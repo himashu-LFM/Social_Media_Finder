@@ -1,0 +1,26 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+uploads/
+
+# Node / Next.js (curator-ai)
+curator-ai/node_modules/
+curator-ai/.next/
+curator-ai/out/
+
+# Generated exports (keep Demo_Social.xlsx if present as sample)
+Talent_Social_Lookup_*.xlsx
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

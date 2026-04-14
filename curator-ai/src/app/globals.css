@@ -1,0 +1,150 @@
+@import "tailwindcss";
+
+/* Curator AI — dark-first theme */
+:root {
+  --background: #0b0f14;
+  --foreground: #f1f5f9;
+  --muted: #94a3b8;
+  --surface: #111827;
+  --surface-high: #1e293b;
+  --primary: #6366f1;
+  --primary-dim: #4f46e5;
+  --ring: rgba(99, 102, 241, 0.35);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-surface: var(--surface);
+  --color-surface-high: var(--surface-high);
+  --color-primary: var(--primary);
+  --color-primary-dim: var(--primary-dim);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-headline: var(--font-manrope), ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  min-height: 100dvh;
+}
+
+/* Buttons: pointer + shared hover / active feedback */
+button:not(:disabled),
+input[type="button"]:not(:disabled),
+input[type="submit"]:not(:disabled),
+input[type="reset"]:not(:disabled) {
+  cursor: pointer;
+  transition:
+    filter 0.15s ease,
+    transform 0.15s ease,
+    box-shadow 0.15s ease,
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+button:disabled,
+input[type="button"]:disabled,
+input[type="submit"]:disabled,
+input[type="reset"]:disabled {
+  cursor: not-allowed;
+}
+
+button:hover:not(:disabled):not([role="switch"]),
+input[type="button"]:hover:not(:disabled),
+input[type="submit"]:hover:not(:disabled),
+input[type="reset"]:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+button[role="switch"]:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+/* Next.js <Link> / anchors styled as pill or block CTAs */
+a[href].rounded-lg,
+a[href].rounded-xl {
+  cursor: pointer;
+  transition:
+    filter 0.15s ease,
+    transform 0.15s ease,
+    box-shadow 0.15s ease,
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+a[href].rounded-lg:hover,
+a[href].rounded-xl:hover {
+  filter: brightness(1.08);
+}
+
+a[href].rounded-lg:active,
+a[href].rounded-xl:active {
+  transform: scale(0.98);
+}
+
+/* Mobile tab bar — links are not rounded-xl; still want pointer + hover */
+nav.fixed.bottom-0.left-0.z-50 a[href] {
+  cursor: pointer;
+  transition: filter 0.15s ease, transform 0.15s ease;
+}
+
+nav.fixed.bottom-0.left-0.z-50 a[href]:hover {
+  filter: brightness(1.12);
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-headline);
+}
+
+.material-symbols-outlined {
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+  display: inline-block;
+  line-height: 1;
+  font-size: 1.25rem;
+}
+
+/* Processing screen — progress bar shimmer + icon pulse */
+@keyframes progress-shimmer-move {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.progress-shimmer {
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.14),
+    transparent
+  );
+  background-size: 200% 100%;
+  animation: progress-shimmer-move 2s infinite;
+}
+
+@keyframes ai-pulse-scale {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.92;
+    transform: scale(1.04);
+  }
+}
+
+.ai-pulse {
+  animation: ai-pulse-scale 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
