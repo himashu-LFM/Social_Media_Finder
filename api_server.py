@@ -10,6 +10,7 @@ Set NEXT_PUBLIC_PYTHON_API_URL=http://127.0.0.1:8787 in curator-ai/.env.local
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -52,9 +53,17 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(title="Curator AI", version="1.0.0", lifespan=_lifespan)
 
 
-# Next.js often uses 3001+ if 3000 is busy; browser Origin must match or fetch fails (looks like "Cannot reach API").
+# CORS:
+# - Local dev defaults to localhost/127.0.0.1 on any port.
+# - Production should set CORS_ORIGINS to a comma-separated list, e.g.
+#   https://your-app.vercel.app,https://your-custom-domain.com
+_cors_origins_env = os.getenv("CORS_ORIGINS", "").strip()
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=_cors_origins,
+    # Keep localhost enabled even when production CORS_ORIGINS is set.
     allow_origin_regex=r"https?://(127\.0\.0\.1|localhost)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],

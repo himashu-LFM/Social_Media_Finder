@@ -22,3 +22,30 @@ npm run dev
 ```
 
 Place input Excel beside `testing.py` or use the UI upload when the API is running.
+
+## Deploy (Render + Vercel)
+
+**1) Deploy backend to Render**
+
+- Create a new **Web Service** from this repo.
+- Root directory: repo root (`/`)
+- Build command:
+  - `pip install -r requirements.txt`
+- Start command:
+  - `uvicorn api_server:app --host 0.0.0.0 --port $PORT`
+- Add environment variables in Render:
+  - `SERPER_API_KEY=...`
+  - `OPENAI_API_KEY=...`
+  - `CORS_ORIGINS=https://<your-vercel-app>.vercel.app`
+
+After deploy, note your backend URL, e.g. `https://your-api.onrender.com`.
+
+**2) Deploy frontend to Vercel**
+
+- Import the same repo in Vercel.
+- Set **Root Directory** to `curator-ai`.
+- Add environment variable:
+  - `NEXT_PUBLIC_PYTHON_API_URL=https://your-api.onrender.com`
+- Deploy.
+
+If you use a custom domain on Vercel, add that domain to Render `CORS_ORIGINS` too (comma-separated).
