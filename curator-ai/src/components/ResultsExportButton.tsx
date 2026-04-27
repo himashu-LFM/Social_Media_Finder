@@ -1,6 +1,7 @@
 "use client";
 
 import * as XLSX from "xlsx";
+import { useToast } from "@/components/ToastProvider";
 import type { ResultRow } from "@/types/results";
 
 type Props = {
@@ -10,18 +11,28 @@ type Props = {
 };
 
 export function ResultsExportButton({ rows, sourceFileName }: Props) {
+  const { pushToast } = useToast();
+
   function download() {
-    if (rows.length === 0) return;
+    if (rows.length === 0) {
+      pushToast("No rows to export.", "error");
+      return;
+    }
 
     const sheetRows = rows.map((r) => ({
       "Talent Name": r.name,
       title_category: r.category,
       title_sub_category: r.subCategory,
       Facebook: r.facebook,
+      "Facebook Confidence": r.facebookConfidence,
       Instagram: r.instagram,
+      "Instagram Confidence": r.instagramConfidence,
       X: r.x,
+      "X Confidence": r.xConfidence,
       TikTok: r.tiktok,
+      "TikTok Confidence": r.tiktokConfidence,
       YouTube: r.youtube,
+      "YouTube Confidence": r.youtubeConfidence,
       Confidence: r.confidence,
       Source: r.source,
     }));
@@ -37,6 +48,7 @@ export function ResultsExportButton({ rows, sourceFileName }: Props) {
         : fallback;
 
     XLSX.writeFile(wb, name);
+    pushToast("Export ready.", "success");
   }
 
   return (

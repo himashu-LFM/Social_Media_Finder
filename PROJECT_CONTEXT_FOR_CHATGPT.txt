@@ -1,0 +1,299 @@
+PROJECT KNOWLEDGE PACK (FOR CHATGPT)
+====================================
+
+Project Name
+------------
+Social Media Finder (Curator AI)
+
+One-line Purpose
+----------------
+Given a list of people ("talent"), the system finds likely official social profile URLs across Facebook, Instagram, X, TikTok, and YouTube, then exports structured results with confidence scoring.
+
+What This Project Is
+--------------------
+This is a hybrid Python + web app with:
+1) A core Python discovery pipeline (`testing.py`) that does search, filtering, AI-assisted disambiguation, enrichment, and Excel export.
+2) A FastAPI backend (`api_server.py`) that exposes the pipeline as async jobs for UI and automation.
+3) A Next.js frontend (`curator-ai/`) that supports discovery input, processing progress, and results viewing/export.
+4) A legacy Colab-style script (`social_media_finder.py`) which is not the main production path.
+
+High-level Problem It Solves
+----------------------------
+When names are ambiguous, simple search returns many wrong links (posts, reels, unrelated people, namesakes). This project attempts to:
+- Search multiple query variants per platform.
+- Keep only profile/channel URLs (reject content URLs).
+- Use metadata (category/sub-category) to improve identity matching.
+- Ask an LLM to select best candidate among top-ranked profiles.
+- Suppress low-confidence guesses to reduce false positives.
+- Optionally enrich missing platforms by mining link hubs/bio pages.
+
+Repository Structure
+--------------------
+- `testing.py`: Core social profile resolution pipeline.
+- `api_server.py`: FastAPI service wrapping pipeline as background jobs and results endpoints.
+- `social_media_finder.py`: Older standalone/Colab script (Google CSE based).
+- `requirements.txt`: Python dependencies.
+- `.env.example`: Backend env variables.
+- `curator-ai/`: Next.js frontend app.
+  - `src/app/page.tsx`: Discovery page.
+  - `src/app/processing/page.tsx`: Processing status page.
+  - `src/app/results/page.tsx`: Results table page.
+  - `.env.example`: Frontend env variables.
+  - `package.json`: frontend scripts/dependencies.
+
+Core Business Flow (End-to-End)
+-------------------------------
+1) Input
+   - User provides names directly or uploads `.xlsx/.xls/.csv`.
+   - Optional metadata columns: `title_category`, `title_sub_category`.
+
+2) Query Generation
+   - For each (person, platform), multiple search queries are generated:
+     - domain-limited (`site:instagram.com "name" official`, etc.)
+     - platform + keyword forms
+     - metadata-enriched variants if category/sub-category available
+   - Query intent is disambiguation + recall.
+
+3) Candidate Retrieval
+   - Uses Serper API (`google.serper.dev/search`) to fetch organic candidates.
+   - Deduplicates links.
+
+4) Deterministic Filtering + Ranking
+   - Keeps only valid profile/channel URL patterns per platform.
+   - Rejects known non-profile routes (posts/videos/reels/status/search pages).
+   - Scores candidates via textual signals:
+     - official/verified hints
+     - name match in title/snippet/url
+     - metadata token alignment
+     - heavy penalty for metadata contradiction.
+
+5) AI Selection
+   - Top candidates are sent to OpenAI Chat Completions.
+   - Prompt constraints force selecting one candidate link or empty.
+   - AI output parsed as strict JSON: `best_link`, `confidence`, `reason`.
+
+6) Safety Gate Before Emitting Output
+   - Reject invalid profile URLs.
+   - Reject obvious wrong-entity candidates via metadata checks.
+   - Apply confidence threshold (`MIN_CONFIDENCE_EMIT`, default 0.72).
+   - If AI is unsure, optional deterministic fallback only when rank is very strong.
+   - Prefer blank cell over risky/wrong link.
+
+7) Cross-platform Enrichment
+   - If one high-confidence profile exists (anchor), fetch its page/about/link-hub.
+   - Extract additional social links and fill missing platforms.
+
+8) Output
+   - Writes `Talent_Social_Lookup_YYYYMMDD_HHMMSS.xlsx`.
+   - Includes columns:
+     - `Talent Name`, `title_category`, `title_sub_category`
+     - `Facebook`, `Instagram`, `X`, `TikTok`, `YouTube`
+     - `Confidence`, `Source`
+   - Applies Excel formatting for confidence and risky rows (first-name-only names).
+
+Architecture Diagram (ASCII)
+----------------------------
+
+[User / Browser]
+      |
+      v
+[Next.js UI: curator-ai]
+  - Discovery page
+  - Processing page
+  - Results page
+      |
+      | HTTP (JSON + file upload)
+      v
+[FastAPI: api_server.py]
+  - /api/jobs
+  - /api/upload, /api/jobs/upload
+  - /api/jobs/{job_id}
+  - /api/results/latest
+  - /api/export/latest
+      |
+      | background thread calls
+      v
+[Pipeline Engine: testing.py]
+  - query builder
+  - Serper fetcher
+  - URL filter + ranker
+  - OpenAI resolver
+  - enrichment
+  - exporter
+      |
+      +--> [Serper API]
+      |
+      +--> [OpenAI Chat Completions]
+      |
+      v
+[Generated Excel in repo root]
+  Talent_Social_Lookup_*.xlsx
+
+Component Responsibilities
+--------------------------
+`testing.py`
+- Data loading from Excel/CSV with flexible column detection.
+- Query expansion with optional metadata-based disambiguation.
+- Search via Serper API.
+- Platform-specific URL validation (profile-only logic).
+- Candidate ranking and wrong-entity rejection.
+- AI-assisted best-link selection.
+- Confidence gating and conservative emission.
+- Link-hub/about-page enrichment from high-confidence anchor profiles.
+- Output saving and formatting.
+
+`api_server.py`
+- Loads env and pipeline.
+- Handles CORS (local regex + production origin list).
+- Starts jobs in background thread.
+- Stores in-memory job state (`queued/running/completed/failed`).
+- Supports both direct name submission and file upload.
+- Exposes latest results JSON and latest export download.
+
+`curator-ai` (frontend)
+- Discovery UI: workflow guidance + expected output schema.
+- Processing UI: run tracking/progress UX.
+- Results UI:
+  - reads from backend `/api/results/latest` when configured
+  - fallback local workbook read path exists
+  - displays table + confidence metrics + export.
+
+Tech Stack
+----------
+Backend (Python):
+- Python
+- FastAPI
+- Uvicorn
+- pandas
+- requests
+- openpyxl
+- python-dotenv
+- python-multipart
+
+External APIs:
+- Serper Search API (`SERPER_API_KEY`)
+- OpenAI Chat Completions (`OPENAI_API_KEY`, model via `OPENAI_CHAT_MODEL`, default `gpt-4o-mini`)
+
+Frontend:
+- Next.js 16
+- React 19
+- TypeScript
+- Tailwind CSS 4
+- xlsx (for workbook parsing/export in UI)
+
+Data Model / Schema
+-------------------
+Input (minimum):
+- `Talent Name` (required logical field)
+
+Input (optional):
+- `title_category`
+- `title_sub_category`
+
+Output columns:
+- `Talent Name`
+- `title_category`
+- `title_sub_category`
+- `Facebook`
+- `Instagram`
+- `X`
+- `TikTok`
+- `YouTube`
+- `Confidence` (0.0 to 1.0)
+- `Source` (per-platform provenance like `Instagram:search; YouTube:bio_enrich`)
+
+API Endpoints
+-------------
+Health:
+- `GET /api/health`
+
+Run by names:
+- `POST /api/jobs`
+  body: `{ "names": ["Name A", "Name B"] }`
+  returns: `{ "job_id": "..." }`
+
+Run by file upload:
+- `POST /api/upload`
+- `POST /api/jobs/upload`
+  multipart file: `.xlsx/.xls/.csv`
+  returns job metadata + parsed names count.
+
+Poll job:
+- `GET /api/jobs/{job_id}`
+
+Latest results JSON:
+- `GET /api/results/latest`
+
+Latest workbook download:
+- `GET /api/export/latest`
+
+Environment Variables
+---------------------
+Backend (`.env` at repo root):
+- `SERPER_API_KEY` (required for pipeline)
+- `OPENAI_API_KEY` (required for AI selection)
+- `OPENAI_CHAT_MODEL` (optional, defaults to `gpt-4o-mini`)
+- `CORS_ORIGINS` (comma-separated origins for production)
+- `MIN_CONFIDENCE_EMIT` (optional, default 0.72)
+- `ANCHOR_MIN_CONFIDENCE` (optional, default 0.86)
+- `MIN_RANK_SCORE_FOR_FALLBACK` (optional, default 12.0)
+
+Frontend (`curator-ai/.env.local`):
+- `NEXT_PUBLIC_PYTHON_API_URL` (e.g., `http://127.0.0.1:8787`)
+
+How to Run Locally
+------------------
+Backend:
+1) `pip install -r requirements.txt`
+2) copy `.env.example` -> `.env` and set keys
+3) `uvicorn api_server:app --host 127.0.0.1 --port 8787 --reload`
+
+Frontend:
+1) `cd curator-ai`
+2) `npm install`
+3) copy `.env.example` -> `.env.local`
+4) set `NEXT_PUBLIC_PYTHON_API_URL=http://127.0.0.1:8787`
+5) `npm run dev`
+
+Deployment Pattern
+------------------
+- Backend on Render (Uvicorn start command).
+- Frontend on Vercel (root at `curator-ai`).
+- Configure CORS_ORIGINS on backend to include frontend domain(s).
+- Point frontend `NEXT_PUBLIC_PYTHON_API_URL` to deployed backend URL.
+
+Key Design Decisions
+--------------------
+- Conservative output: blank is preferred over wrong profile.
+- Hybrid approach: deterministic filters + AI disambiguation.
+- Metadata-aware disambiguation for namesake collisions.
+- Background-job API model for non-blocking UI.
+- Timestamped immutable exports for traceability.
+
+Known Limitations / Risks
+-------------------------
+- Depends on external API availability/quotas (Serper/OpenAI).
+- HTML scraping for enrichment can be brittle due to anti-bot behavior.
+- In-memory job store (not persistent across server restarts).
+- No authentication/authorization in current UI/API.
+- Confidence is heuristic + model-based, not guaranteed correctness.
+- Legacy `social_media_finder.py` differs from main pipeline (possible confusion).
+
+Suggested Future Improvements
+-----------------------------
+- Persist jobs and run history in database/queue (Redis + worker).
+- Add auth + role-based access to API/UI.
+- Add automated evaluation set with precision/recall metrics.
+- Add retries/backoff/circuit breaker around external APIs.
+- Add explainability/audit log per selected link.
+- Add per-platform plugin architecture for easier rule updates.
+
+Quick Prompt You Can Give ChatGPT Next
+--------------------------------------
+"Using this project context, create:
+1) a technical PRD,
+2) a migration plan to production-grade architecture,
+3) a test strategy (unit/integration/e2e + quality metrics),
+4) a backlog split into milestones (MVP, hardening, scale),
+5) and recommend immediate high-impact code changes ranked by effort vs impact."
+

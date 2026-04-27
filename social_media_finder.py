@@ -38,8 +38,8 @@ from datetime import datetime
 from google.colab import files
 
 # ================== CONFIG ==================
-CSE_KEY = "AIzaSyBQSW64LiXwowmaJsySN63wuW80U0jgqLo"
-CSE_CX  = "b072d5bee5e3747eb"
+# CSE_KEY = 
+# CSE_CX  = 
 
 RESULTS_PER_QUERY = 10
 MAX_WORKERS = 5

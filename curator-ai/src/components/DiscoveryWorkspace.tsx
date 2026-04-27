@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { useToast } from "@/components/ToastProvider";
 import {
   getPythonApiUrl,
   parseNamesFromText,
@@ -16,6 +17,7 @@ ESPN`;
 
 export function DiscoveryWorkspace() {
   const router = useRouter();
+  const { pushToast } = useToast();
   const [text, setText] = useState(defaultNames);
   const [ignoreSingle, setIgnoreSingle] = useState(true);
   const [hint, setHint] = useState<string | null>(null);
@@ -24,6 +26,7 @@ export function DiscoveryWorkspace() {
   async function runDiscovery() {
     const names = parseNamesFromText(text, ignoreSingle);
     if (names.length === 0) {
+      pushToast("Add at least one valid name.", "error");
       setHint(
         "Add at least one name line, or turn off “ignore single-name” if each line is a single word.",
       );
@@ -52,11 +55,13 @@ export function DiscoveryWorkspace() {
                 ? JSON.stringify(payload.detail)
                 : `Request failed (${res.status})`;
           setHint(msg);
+          pushToast("Discovery start failed.", "error");
           setLoading(false);
           return;
         }
         if (!payload.job_id) {
           setHint("Invalid API response (missing job_id).");
+          pushToast("Invalid API response.", "error");
           setLoading(false);
           return;
         }
@@ -67,6 +72,7 @@ export function DiscoveryWorkspace() {
         setHint(
           `Cannot reach ${base} (${detail}). From C:\\Testing run: uvicorn api_server:app --host 127.0.0.1 --port 8787 — add NEXT_PUBLIC_PYTHON_API_URL=http://127.0.0.1:8787 to curator-ai/.env.local and restart npm run dev.`,
         );
+        pushToast("Python API unreachable.", "error");
         setLoading(false);
         return;
       }
@@ -76,6 +82,7 @@ export function DiscoveryWorkspace() {
       saveProcessingNames(names);
     }
 
+    pushToast("Discovery started.", "success");
     router.push("/processing");
   }
 

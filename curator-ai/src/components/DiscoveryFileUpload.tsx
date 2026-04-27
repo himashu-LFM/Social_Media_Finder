@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
+import { useToast } from "@/components/ToastProvider";
 import {
   getPythonApiUrl,
   saveProcessingNames,
@@ -10,6 +11,7 @@ import {
 
 export function DiscoveryFileUpload() {
   const router = useRouter();
+  const { pushToast } = useToast();
   const inputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -56,12 +58,14 @@ export function DiscoveryFileUpload() {
             "405 Method Not Allowed — restart uvicorn from C:\\Testing with the latest api_server.py (use --reload).";
         }
         setStatus(msg);
+        pushToast("Upload failed.", "error");
         setLoading(false);
         return;
       }
 
       if (!payload.job_id || !payload.names?.length) {
         setStatus("Invalid response from server.");
+        pushToast("Invalid upload response.", "error");
         setLoading(false);
         return;
       }
@@ -69,12 +73,14 @@ export function DiscoveryFileUpload() {
       saveProcessingNames(payload.names);
       setPythonJobId(payload.job_id);
       setLoading(false);
+      pushToast("File uploaded.", "success");
       router.push("/processing");
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       setStatus(
         `Cannot reach ${base}: ${detail}. Run uvicorn from C:\\Testing (port 8787), set NEXT_PUBLIC_PYTHON_API_URL in .env.local, restart next dev.`,
       );
+      pushToast("Cannot reach Python API.", "error");
       setLoading(false);
     }
   }

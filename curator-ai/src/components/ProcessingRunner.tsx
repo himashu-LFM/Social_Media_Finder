@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useToast } from "@/components/ToastProvider";
 import {
   getPythonApiUrl,
   markProcessingRunFinished,
@@ -33,6 +34,7 @@ type JobPollPayload = {
 };
 
 export function ProcessingRunner() {
+  const { pushToast } = useToast();
   const [mounted, setMounted] = useState(false);
   const [names, setNames] = useState<string[] | null>(null);
   const [statuses, setStatuses] = useState<RowStatus[]>([]);
@@ -139,6 +141,7 @@ export function ProcessingRunner() {
           if (!completionMarkedRef.current) {
             completionMarkedRef.current = true;
             markProcessingRunFinished();
+            pushToast("Processing completed.", "success");
           }
           if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
@@ -147,6 +150,7 @@ export function ProcessingRunner() {
         }
         if (data.status === "failed") {
           setBackendError(data.error || "Pipeline failed.");
+          pushToast("Pipeline failed.", "error");
           if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
@@ -154,6 +158,7 @@ export function ProcessingRunner() {
         }
       } catch {
         setBackendError("Cannot reach the Python API.");
+        pushToast("Python API disconnected.", "error");
         if (pollTimerRef.current) {
           clearInterval(pollTimerRef.current);
           pollTimerRef.current = null;
@@ -170,7 +175,7 @@ export function ProcessingRunner() {
         pollTimerRef.current = null;
       }
     };
-  }, [source, names]);
+  }, [source, names, pushToast]);
 
   useEffect(() => {
     if (allDone || total === 0) return;

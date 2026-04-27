@@ -71,6 +71,10 @@ PLATFORMS: Dict[str, List[str]] = {
     "YouTube": ["youtube.com"],
 }
 
+PLATFORM_CONF_COLUMNS: Dict[str, str] = {
+    p: f"{p} Confidence" for p in PLATFORMS
+}
+
 
 def is_first_name_only(talent: str) -> bool:
     parts = re.sub(r"\s+", " ", (talent or "").strip()).split()
@@ -125,6 +129,8 @@ def _default_talent_table() -> pd.DataFrame:
     }
     for p in PLATFORMS:
         data[p] = [""] * n
+    for c in PLATFORM_CONF_COLUMNS.values():
+        data[c] = [float("nan")] * n
     data["Confidence"] = [float("nan")] * n
     data["Source"] = [""] * n
     return pd.DataFrame(data)
@@ -189,6 +195,8 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
     }
     for p in PLATFORMS:
         out[p] = [""] * n
+    for c in PLATFORM_CONF_COLUMNS.values():
+        out[c] = [float("nan")] * n
     out["Confidence"] = [float("nan")] * n
     out["Source"] = [""] * n
     return pd.DataFrame(out)
@@ -211,6 +219,8 @@ def build_talent_df(names: List[str], platforms: List[str]) -> pd.DataFrame:
     talent_data: Dict[str, List] = {"Talent Name": names}
     for platform in platforms:
         talent_data[platform] = [""] * len(names)
+    for platform in platforms:
+        talent_data[f"{platform} Confidence"] = [float("nan")] * len(names)
     talent_data["title_category"] = [""] * len(names)
     talent_data["title_sub_category"] = [""] * len(names)
     talent_data["Confidence"] = [float("nan")] * len(names)
@@ -720,7 +730,9 @@ def enrich_row_from_anchor_profiles(df: pd.DataFrame, row_label: object) -> None
         if not is_valid_profile_url(link, tgt):
             continue
         df.at[row_label, tgt] = link
-        ROW_PLATFORM_CONFIDENCE.setdefault(row_label, {})[tgt] = round(min(0.93, best_c * 0.96), 3)
+        conf_value = round(min(0.93, best_c * 0.96), 3)
+        ROW_PLATFORM_CONFIDENCE.setdefault(row_label, {})[tgt] = conf_value
+        df.at[row_label, PLATFORM_CONF_COLUMNS[tgt]] = conf_value
         ROW_PLATFORM_SOURCE.setdefault(row_label, {})[tgt] = "bio_enrich"
         print(f"  + filled {tgt} from bio/link hub")
 
@@ -1027,6 +1039,8 @@ def process_row(idx: object, row: pd.Series, df: pd.DataFrame) -> None:
     for p in PLATFORMS:
         if str(row.get(p, "") or "").strip():
             ROW_PLATFORM_SOURCE[idx][p] = "input"
+            ROW_PLATFORM_CONFIDENCE[idx][p] = 1.0
+            df.at[idx, PLATFORM_CONF_COLUMNS[p]] = 1.0
 
     futures = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -1041,6 +1055,7 @@ def process_row(idx: object, row: pd.Series, df: pd.DataFrame) -> None:
             platform, best_link, conf, rsn = fut.result()
             df.at[idx, platform] = best_link
             ROW_PLATFORM_CONFIDENCE[idx][platform] = float(conf) if best_link else 0.0
+            df.at[idx, PLATFORM_CONF_COLUMNS[platform]] = float(conf) if best_link else 0.0
             if best_link:
                 ROW_PLATFORM_SOURCE[idx][platform] = "search"
             confidences.append(float(conf))

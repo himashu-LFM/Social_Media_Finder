@@ -3,6 +3,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import * as XLSX from "xlsx";
 import { AppMobileNav } from "@/components/AppMobileNav";
+import { ResultsAnalysisButton } from "@/components/ResultsAnalysisButton";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ResultsExportButton } from "@/components/ResultsExportButton";
 import type { ResultRow } from "@/types/results";
@@ -41,10 +42,15 @@ function mapRecordToRow(r: Record<string, unknown>): ResultRow {
     category: asString(r["title_category"] || r["de_category"] || r["category"]),
     subCategory: asString(r["title_sub_category"] || r["sub_category"]),
     facebook: asString(r["Facebook"]),
+    facebookConfidence: asConfidence(r["Facebook Confidence"]),
     instagram: asString(r["Instagram"]),
+    instagramConfidence: asConfidence(r["Instagram Confidence"]),
     x: asString(r["X"]),
+    xConfidence: asConfidence(r["X Confidence"]),
     tiktok: asString(r["TikTok"]),
+    tiktokConfidence: asConfidence(r["TikTok Confidence"]),
     youtube: asString(r["YouTube"]),
+    youtubeConfidence: asConfidence(r["YouTube Confidence"]),
     confidence: asConfidence(r["Confidence"]),
     source: asString(r["Source"]),
   };
@@ -163,17 +169,27 @@ function ConfBadge({ value }: { value: number }) {
   return <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-bold ring-1 ${cls}`}>{pct}%</span>;
 }
 
-function LinkCell({ href }: { href: string }) {
+function LinkCell({ href, confidence }: { href: string; confidence: number }) {
   if (!href) return <span className="text-slate-600">-</span>;
+  const pct = Math.round(confidence * 100);
+  const cls =
+    pct > 85
+      ? "bg-emerald-500/10 text-emerald-300 ring-emerald-500/30"
+      : pct >= 70
+        ? "bg-amber-500/10 text-amber-300 ring-amber-500/30"
+        : "bg-rose-500/10 text-rose-300 ring-rose-500/30";
   return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noreferrer"
-      className="cursor-pointer text-xs text-primary break-all underline-offset-2 transition hover:underline hover:brightness-110"
-    >
-      {href}
-    </a>
+    <div className={`rounded-md px-2 py-1 ring-1 ${cls}`}>
+      <a
+        href={href}
+        target="_blank"
+        rel="noreferrer"
+        className="cursor-pointer text-xs break-all underline-offset-2 transition hover:underline"
+      >
+        {href}
+      </a>
+      <div className="mt-1 text-[10px] font-semibold opacity-90">{pct}%</div>
+    </div>
   );
 }
 
@@ -200,14 +216,29 @@ export default async function ResultsPage() {
       <main className="md:ml-64 p-4 pb-32 md:p-8">
         <header className="sticky top-0 z-30 mb-6 flex items-center justify-between bg-background/90 py-3 backdrop-blur-md">
           <h1 className="text-lg font-bold text-slate-100">Results</h1>
-          <ResultsExportButton rows={rows} sourceFileName={latestFileName} />
+          <div className="flex items-center gap-2">
+            <ResultsAnalysisButton />
+            <ResultsExportButton rows={rows} sourceFileName={latestFileName} />
+          </div>
         </header>
 
         <div className="mx-auto max-w-7xl space-y-6">
           <div className="rounded-xl bg-slate-900/60 p-4 ring-1 ring-white/10">
             <p className="text-sm text-slate-400">
-              Output schema: <code>Talent Name | title_category | title_sub_category | Facebook | Instagram | X | TikTok | YouTube | Confidence | Source</code>
+              Output schema: <code>Talent Name | title_category | title_sub_category | Facebook | Facebook Confidence | Instagram | Instagram Confidence | X | X Confidence | TikTok | TikTok Confidence | YouTube | YouTube Confidence | Confidence | Source</code>
             </p>
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-slate-400">Link confidence:</span>
+              <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-semibold text-emerald-300">
+                Green &gt; 85%
+              </span>
+              <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 font-semibold text-amber-300">
+                Yellow 70%-85%
+              </span>
+              <span className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 font-semibold text-rose-300">
+                Red &lt; 70%
+              </span>
+            </div>
             <p className="mt-2 text-xs text-slate-500">
               Latest file: {latestFileName ?? "No Talent_Social_Lookup_*.xlsx found in C:\\Testing"}
             </p>
@@ -257,11 +288,11 @@ export default async function ResultsPage() {
                       <td className="px-4 py-4 font-semibold text-slate-100">{r.name}</td>
                       <td className="px-4 py-4 text-sm text-slate-300">{r.category || "-"}</td>
                       <td className="px-4 py-4 text-sm text-slate-300">{r.subCategory || "-"}</td>
-                      <td className="px-4 py-4"><LinkCell href={r.facebook} /></td>
-                      <td className="px-4 py-4"><LinkCell href={r.instagram} /></td>
-                      <td className="px-4 py-4"><LinkCell href={r.x} /></td>
-                      <td className="px-4 py-4"><LinkCell href={r.tiktok} /></td>
-                      <td className="px-4 py-4"><LinkCell href={r.youtube} /></td>
+                      <td className="px-4 py-4"><LinkCell href={r.facebook} confidence={r.facebookConfidence} /></td>
+                      <td className="px-4 py-4"><LinkCell href={r.instagram} confidence={r.instagramConfidence} /></td>
+                      <td className="px-4 py-4"><LinkCell href={r.x} confidence={r.xConfidence} /></td>
+                      <td className="px-4 py-4"><LinkCell href={r.tiktok} confidence={r.tiktokConfidence} /></td>
+                      <td className="px-4 py-4"><LinkCell href={r.youtube} confidence={r.youtubeConfidence} /></td>
                       <td className="px-4 py-4"><ConfBadge value={r.confidence} /></td>
                       <td className="px-4 py-4 text-xs text-slate-400">{r.source || "-"}</td>
                     </tr>
@@ -299,6 +330,14 @@ export default async function ResultsPage() {
                 {(avgConfidence * 100).toFixed(1)}%
               </div>
             </div>
+          </div>
+
+          <div className="rounded-2xl border border-primary/30 bg-primary/10 p-6 ring-1 ring-primary/20">
+            <div className="text-xs font-bold uppercase tracking-wider text-indigo-200">Final Confidence Score</div>
+            <div className="mt-2 text-3xl font-black text-white">{(avgConfidence * 100).toFixed(2)}%</div>
+            <p className="mt-2 text-xs text-indigo-100/80">
+              Computed as average row confidence across all processed records.
+            </p>
           </div>
         </div>
       </main>
