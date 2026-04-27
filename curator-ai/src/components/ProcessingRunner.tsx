@@ -211,7 +211,7 @@ export function ProcessingRunner() {
           name is searched and scored in the background.
         </p>
         <Link
-          href="/"
+          href="/discovery"
           className="mt-8 inline-flex cursor-pointer items-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-bold text-white shadow-lg shadow-indigo-500/20 transition hover:shadow-indigo-500/40"
         >
           <span className="material-symbols-outlined text-lg">arrow_back</span>

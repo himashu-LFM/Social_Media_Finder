@@ -10,11 +10,19 @@ export const metadata: Metadata = {
 };
 
 export default function ProcessingPage() {
+  const stars = Array.from({ length: 50 }, (_, i) => i + 1);
+
   return (
-    <div className="flex min-h-screen flex-col bg-background md:flex-row">
+    <div className="relative flex min-h-screen flex-col bg-background md:flex-row">
+      <div className="lf-stars" aria-hidden>
+        {stars.map((n) => (
+          <div key={n} className="lf-star" />
+        ))}
+      </div>
+
       <AppSidebar />
 
-      <main className="flex min-h-screen flex-1 flex-col pb-24 md:ml-64 md:pb-0">
+      <main className="relative z-10 flex min-h-screen flex-1 flex-col pb-24 md:ml-64 md:pb-0">
         <header className="sticky top-0 z-30 flex w-full items-center justify-between border-b border-white/5 bg-background/90 px-6 py-4 backdrop-blur-md">
           <h1 className="text-lg font-bold text-slate-100">Processing</h1>
           <Link

@@ -10,7 +10,7 @@ export function AppSidebar() {
   return (
     <nav className="fixed left-0 top-0 z-40 hidden h-screen w-64 flex-col gap-2 border-r border-white/5 bg-surface p-6 md:flex">
       <Link
-        href="/"
+        href="/discovery"
         className="mb-8 inline-flex cursor-pointer items-center gap-2 rounded-lg font-[family-name:var(--font-manrope)] text-2xl font-black text-primary transition hover:opacity-90 hover:brightness-110"
       >
         <span className="inline-block h-2.5 w-2.5 rounded-full bg-primary shadow-[0_0_16px_rgba(242,209,0,0.8)]" />
