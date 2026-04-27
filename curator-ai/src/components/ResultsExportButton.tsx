@@ -44,7 +44,7 @@ export function ResultsExportButton({ rows, sourceFileName }: Props) {
     const fallback = `Talent_Social_Lookup_export_${new Date().toISOString().slice(0, 10)}.xlsx`;
     const name =
       sourceFileName && sourceFileName.endsWith(".xlsx")
-        ? sourceFileName.replace(/\.xlsx$/i, "_curator_export.xlsx")
+        ? sourceFileName.replace(/\.xlsx$/i, "_listenfirst_export.xlsx")
         : fallback;
 
     XLSX.writeFile(wb, name);

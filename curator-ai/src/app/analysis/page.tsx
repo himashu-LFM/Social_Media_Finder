@@ -12,7 +12,7 @@ const REQUIRED_SUFFIX = ".xlsx";
 export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
-  title: "Analysis | Curator AI",
+  title: "Analysis | ListenFirst",
   description: "Confidence distribution analysis for resolved social links.",
 };
 

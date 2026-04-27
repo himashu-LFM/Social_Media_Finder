@@ -14,7 +14,7 @@ const REQUIRED_SUFFIX = ".xlsx";
 export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
-  title: "Results | Curator AI",
+  title: "Results | ListenFirst",
   description: "Profile lookup output table aligned with python export schema.",
 };
 

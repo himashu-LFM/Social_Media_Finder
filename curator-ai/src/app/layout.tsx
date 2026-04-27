@@ -14,9 +14,9 @@ const manrope = Manrope({
 });
 
 export const metadata: Metadata = {
-  title: "Curator AI — Discovery",
+  title: "ListenFirst Social Intelligence",
   description:
-    "Discover social presence across ecosystems. AI filters noise to surface authentic profiles.",
+    "ListenFirst social intelligence workspace for profile discovery, validation, and analysis.",
 };
 
 export default function RootLayout({

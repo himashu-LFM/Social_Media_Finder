@@ -1,15 +1,15 @@
 @import "tailwindcss";
 
-/* Curator AI — dark-first theme */
+/* ListenFirst brand theme: charcoal + white + yellow */
 :root {
-  --background: #0b0f14;
-  --foreground: #f1f5f9;
-  --muted: #94a3b8;
-  --surface: #111827;
-  --surface-high: #1e293b;
-  --primary: #6366f1;
-  --primary-dim: #4f46e5;
-  --ring: rgba(99, 102, 241, 0.35);
+  --background: #0f1012;
+  --foreground: #f8fafc;
+  --muted: #9ca3af;
+  --surface: #181a1f;
+  --surface-high: #23262d;
+  --primary: #f2d100;
+  --primary-dim: #d5b700;
+  --ring: rgba(242, 209, 0, 0.35);
 }
 
 @theme inline {

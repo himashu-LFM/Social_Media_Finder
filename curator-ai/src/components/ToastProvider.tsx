@@ -39,7 +39,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
               ? "border-emerald-500/30 bg-emerald-500/15 text-emerald-100"
               : t.tone === "error"
                 ? "border-rose-500/35 bg-rose-500/15 text-rose-100"
-                : "border-indigo-500/35 bg-indigo-500/15 text-indigo-100";
+                : "border-primary/45 bg-primary/15 text-yellow-100";
           return (
             <div
               key={t.id}

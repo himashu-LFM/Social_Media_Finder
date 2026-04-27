@@ -5,7 +5,7 @@ import { AppSidebar } from "@/components/AppSidebar";
 import { ProcessingRunner } from "@/components/ProcessingRunner";
 
 export const metadata: Metadata = {
-  title: "Processing | Curator AI",
+  title: "Processing | ListenFirst",
   description: "Per-name discovery progress for social profile resolution.",
 };
 

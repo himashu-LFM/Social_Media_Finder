@@ -24,15 +24,15 @@ export default function DiscoveryPage() {
       <main className="min-h-screen flex-1 pb-24 md:ml-64 md:pb-0">
         <header className="sticky top-0 z-30 flex w-full items-center justify-between border-b border-white/5 bg-background/80 px-6 py-4 backdrop-blur-md">
           <h1 className="text-lg font-bold text-slate-100">Discovery</h1>
-          <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-400">
-            No authentication required
+          <span className="rounded-full border border-primary/40 bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">
+            ListenFirst Product Workspace
           </span>
         </header>
 
         <div className="mx-auto max-w-6xl px-6 py-8">
           <section className="mb-10">
             <h2 className="mb-3 text-4xl font-extrabold tracking-tight text-slate-50 md:text-5xl">
-              Social Profile Resolver
+              ListenFirst Social Resolver
             </h2>
          
           </section>
@@ -61,8 +61,8 @@ export default function DiscoveryPage() {
 
               <div className="rounded-2xl bg-slate-950 p-6 ring-1 ring-white/10">
                 <div className="mb-3 flex items-center gap-2">
-                  <span className="material-symbols-outlined text-indigo-300">auto_awesome</span>
-                  <span className="text-xs font-bold uppercase tracking-widest text-indigo-300">Pipeline Logic</span>
+                  <span className="material-symbols-outlined text-primary">auto_awesome</span>
+                  <span className="text-xs font-bold uppercase tracking-widest text-primary">Pipeline Logic</span>
                 </div>
                 <ul className="space-y-2 text-sm text-slate-300">
                   <li>1. Serper query expansion with metadata.</li>
