@@ -139,6 +139,7 @@ export function ProcessingRunner() {
     if (!api) return;
 
     setBackendError(null);
+    const nameList = names;
     const startedAt = readProcessingRunStartedAt();
     let mode: "job" | "latest" = jid ? "job" : "latest";
 
@@ -159,7 +160,7 @@ export function ProcessingRunner() {
           }
         }
 
-        setStatuses(names.map(() => "done"));
+        setStatuses(nameList.map(() => "done"));
         if (!completionMarkedRef.current) {
           completionMarkedRef.current = true;
           markProcessingRunFinished();
