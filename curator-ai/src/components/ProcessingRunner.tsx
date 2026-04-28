@@ -7,9 +7,7 @@ import {
   getPythonApiUrl,
   markProcessingRunFinished,
   readProcessingNames,
-  readProcessingRunStartedAt,
   readPythonJobId,
-  setPythonJobId,
 } from "@/lib/processing-job";
 
 type RowStatus = "queued" | "processing" | "done";
@@ -34,28 +32,6 @@ type JobPollPayload = {
   names: { name: string; status: RowStatus }[];
   error?: string | null;
 };
-
-type LatestResultsPayload = {
-  rows?: unknown[];
-  filename?: string | null;
-  warning?: string | null;
-  error?: string | null;
-};
-
-function parseExportTimestampMs(filename: string): number | null {
-  // Talent_Social_Lookup_YYYYMMDD_HHMMSS.xlsx
-  const m = /Talent_Social_Lookup_(\d{8})_(\d{6})/i.exec(filename);
-  if (!m) return null;
-  const y = Number(m[1].slice(0, 4));
-  const mo = Number(m[1].slice(4, 6));
-  const d = Number(m[1].slice(6, 8));
-  const hh = Number(m[2].slice(0, 2));
-  const mm = Number(m[2].slice(2, 4));
-  const ss = Number(m[2].slice(4, 6));
-  if (![y, mo, d, hh, mm, ss].every((n) => Number.isFinite(n))) return null;
-  // Note: timestamp is local time from backend; treat as "best effort" ordering signal.
-  return new Date(y, mo - 1, d, hh, mm, ss).getTime();
-}
 
 export function ProcessingRunner() {
   const { pushToast } = useToast();
@@ -85,7 +61,7 @@ export function ProcessingRunner() {
     if (list && list.length > 0) {
       setNames(list);
       setStatuses(list.map(() => "queued"));
-      if (api) {
+      if (api && jid) {
         setSource("python");
       } else {
         setSource("demo");
@@ -136,72 +112,21 @@ export function ProcessingRunner() {
 
     const api = getPythonApiUrl();
     const jid = readPythonJobId();
-    if (!api) return;
+    if (!api || !jid) return;
 
     setBackendError(null);
-    const nameList = names;
-    const startedAt = readProcessingRunStartedAt();
-    let mode: "job" | "latest" = jid ? "job" : "latest";
-
-    async function pollLatestOnce() {
-      try {
-        const res = await fetch(`${api}/api/results/latest`, { cache: "no-store" });
-        if (!res.ok) return;
-        const data = (await res.json()) as LatestResultsPayload;
-        const rows = Array.isArray(data.rows) ? data.rows : [];
-        const filename = typeof data.filename === "string" ? data.filename : null;
-        if (!filename || rows.length === 0) return;
-
-        if (startedAt) {
-          const exportMs = parseExportTimestampMs(filename);
-          // If timestamp parsing fails, still allow completion once rows exist.
-          if (exportMs && exportMs + 3_000 < startedAt) {
-            return;
-          }
-        }
-
-        setStatuses(nameList.map(() => "done"));
-        if (!completionMarkedRef.current) {
-          completionMarkedRef.current = true;
-          markProcessingRunFinished();
-          pushToast("Processing completed.", "success");
-        }
-        if (pollTimerRef.current) {
-          clearInterval(pollTimerRef.current);
-          pollTimerRef.current = null;
-        }
-      } catch {
-        // ignore transient errors; keep polling
-      }
-    }
 
     async function pollOnce() {
       try {
-        if (mode === "latest") {
-          await pollLatestOnce();
-          return;
-        }
-
-        if (!jid) {
-          mode = "latest";
-          await pollLatestOnce();
-          return;
-        }
-
         const res = await fetch(`${api}/api/jobs/${jid}`);
         if (res.status === 404) {
-          // Production-safe fallback: API restarted or different instance.
-          setBackendError(null);
-          setPythonJobId(null);
-          mode = "latest";
-          pushToast("Backend restarted — switching to results polling.", "info");
+          setBackendError(
+            "Job not found (Python API may have restarted). Run Discovery again.",
+          );
           if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
           }
-          // restart polling using latest results endpoint
-          void pollLatestOnce();
-          pollTimerRef.current = setInterval(() => void pollLatestOnce(), 1400);
           return;
         }
         if (!res.ok) {

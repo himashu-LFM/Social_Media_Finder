@@ -3,7 +3,6 @@
 export const PROCESSING_NAMES_KEY = "curator-ai-processing-names-v1";
 export const PROCESSING_RUN_FINISHED_KEY = "curator-ai-processing-run-finished-v1";
 export const PYTHON_JOB_ID_KEY = "curator-ai-python-job-id-v1";
-export const PROCESSING_RUN_STARTED_AT_KEY = "curator-ai-processing-run-started-at-v1";
 
 /**
  * Base URL of the FastAPI app in C:\\Testing (no trailing slash). Set in .env.local.
@@ -48,7 +47,6 @@ export function saveProcessingNames(names: string[]): void {
   try {
     sessionStorage.setItem(PROCESSING_NAMES_KEY, JSON.stringify(names));
     sessionStorage.removeItem(PROCESSING_RUN_FINISHED_KEY);
-    sessionStorage.setItem(PROCESSING_RUN_STARTED_AT_KEY, String(Date.now()));
   } catch {
     /* quota or private mode */
   }
@@ -79,16 +77,4 @@ export function markProcessingRunFinished(): void {
 export function hasProcessingRunFinished(): boolean {
   if (typeof window === "undefined") return false;
   return sessionStorage.getItem(PROCESSING_RUN_FINISHED_KEY) === "1";
-}
-
-export function readProcessingRunStartedAt(): number | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = sessionStorage.getItem(PROCESSING_RUN_STARTED_AT_KEY);
-    if (!raw) return null;
-    const n = Number(raw);
-    return Number.isFinite(n) ? n : null;
-  } catch {
-    return null;
-  }
 }
