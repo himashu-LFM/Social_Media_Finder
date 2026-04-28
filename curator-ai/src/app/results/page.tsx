@@ -30,8 +30,12 @@ function asString(v: unknown): string {
 
 function asConfidence(v: unknown): number {
   if (typeof v === "number") return Math.max(0, Math.min(1, v));
-  const n = Number(String(v ?? "").trim());
+  const raw = String(v ?? "").trim();
+  if (!raw) return 0;
+  const cleaned = raw.replace(/,/g, "").replace(/%$/, "");
+  const n = Number(cleaned);
   if (!Number.isFinite(n)) return 0;
+  // Treat 0..1 as already-normalized, 1..100 as percent points.
   if (n > 1) return Math.max(0, Math.min(1, n / 100));
   return Math.max(0, Math.min(1, n));
 }
