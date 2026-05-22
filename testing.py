@@ -1316,6 +1316,282 @@ def _slug_chars(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
+# Vertical/sub-account suffixes on brand handles (not the parent brand page).
+# Common word shortenings in brand handles (Basketball -> BBall, etc.)
+_BRAND_WORD_ABBREV: Dict[str, str] = {
+    "basketball": "bball",
+    "football": "fball",
+}
+
+_BRAND_VERTICAL_SUFFIXES = frozenset({
+    "football", "basketball", "cbb", "wcbb", "cfb", "nba", "nfl", "mlb", "nhl", "mls",
+    "soccer", "college", "fantasy", "gaming", "news", "sport", "sports", "golf", "tennis",
+    "racing", "mma", "wwe", "esports", "highlights", "podcast", "radio", "tv", "plus",
+    "women", "womens", "men", "kids", "pr", "shop", "store", "fan", "fans", "hq",
+})
+
+
+def _brand_canonical_slug(talent: str) -> str:
+    return _slug_chars(talent)
+
+
+def _brand_name_parts(talent: str) -> List[str]:
+    return re.findall(r"[a-zA-Z0-9]+", talent or "")
+
+
+def _talent_name_implies_brand(talent: str) -> bool:
+    """
+    Infer media-brand rows when metadata is missing or only says 'Talent'
+    (e.g. 'Overtime Elite' with no Publishers category).
+    """
+    t = (talent or "").strip()
+    if not t or is_first_name_only(t):
+        return False
+    parts = _brand_name_parts(t)
+    if len(parts) < 2:
+        return False
+    slug = _slug_chars(t)
+    org_markers = (
+        "sports", "sport", "network", "media", "elite", "athletic", "tribune",
+        "report", "overtime", "yahoo", "bleacher", "espn", "tsn", "sportsnet",
+        "publication", "broadcast", "channel", "league",
+    )
+    if any(m in slug for m in org_markers):
+        return True
+    if re.search(r"\([A-Z]{2,}\)", talent):
+        return True
+    if len(parts) >= 3 and parts[0].lower() == "the":
+        return True
+    return False
+
+
+def _brand_explicit_acronyms(talent: str) -> List[str]:
+    """Acronyms from parentheses (TSN) or ALL-CAPS tokens in the name."""
+    found: List[str] = []
+    seen: set = set()
+    for m in re.finditer(r"\(([A-Za-z0-9]{2,})\)", talent or ""):
+        ac = m.group(1).lower()
+        if ac not in seen:
+            seen.add(ac)
+            found.append(ac)
+    for m in re.finditer(r"\b[A-Z]{2,}\b", talent or ""):
+        ac = m.group(0).lower()
+        if ac not in seen:
+            seen.add(ac)
+            found.append(ac)
+    return found
+
+
+def _brand_short_acronyms(parts: List[str]) -> List[str]:
+    """Short handles: oe, ote (O+last-2-letters), tbt, etc."""
+    if len(parts) < 2:
+        return []
+    meaningful = [p for p in parts if p.lower() not in ("the", "and", "of", "a")]
+    if len(meaningful) < 2:
+        meaningful = parts
+    first, last = meaningful[0], meaningful[-1]
+    acronyms: List[str] = []
+    if first and last:
+        acronyms.append("".join(p[0].lower() for p in meaningful if p))
+        if len(last) >= 2:
+            acronyms.append(first[0].lower() + last[:2].lower())
+        if len(last) >= 3:
+            acronyms.append(first[0].lower() + last[-2:].lower())
+    return acronyms
+
+
+def _brand_parent_slug(talent: str) -> str:
+    """Parent brand slug when talent ends with a number (FOX Sports 1 -> foxsports)."""
+    parts = _brand_name_parts(talent)
+    if parts and parts[-1].isdigit():
+        return _slug_chars("".join(parts[:-1]))
+    return ""
+
+
+def _brand_search_handles(talent: str) -> List[str]:
+    """Likely official handles: compact slug, acronym (fs1), parent slug for shared YT, etc."""
+    handles: List[str] = []
+    seen: set = set()
+
+    def add(h: str) -> None:
+        h = (h or "").strip().lstrip("@").lower()
+        if h and h not in seen:
+            seen.add(h)
+            handles.append(h)
+
+    parts = _brand_name_parts(talent)
+    add(_brand_canonical_slug(talent))
+    for ac in _brand_explicit_acronyms(talent):
+        add(ac)
+    if parts:
+        add("".join(p.lower() for p in parts))
+        if parts[0].lower() == "the" and len(parts) > 1:
+            add("".join(p.lower() for p in parts[1:]))
+            add("".join(p[0].lower() for p in parts[1:] if p))
+        if len(parts) >= 2:
+            add("".join(p[0].lower() for p in parts if p))
+        for ac in _brand_short_acronyms(parts):
+            add(ac)
+        if parts[-1].isdigit():
+            add("".join(p[0].lower() for p in parts if p))
+        if len(parts[0]) <= 4 and re.match(r"^[a-zA-Z0-9]+$", parts[0]):
+            add(parts[0].lower())
+        if re.search(r"\d", "".join(parts)):
+            add("".join(p[0].lower() for p in parts if p and p[0].isalnum()))
+        abbrev_join = []
+        for p in parts:
+            pl = p.lower()
+            if pl in _BRAND_WORD_ABBREV:
+                abbrev_join.append(_BRAND_WORD_ABBREV[pl])
+            elif pl != "the":
+                abbrev_join.append(p.lower())
+        if abbrev_join:
+            add("".join(abbrev_join))
+            if parts and parts[0].lower() == "the":
+                add("the" + "".join(abbrev_join))
+    for h in list(handles):
+        if 2 <= len(h) <= 14:
+            add(f"{h}_official")
+    return handles[:12]
+
+
+def _brand_known_handle_slugs(talent: str) -> set:
+    return {_slug_chars(h) for h in _brand_search_handles(talent)}
+
+
+def _platform_from_link(link: str) -> str:
+    low = (link or "").lower()
+    for plat, domains in PLATFORMS.items():
+        if any(d in low for d in domains):
+            return plat
+    return ""
+
+
+def _is_youtube_channel_id_slug(slug: str) -> bool:
+    return bool(re.match(r"^UC[\w-]{10,}$", slug or "", re.I))
+
+
+def _candidate_supports_brand(talent: str, candidate: dict) -> bool:
+    """Title/snippet evidence that a URL (esp. YouTube /channel/UC…) belongs to this brand."""
+    title = (candidate.get("title") or "")
+    snippet = (candidate.get("snippet") or "")
+    blob = f"{title} {snippet}".lower()
+    slug = _slug_chars(talent)
+    if slug and len(slug) >= 5 and slug[: min(10, len(slug))] in _slug_chars(blob):
+        return True
+    for part in _brand_name_parts(talent):
+        pl = part.lower()
+        if pl in ("the", "and", "of", "a") or len(pl) < 3:
+            continue
+        if pl in blob:
+            return True
+    for ac in _brand_explicit_acronyms(talent):
+        if ac in blob:
+            return True
+    return False
+
+
+def _path_handle_slug(link: str, platform: str) -> str:
+    """Handle slug from a profile URL (YouTube /user/FoxSports -> foxsports)."""
+    segs = [s for s in urlparse(link).path.strip("/").split("/") if s]
+    if not segs:
+        return ""
+    if platform == "YouTube" and segs[0].lower() in ("user", "channel", "c") and len(segs) >= 2:
+        return _slug_chars(segs[1].lstrip("@"))
+    return _slug_chars(segs[-1].lstrip("@"))
+
+
+def _brand_handle_matches_row(
+    talent: str, handle_slug: str, platform: str = "",
+) -> bool:
+    """True when URL handle matches this brand row (not a parent/vertical/other brand)."""
+    handle_slug = _slug_chars(handle_slug)
+    if not handle_slug:
+        return False
+    if handle_slug in _brand_known_handle_slugs(talent):
+        return True
+    canonical = _brand_canonical_slug(talent)
+    if handle_slug == canonical:
+        return True
+    parent = _brand_parent_slug(talent)
+    if parent and handle_slug == parent:
+        return platform == "YouTube"
+    first_tokens = re.findall(r"[a-z0-9]+", (talent or "").lower())
+    if (
+        first_tokens
+        and handle_slug == _slug_chars(first_tokens[0])
+        and re.search(r"\d", first_tokens[0])
+    ):
+        return True
+    significant = [t for t in first_tokens if len(t) > 1 or t.isdigit()]
+    if not significant or not all(t in handle_slug for t in significant):
+        return False
+    if canonical and handle_slug.startswith(canonical) and len(handle_slug) > len(canonical):
+        extra = handle_slug[len(canonical):]
+        if extra and extra not in _slug_chars(talent) and (
+            extra in _BRAND_VERTICAL_SUFFIXES or len(extra) >= 2
+        ):
+            return False
+    return True
+
+
+def _brand_slug_is_vertical(
+    canonical: str, path_slug: str, talent: str, platform: str = "",
+) -> bool:
+    """True for vertical/sub-brand/parent-mismatch handles (e.g. cbssportscbb, foxsportspr)."""
+    path_slug = _slug_chars(path_slug)
+    canonical = _slug_chars(canonical)
+    if not path_slug:
+        return False
+    if _brand_handle_matches_row(talent, path_slug, platform):
+        return False
+    parent = _brand_parent_slug(talent)
+    if parent and path_slug == parent and platform != "YouTube":
+        return True
+    if canonical and path_slug != canonical and canonical.startswith(path_slug) and len(canonical) > len(path_slug) + 1:
+        return True
+    if canonical and path_slug.startswith(canonical) and len(path_slug) > len(canonical):
+        remainder = path_slug[len(canonical):]
+        if remainder in _BRAND_VERTICAL_SUFFIXES or len(remainder) >= 2:
+            return True
+    return False
+
+
+def profile_from_candidate_url(link: str, platform: str) -> str:
+    """Normalize Serper links to a profile root (e.g. facebook.com/foxsports/videos/... -> /foxsports)."""
+    if not link:
+        return ""
+    if is_valid_profile_url(link, platform):
+        return normalize_profile_url(link, platform)
+    low = link.lower()
+    if platform == "Facebook" and "facebook.com" in low:
+        m = re.search(r"facebook\.com/([^/?#]+)", low, re.I)
+        if m:
+            handle = m.group(1).lower()
+            blocked = {
+                "share", "sharer", "groups", "events", "marketplace", "gaming", "watch",
+                "people", "pages", "profile.php", "public", "login",
+            }
+            if handle not in blocked:
+                base = f"https://www.facebook.com/{m.group(1)}"
+                if is_valid_profile_url(base, platform):
+                    return normalize_profile_url(base, platform)
+    if platform == "YouTube" and "youtube.com" in low:
+        for pattern in (
+            r"youtube\.com/(@[\w.-]+)",
+            r"youtube\.com/user/([\w.-]+)",
+            r"youtube\.com/channel/([\w.-]+)",
+            r"youtube\.com/c/([\w.-]+)",
+        ):
+            m = re.search(pattern, low, re.I)
+            if m:
+                seg = m.group(0).split("youtube.com/")[-1].split("?")[0]
+                base = f"https://www.youtube.com/{seg}"
+                if is_valid_profile_url(base, platform):
+                    return normalize_profile_url(base, platform)
+    return ""
+
+
 # ─────────────────────────────────────────────
 #  NAME AMBIGUITY  (NEW)
 # ─────────────────────────────────────────────
@@ -1382,18 +1658,34 @@ def extract_search_keywords(title_category: str, title_sub_category: str) -> str
     return " ".join(words[:14])[:140].strip()
 
 
-def parse_entity_expectations(title_category: str, title_sub_category: str) -> Dict[str, bool]:
+def parse_entity_expectations(
+    title_category: str,
+    title_sub_category: str,
+    talent: str = "",
+) -> Dict[str, bool]:
     blob = f"{title_category or ''} {title_sub_category or ''}".lower()
+    cat = (title_category or "").lower()
+    expects_brand = bool(
+        re.search(r"\bpublishers?\b", cat)
+        or re.search(r"\b(publication|network|brand|company|organization|organisation)\b", blob)
+        or re.search(r"\btv\s*network\b", cat)
+        or re.search(r"\bmedia\s*(brand|company|outlet)\b", blob)
+        or _talent_name_implies_brand(talent)
+    )
     return {
+        "expects_brand":      expects_brand,
         "expects_male":       bool(re.search(r"gender\s*-\s*man\b", blob)),
         "expects_female":     bool(re.search(r"gender\s*-\s*woman\b", blob)),
-        "expects_athlete":    bool(
+        "expects_athlete":    False if expects_brand else bool(
             re.search(r"\bathlete\b", blob)
             or re.search(r"\bbasketball\b", blob)
             or re.search(r"\bfootball\b", blob)
-            or "sport" in blob
+            or (
+                "sport" in blob
+                and not re.search(r"publication\s*type", blob)
+            )
         ),
-        "expects_basketball": "basketball" in blob,
+        "expects_basketball": False if expects_brand else ("basketball" in blob),
         "expects_musician":   bool(
             re.search(r"\bmusician\b|\bsinger\b|\brap(per)?\b|\bartist\b|\bband\b", blob)
         ),
@@ -1530,14 +1822,30 @@ def build_candidate_signals(talent: str, candidate: dict, platform: str) -> dict
 # ─────────────────────────────────────────────
 
 def get_category_disambiguation_context(
-    title_category: str, title_sub_category: str
+    title_category: str,
+    title_sub_category: str,
+    talent: str = "",
 ) -> str:
     """
     Return a category-specific disambiguation instruction block for the AI prompt.
     This tells the model exactly what signals confirm vs contradict the expected identity.
     """
-    exp = parse_entity_expectations(title_category, title_sub_category)
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=talent)
     lines: List[str] = []
+
+    if exp.get("expects_brand"):
+        handles = ", ".join(f"@{h}" for h in _brand_search_handles(talent)[:4]) if talent else ""
+        lines += [
+            "CATEGORY: This row is a MEDIA BRAND / PUBLISHER / TV NETWORK (organization), not an individual person.",
+            "SELECT the official organization page for this brand on this platform.",
+            "CONFIRM if: URL handle matches the brand name, or title/snippet names the network/outlet/channel.",
+            "CONFIRM if: verified/official signals and high follower counts typical of major media brands.",
+            f"PREFERRED HANDLES (search hints): {handles or '(derive from talent name)'}",
+            "REJECT if: profile is clearly an individual employee, journalist, or fan — unless the talent name is that person.",
+            "REJECT if: vertical/sub-brand page (e.g. /BrandFootball, /BrandPR, /BrandCBB) when the talent is the parent brand.",
+            "REJECT if: parent brand handle when talent is a distinct sub-brand (e.g. foxsports for FOX Sports 1 — prefer foxsports1/FOXSports1).",
+        ]
+        return "\n".join(lines)
 
     if exp["expects_athlete"] or exp["expects_basketball"]:
         sport = "basketball" if exp["expects_basketball"] else "sports/athletics"
@@ -1606,6 +1914,7 @@ def entity_profile_rejected(
     title_category: str,
     title_sub_category: str,
     candidate: Optional[dict],
+    platform: str = "",
 ) -> Tuple[bool, str]:
     """
     Reject Serper candidates that clearly contradict Excel metadata.
@@ -1618,7 +1927,32 @@ def entity_profile_rejected(
     snippet = (candidate.get("snippet") or "")
     link    = (candidate.get("link")    or "")
     blob    = f"{title} {snippet}".lower()
-    exp     = parse_entity_expectations(title_category, title_sub_category)
+    exp     = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+
+    if exp.get("expects_brand"):
+        plat = platform or _platform_from_link(link)
+        path_slug = _path_handle_slug(link, plat) if plat else _slug_chars(urlparse(link).path)
+        canonical = _brand_canonical_slug(talent)
+        if _brand_slug_is_vertical(canonical, path_slug, talent, plat):
+            return True, "Brand row: URL is a vertical/sub-brand or parent-mismatch handle, not the main brand page."
+        handle = path_slug
+        if (
+            plat == "YouTube"
+            and _is_youtube_channel_id_slug(handle)
+            and _candidate_supports_brand(talent, candidate)
+        ):
+            pass
+        elif handle and not _brand_handle_matches_row(talent, handle, plat):
+            person_markers = (
+                " i ", " my ", " he ", " she ", " his ", " her ", " husband", " wife",
+                "realtor", "agent at", "works at", "digital creator",
+            )
+            brand_markers = (
+                "network", "official", "sports", "media", "news", "tv", "channel",
+                "publisher", "broadcast", "we are", "follow us",
+            )
+            if any(p in blob for p in person_markers) and not any(b in blob for b in brand_markers):
+                return True, "Brand row: profile appears to be an individual, not the organization."
 
     # ── shared markers ──
     sport_markers = (
@@ -1715,6 +2049,7 @@ def candidate_rank_score(
     link    = (c.get("link")    or "").lower()
     t       = re.sub(r"\s+", " ", (talent or "").strip()).lower()
     score   = 0.0
+    exp_rank = parse_entity_expectations(title_category, title_sub_category, talent=talent)
 
     # ── Authenticity signals ──
     if "official" in title or "official" in snippet:
@@ -1750,11 +2085,32 @@ def candidate_rank_score(
             score += 1.0
 
     # ── Metadata keyword alignment ──
+    sport_bias_tokens = {
+        "sports", "sport", "basketball", "football", "publication", "publishers", "publisher",
+    }
     for token in _metadata_tokens(search_keywords):
         if len(token) < 3:
             continue
+        if exp_rank.get("expects_brand") and token in sport_bias_tokens:
+            continue
         if token in title or token in snippet:
             score += 1.5
+
+    # ── Brand handle alignment ──
+    if exp_rank.get("expects_brand"):
+        brand_slug = _path_handle_slug(link, platform) if platform else path_slug
+        canonical = _brand_canonical_slug(talent)
+        if canonical and brand_slug == canonical:
+            score += 12.0
+        elif _brand_handle_matches_row(talent, brand_slug, platform):
+            score += 8.0
+        elif platform == "YouTube" and _is_youtube_channel_id_slug(brand_slug):
+            if _candidate_supports_brand(talent, c):
+                score += 11.0
+        elif _candidate_supports_brand(talent, c):
+            score += 5.0
+        elif canonical and _brand_slug_is_vertical(canonical, brand_slug, talent, platform):
+            score -= 20.0
 
     # ── Username hint bonus (cross-platform consistency) ──
     if username_hints and platform:
@@ -1794,8 +2150,67 @@ def build_queries(
     username_hints: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     kw  = (search_keywords or "").strip()
-    exp = parse_entity_expectations(title_category, title_sub_category)
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=talent)
     queries: List[str] = []
+
+    # ── Brand: direct handle searches first (foxsports, on3sports, foxsports1, …) ──
+    if exp.get("expects_brand"):
+        for handle in _brand_search_handles(talent):
+            for domain in domains:
+                queries.append(f"site:{domain}/{handle}")
+                queries.append(f"site:{domain}/@{handle}")
+            queries.append(f'"{handle}" {platform} official')
+        parts = _brand_name_parts(talent)
+        parent_slug = _brand_parent_slug(talent)
+        if parent_slug and platform == "YouTube":
+            for domain in domains:
+                if "youtube" in domain:
+                    queries.insert(0, f"site:{domain}/user/{parent_slug}")
+                    cap = parent_slug[:1].upper() + parent_slug[1:]
+                    queries.insert(0, f"site:{domain}/user/{cap}")
+        if platform == "YouTube":
+            for domain in domains:
+                if "youtube" in domain:
+                    queries.insert(0, f'site:{domain}/channel "{talent}"')
+                    queries.insert(0, f'site:{domain} "{talent}" official channel')
+        if parts:
+            pascal = "".join(
+                (p[:1].upper() + p[1:].lower()) if p.isalpha() else p
+                for p in parts
+            )
+            compact_pascal = "".join(
+                (p[:1].upper() + p[1:].lower()) if len(p) > 1 else p.lower()
+                for p in parts
+            )
+            def _pascal_token(p: str) -> str:
+                pl = p.lower()
+                if pl in _BRAND_WORD_ABBREV:
+                    ab = _BRAND_WORD_ABBREV[pl]
+                    return ab[:1].upper() + ab[1:].lower()
+                if p.isalpha():
+                    return p[:1].upper() + p[1:].lower()
+                return p
+
+            abbrev_pascal = "".join(_pascal_token(p) for p in parts)
+            for domain in domains:
+                queries.insert(0, f"site:{domain}/{pascal}")
+                if compact_pascal.lower() != pascal.lower():
+                    queries.insert(0, f"site:{domain}/{compact_pascal}")
+                if abbrev_pascal.lower() not in (pascal.lower(), compact_pascal.lower()):
+                    queries.insert(0, f"site:{domain}/{abbrev_pascal}")
+        for domain in domains:
+            queries.append(f'site:{domain} "{talent}" official')
+            queries.append(f'site:{domain} "{talent}" verified')
+            queries.append(f'site:{domain} "{talent}"')
+        queries.append(f'"{talent}" {platform} official')
+        queries.append(f'"{talent}" {platform}')
+        seen: set = set()
+        unique: List[str] = []
+        for q in queries:
+            if q not in seen:
+                seen.add(q)
+                unique.append(q)
+        return unique
 
     # ── Username hint queries — highest-value; run first ──
     if username_hints:
@@ -2023,7 +2438,17 @@ def normalize_profile_url(url: str, platform: str) -> str:
     return u.rstrip("/")
 
 
-def talent_url_aligned(talent: str, link: str) -> bool:
+def talent_url_aligned(
+    talent: str,
+    link: str,
+    title_category: str = "",
+    title_sub_category: str = "",
+) -> bool:
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+    if exp.get("expects_brand"):
+        plat = _platform_from_link(link)
+        handle_slug = _path_handle_slug(link, plat) if plat else _slug_chars(urlparse(link).path)
+        return _brand_handle_matches_row(talent, handle_slug, plat)
     t = _slug_chars(talent)
     if len(t) < 4:
         return False
@@ -2130,7 +2555,10 @@ def ai_select_best_profile(
     if not candidates:
         return {"best_link": "", "confidence": 0.0, "reason": "No candidates provided."}
 
-    cat_context = get_category_disambiguation_context(entity_category, entity_sub_category)
+    exp_sel = parse_entity_expectations(entity_category, entity_sub_category, talent=talent)
+    cat_context = get_category_disambiguation_context(
+        entity_category, entity_sub_category, talent=talent,
+    )
 
     # Enrich candidates with pre-computed signals
     enriched_candidates = []
@@ -2156,14 +2584,24 @@ def ai_select_best_profile(
         if hint_lines else ""
     )
 
-    system_msg = (
-        "You are an expert social media profile resolver working for a talent research firm. "
-        "Your job is to identify the single official, active social media profile for a real public figure. "
-        "\n\nCORE RULE: A blank cell is ALWAYS better than a wrong link. "
-        "When uncertain, return empty string for best_link. "
-        "\nNEVER select: posts, videos, reels, shorts, news articles, Wikipedia pages, fan pages, "
-        "tribute accounts, brand pages for companies, or profiles that clearly belong to a different person."
-    )
+    if exp_sel.get("expects_brand"):
+        system_msg = (
+            "You are an expert social media profile resolver for media brands, publishers, and TV networks. "
+            "Your job is to identify the single official organization profile on each platform. "
+            "\n\nCORE RULE: A blank cell is ALWAYS better than a wrong link. "
+            "When uncertain, return empty string for best_link. "
+            "\nNEVER select: posts, videos, reels, individual employee accounts, fan pages, "
+            "news articles, or vertical sub-brands (e.g. /BrandFootball, /BrandPR) unless the talent name is that vertical."
+        )
+    else:
+        system_msg = (
+            "You are an expert social media profile resolver working for a talent research firm. "
+            "Your job is to identify the single official, active social media profile for a real public figure. "
+            "\n\nCORE RULE: A blank cell is ALWAYS better than a wrong link. "
+            "When uncertain, return empty string for best_link. "
+            "\nNEVER select: posts, videos, reels, shorts, news articles, Wikipedia pages, fan pages, "
+            "tribute accounts, or profiles that clearly belong to a different person."
+        )
 
     user_msg = f"""
 TALENT: "{talent}"
@@ -2202,6 +2640,7 @@ BLANK RULES (return best_link="" if any of these apply):
   • The best candidate's profession_signals conflict with the expected category (e.g. realtor for an athlete)
   • The best candidate is clearly a fan/tribute/unofficial page
   • You cannot distinguish between 2+ legitimate people with the same name
+  • For MEDIA BRANDS: reject parent-brand URLs when the talent is a sub-brand (e.g. foxsports for FOX Sports 1)
 
 OUTPUT FORMAT — strict JSON only, no markdown, no extra keys:
 {{
@@ -2278,13 +2717,40 @@ def ai_verify_selected_link(
     Returns (verified: bool, adjusted_confidence: float, reason: str).
     If verified=False, the caller should blank the result.
     """
-    cat_context = get_category_disambiguation_context(entity_category, entity_sub_category)
+    exp_v = parse_entity_expectations(entity_category, entity_sub_category, talent=talent)
+    cat_context = get_category_disambiguation_context(
+        entity_category, entity_sub_category, talent=talent,
+    )
     signals = build_candidate_signals(talent, {"link": link, "title": title, "snippet": snippet}, platform)
 
-    system_msg = (
-        "You are a fact-checker verifying whether a specific social media URL belongs "
-        "to a specific public figure. Answer with strict JSON only."
-    )
+    if exp_v.get("expects_brand"):
+        system_msg = (
+            "You are a fact-checker verifying whether a social URL is the official page for a "
+            "media brand/publisher/network (organization). Answer with strict JSON only."
+        )
+        verify_q = (
+            f"Does this URL clearly belong to the organization \"{talent}\" on {platform}?"
+        )
+        verify_no = (
+            "Answer NO if: clearly a different brand, an individual employee/fan account, "
+            "a vertical sub-page (PR/CFB/etc.) when the talent is the parent brand, "
+            "or a news article — not the org profile."
+        )
+    else:
+        system_msg = (
+            "You are a fact-checker verifying whether a specific social media URL belongs "
+            "to a specific public figure. Answer with strict JSON only."
+        )
+        verify_q = (
+            f"Does this URL clearly and definitively belong to the talent named above on {platform}?"
+        )
+        verify_no = (
+            "Answer NO if:\n"
+            "  • This is clearly a different person\n"
+            "  • This is a fan/tribute/unofficial page\n"
+            "  • This is a news article or Wikipedia page\n"
+            "  • There is not enough evidence to confirm identity"
+        )
     user_msg = f"""
 TALENT: "{talent}"
 PLATFORM: {platform}
@@ -2296,14 +2762,10 @@ PAGE TITLE:    {title}
 SNIPPET:       {snippet}
 PRE-COMPUTED SIGNALS: {json.dumps(signals, ensure_ascii=True)}
 
-QUESTION: Does this URL clearly and definitively belong to the talent named above on {platform}?
+QUESTION: {verify_q}
 
-Answer YES only if you are confident this is their real, official profile.
-Answer NO if:
-  • This is clearly a different person
-  • This is a fan/tribute/unofficial page
-  • This is a news article or Wikipedia page
-  • There is not enough evidence to confirm identity
+Answer YES only if you are confident this is the official profile for this entity.
+{verify_no}
 
 Output strict JSON only:
 {{"verified": true/false, "confidence": 0.0, "reason": "one sentence"}}
@@ -2358,6 +2820,7 @@ def decide_emitted_link(
     require higher confidence before we emit anything.
     """
     effective_min = _effective_min_confidence(talent)
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=talent)
 
     if not selected or selected == "Not Found":
         return "", confidence, reason or "No selection."
@@ -2379,16 +2842,30 @@ def decide_emitted_link(
         rej_fb, rej_msg = entity_profile_rejected(talent, title_category, title_sub_category, top_candidate)
         if rej_fb:
             return "", confidence, f"Omitted: {rej_msg}"
-        rs   = candidate_rank_score(talent, top_candidate, search_keywords, title_category, title_sub_category)
+        rs   = candidate_rank_score(
+            talent, top_candidate, search_keywords, title_category, title_sub_category,
+        )
         link = top_candidate.get("link", "")
-        if (
+        prof = profile_from_candidate_url(link, platform) or link
+        url_ok = (
             rs >= MIN_RANK_SCORE_FOR_FALLBACK
-            and talent_url_aligned(talent, link)
-            and is_valid_profile_url(link, platform)
-        ):
+            and talent_url_aligned(talent, prof, title_category, title_sub_category)
+            and is_valid_profile_url(prof, platform)
+        )
+        if exp.get("expects_brand"):
+            path_slug = _path_handle_slug(prof, platform)
+            url_ok = url_ok or (
+                rs >= MIN_RANK_SCORE_FOR_FALLBACK - 2.0
+                and _brand_handle_matches_row(talent, path_slug, platform)
+                and is_valid_profile_url(prof, platform)
+            )
+        if url_ok:
+            fb_conf = min(0.85, max(confidence, rs / 20.0))
+            if exp.get("expects_brand"):
+                fb_conf = max(fb_conf, 0.80)
             return (
-                normalize_profile_url(link, platform),
-                min(confidence, 0.68),
+                normalize_profile_url(prof, platform),
+                fb_conf,
                 f"Strong search rank + URL match ({rs:.1f}): {reason}",
             )
 
@@ -2524,7 +3001,7 @@ def enrich_row_from_anchor_profiles(df: pd.DataFrame, row_label: object) -> None
     if not best_url or not best_plat:
         return
     talent = str(df.at[row_label, "Talent Name"] or "")
-    print(f"[ENRICH] {talent} ← anchor {best_plat} (conf={best_c:.2f})")
+    print(f"[ENRICH] {talent} <- anchor {best_plat} (conf={best_c:.2f})")
     try:
         discovered = extract_social_links_from_page(best_url, best_plat)
     except Exception as exc:
@@ -2580,6 +3057,7 @@ def search_one_platform(
     username_hints: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, str, float, str]:
     search_keywords = extract_search_keywords(title_category, title_sub_category)
+    exp_search = parse_entity_expectations(title_category, title_sub_category, talent=talent)
     all_candidates: List[dict] = []
     seen_links: set = set()
 
@@ -2594,10 +3072,14 @@ def search_one_platform(
             results = serper_search(query, num_results=RESULTS_PER_QUERY)
             print(f"[QUERY] {platform} | {talent} | '{query}' -> {len(results)} raw results")
             for item in results:
-                link = item.get("link", "")
-                if link and link not in seen_links:
-                    seen_links.add(link)
-                    all_candidates.append(item)
+                raw_link = item.get("link", "")
+                prof = profile_from_candidate_url(raw_link, platform) or raw_link
+                if not prof or prof in seen_links:
+                    continue
+                if not is_valid_profile_url(prof, platform):
+                    continue
+                seen_links.add(prof)
+                all_candidates.append({**item, "link": prof})
         except Exception as exc:
             print(f"[WARN] Serper failed '{query}': {exc}")
             fatal_markers = (
@@ -2615,6 +3097,17 @@ def search_one_platform(
         time.sleep(0.2)
 
     valid_candidates = [c for c in all_candidates if is_valid_profile_url(c.get("link", ""), platform)]
+    if exp_search.get("expects_brand"):
+        canonical = _brand_canonical_slug(talent)
+        brand_clean: List[dict] = []
+        for c in valid_candidates:
+            clink = c.get("link", "")
+            path_slug = _path_handle_slug(clink, platform)
+            if _brand_slug_is_vertical(canonical, path_slug, talent, platform):
+                print(f"  [BRAND] Skip vertical handle: {(clink or '')[:90]}")
+                continue
+            brand_clean.append(c)
+        valid_candidates = brand_clean
     valid_candidates = sort_candidates_for_ai(
         talent, valid_candidates, search_keywords, title_category, title_sub_category,
         username_hints=username_hints, platform=platform,
@@ -2687,13 +3180,33 @@ def search_one_platform(
                 title_category, title_sub_category, search_keywords,
             )
             print(f"[VERIFY] {platform} | {talent} | verified={verified} conf={verify_conf:.2f} | {verify_rsn}")
+            path_slug = _path_handle_slug(selected, platform)
+            cand_brand = emit_candidate or top_candidate
+            brand_handle_ok = (
+                exp_search.get("expects_brand")
+                and (
+                    _brand_handle_matches_row(talent, path_slug, platform)
+                    or (
+                        platform == "YouTube"
+                        and _is_youtube_channel_id_slug(path_slug)
+                        and cand_brand
+                        and _candidate_supports_brand(talent, cand_brand)
+                    )
+                )
+            )
             if not verified and verify_conf < AI_VERIFY_MIN_CONFIDENCE:
-                # Verification failed decisively
-                print(f"[VETO] Verify vetoed result for {platform} | {talent}")
-                selected   = ""
-                confidence = min(confidence, verify_conf)
-                reason     = f"Verify pass failed: {verify_rsn}"
-                emit_candidate = None
+                if brand_handle_ok and confidence >= 0.55:
+                    print(
+                        f"[VERIFY-WAIVER] {platform} | {talent} | "
+                        "keeping brand handle match despite weak snippet verify"
+                    )
+                    reason = f"{reason} [verify waived: {verify_rsn}]"
+                else:
+                    print(f"[VETO] Verify vetoed result for {platform} | {talent}")
+                    selected   = ""
+                    confidence = min(confidence, verify_conf)
+                    reason     = f"Verify pass failed: {verify_rsn}"
+                    emit_candidate = None
             elif verified and verify_conf > 0:
                 # Blend confidence: average of selection + verify
                 confidence = round((confidence + verify_conf) / 2, 4)
@@ -2716,7 +3229,9 @@ def search_one_platform(
                 rs = candidate_rank_score(
                     talent, top_candidate, search_keywords, title_category, title_sub_category
                 )
-                if rs >= MIN_RANK_SCORE_FOR_FALLBACK and talent_url_aligned(talent, fallback):
+                if rs >= MIN_RANK_SCORE_FOR_FALLBACK and talent_url_aligned(
+                    talent, fallback, title_category, title_sub_category,
+                ):
                     return (
                         platform,
                         normalize_profile_url(fallback, platform),
