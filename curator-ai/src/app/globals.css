@@ -181,6 +181,7 @@ h4 {
 
 .lf-star {
   --star-color: rgba(255, 255, 255, 0.8);
+  --star-accent-color: rgba(242, 209, 0, 0.9);
   --star-tail-length: 6em;
   --star-tail-height: 2px;
   --star-width: calc(var(--star-tail-length) / 6);
@@ -194,9 +195,16 @@ h4 {
   width: var(--star-tail-length);
   height: var(--star-tail-height);
   color: var(--star-color);
-  background: linear-gradient(45deg, currentColor, transparent);
+  background: linear-gradient(
+    45deg,
+    var(--star-color) 0%,
+    var(--star-accent-color) 42%,
+    transparent 78%
+  );
   border-radius: 999px;
-  filter: drop-shadow(0 0 6px currentColor);
+  filter:
+    drop-shadow(0 0 6px var(--star-color))
+    drop-shadow(0 0 10px rgba(242, 209, 0, 0.28));
   transform: translate3d(104em, 0, 0);
   animation:
     lf-fall var(--fall-duration) var(--fall-delay) linear infinite,
@@ -211,9 +219,30 @@ h4 {
   left: calc(var(--star-width) / -2);
   width: var(--star-width);
   height: 100%;
-  background: linear-gradient(45deg, transparent, currentColor, transparent);
+  background: linear-gradient(
+    45deg,
+    transparent,
+    var(--star-accent-color),
+    var(--star-color),
+    transparent
+  );
   border-radius: inherit;
   animation: lf-blink 2s linear infinite;
+}
+
+.lf-stars:not(.lf-stars-cover) .lf-star:nth-child(3n + 1) {
+  --star-color: rgba(242, 209, 0, 0.95);
+  --star-accent-color: rgba(255, 255, 255, 0.9);
+}
+
+.lf-stars:not(.lf-stars-cover) .lf-star:nth-child(3n + 2) {
+  --star-color: rgba(255, 255, 255, 0.9);
+  --star-accent-color: rgba(242, 209, 0, 0.85);
+}
+
+.lf-stars:not(.lf-stars-cover) .lf-star:nth-child(3n) {
+  --star-color: rgba(255, 241, 168, 0.86);
+  --star-accent-color: rgba(255, 255, 255, 0.82);
 }
 
 .lf-star::before {
