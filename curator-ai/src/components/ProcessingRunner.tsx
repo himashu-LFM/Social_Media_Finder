@@ -15,10 +15,17 @@ type RowStatus = "queued" | "processing" | "done";
 type RunSource = "idle" | "python" | "demo";
 
 const PIPELINE_STEPS = [
-  "Serper search",
-  "Profile URL filter",
-  "AI selection",
-  "Confidence + source",
+  "Searching social platforms",
+  "Filtering profile URLs",
+  "AI identity check",
+  "Confidence + export",
+] as const;
+
+const LIVE_MESSAGES = [
+  "The backend is still working. You can leave this page open while it checks each profile.",
+  "Longer runs are normal when names need extra verification or multiple platform searches.",
+  "The queue updates as soon as Python starts a new row or finishes one.",
+  "Results will appear automatically once the export workbook is ready.",
 ] as const;
 
 function delay(ms: number) {
@@ -44,6 +51,8 @@ export function ProcessingRunner() {
   const cancelledRef = useRef(false);
   const completionMarkedRef = useRef(false);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const previousDoneCountRef = useRef(0);
+  const previousActiveIndexRef = useRef(-1);
 
   const doneCount = useMemo(
     () => statuses.filter((s) => s === "done").length,
@@ -52,6 +61,7 @@ export function ProcessingRunner() {
   const total = names?.length ?? 0;
   const allDone = total > 0 && doneCount === total;
   const currentNameIndex = statuses.findIndex((s) => s === "processing");
+  const remainingCount = Math.max(0, total - doneCount);
 
   useEffect(() => {
     setMounted(true);
@@ -135,6 +145,15 @@ export function ProcessingRunner() {
         }
         const data = (await res.json()) as JobPollPayload;
         const next = data.names.map((n) => n.status);
+        const nextDoneCount = next.filter((s) => s === "done").length;
+        const nextActiveIndex = next.findIndex((s) => s === "processing");
+        if (
+          nextDoneCount !== previousDoneCountRef.current ||
+          nextActiveIndex !== previousActiveIndexRef.current
+        ) {
+          previousDoneCountRef.current = nextDoneCount;
+          previousActiveIndexRef.current = nextActiveIndex;
+        }
         setStatuses(next);
 
         if (data.status === "completed") {
@@ -224,17 +243,81 @@ export function ProcessingRunner() {
   const pct = total ? Math.round((doneCount / total) * 100) : 0;
   const activeName =
     currentNameIndex >= 0 ? names[currentNameIndex] : names[names.length - 1];
+  const liveMessage = LIVE_MESSAGES[currentStepIndex % LIVE_MESSAGES.length];
+  const isWaitingForFirstRow = !allDone && doneCount === 0 && currentNameIndex < 0;
+  const statusLabel = allDone ? "Completed" : backendError ? "Needs attention" : "Live processing";
+  const statusTone = backendError
+    ? "border-rose-400/30 bg-rose-500/10 text-rose-200"
+    : allDone
+      ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
+      : "border-primary/30 bg-primary/10 text-primary";
+  const statusDot = backendError ? "bg-rose-300" : allDone ? "bg-emerald-300" : "bg-primary";
 
   return (
-    <div className="mx-auto w-full max-w-4xl space-y-8 px-6 py-10">
+    <div className="mx-auto w-full max-w-6xl space-y-6 px-4 py-6 sm:px-6 lg:py-8">
       {backendError && (
         <div
-          className="rounded-xl border border-rose-500/40 bg-rose-950/40 px-4 py-3 text-sm text-rose-200"
+          className="flex items-start gap-3 rounded-2xl border border-rose-500/40 bg-rose-950/50 px-4 py-3 text-sm text-rose-100 shadow-xl shadow-rose-950/20 ring-1 ring-white/5"
           role="alert"
         >
-          {backendError}
+          <span className="material-symbols-outlined mt-0.5 text-rose-300">error</span>
+          <div>
+            <p className="font-bold">Processing connection needs attention</p>
+            <p className="mt-1 text-rose-200/85">{backendError}</p>
+          </div>
         </div>
       )}
+
+      <section className="grid gap-5 xl:grid-cols-[1.25fr_0.95fr]">
+        <div className="relative overflow-hidden rounded-[2rem] border border-primary/25 bg-[radial-gradient(circle_at_20%_20%,rgba(242,209,0,0.16),transparent_28%),linear-gradient(135deg,rgba(15,23,42,0.96),rgba(2,6,23,0.92))] p-5 shadow-2xl shadow-black/40 ring-1 ring-white/10 sm:p-6 lg:p-8">
+          <div className="absolute -right-20 -top-20 h-64 w-64 rounded-full bg-primary/10 blur-3xl" />
+          <div className="absolute -bottom-24 left-1/3 h-56 w-56 rounded-full bg-sky-500/10 blur-3xl" />
+          <div className="relative z-10 flex flex-col gap-7 lg:flex-row lg:items-center">
+            <div className="relative mx-auto flex h-44 w-44 shrink-0 items-center justify-center sm:h-52 sm:w-52 lg:mx-0">
+              <div className="absolute inset-0 rounded-full border border-primary/20" />
+              <div className="absolute inset-4 rounded-full border border-primary/15" />
+              <div className="absolute inset-8 rounded-full border border-primary/10" />
+              <div className="absolute h-[92%] w-[92%] animate-spin rounded-full border-t-2 border-primary/80" />
+              <div className="absolute h-[64%] w-[64%] rounded-full bg-primary/10 blur-xl" />
+              <div className="absolute h-20 w-20 rounded-full border border-primary/20 bg-slate-950/70" />
+              <span className="material-symbols-outlined ai-pulse relative text-5xl text-primary">radar</span>
+              <span className="absolute bottom-7 rounded-full bg-slate-950/80 px-2.5 py-1 text-[11px] font-extrabold text-primary ring-1 ring-primary/20">
+                {pct}%
+              </span>
+            </div>
+
+            <div className="min-w-0 flex-1">
+              <div className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-bold ${statusTone}`}>
+                <span className={`h-2 w-2 animate-pulse rounded-full ${statusDot}`} />
+                {statusLabel}
+              </div>
+              <h2 className="max-w-xl text-3xl font-extrabold tracking-tight text-slate-50 sm:text-4xl">
+                {allDone ? "Your export is ready" : backendError ? "Processing is paused" : "We are still searching"}
+              </h2>
+              <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-300 sm:text-base">
+                {allDone
+                  ? "All names have been processed. You can open the results now."
+                  : backendError
+                    ? "The job status could not be found. If the Python server restarted, start Discovery again to create a fresh job."
+                    : isWaitingForFirstRow
+                    ? "The Python job has started and is warming up the first row. This can take a moment on larger uploads."
+                    : liveMessage}
+              </p>
+
+            </div>
+          </div>
+        </div>
+
+        <aside className="rounded-[2rem] border border-white/10 bg-slate-900/80 p-5 shadow-2xl shadow-black/25 ring-1 ring-white/5 sm:p-6">
+          <RunProgressPanel
+            activeName={allDone ? "Finished" : activeName}
+            doneCount={doneCount}
+            remainingCount={remainingCount}
+            total={total}
+            workbookStatus={allDone ? "Ready to view" : "Building export"}
+          />
+        </aside>
+      </section>
 
       <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-slate-900/80 p-8 ring-1 ring-white/5 md:p-10">
         <div className="absolute -right-24 -top-24 h-64 w-64 rounded-full bg-primary/10 blur-3xl" />
@@ -390,5 +473,66 @@ function StatusBadge({ status }: { status: RowStatus }) {
     <span className="inline-flex items-center gap-1 rounded-full bg-slate-800/80 px-2.5 py-1 text-xs font-semibold text-slate-500 ring-1 ring-white/10">
       Queued
     </span>
+  );
+}
+
+function RunProgressPanel({
+  activeName,
+  doneCount,
+  remainingCount,
+  total,
+  workbookStatus,
+}: {
+  activeName: string;
+  doneCount: number;
+  remainingCount: number;
+  total: number;
+  workbookStatus: string;
+}) {
+  return (
+    <div className="w-full rounded-2xl border border-white/10 bg-slate-950/55 p-4 ring-1 ring-white/5">
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-xs font-bold uppercase tracking-[0.18em] text-slate-500">
+            Run progress
+          </p>
+          <p className="mt-1 text-sm font-semibold text-slate-200">
+            {doneCount} of {total} rows completed
+          </p>
+        </div>
+        <span className="shrink-0 rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-extrabold text-primary">
+          {remainingCount} remaining
+        </span>
+      </div>
+      <div className="grid gap-3">
+        <ProgressTile marker="01" label="Current row" value={activeName} />
+        <ProgressTile marker="02" label="Verified rows" value={`${doneCount}/${total}`} />
+        <ProgressTile marker="03" label="Workbook" value={workbookStatus} />
+      </div>
+    </div>
+  );
+}
+
+function ProgressTile({
+  label,
+  value,
+  marker,
+}: {
+  label: string;
+  value: string;
+  marker: string;
+}) {
+  return (
+    <div className="flex h-full min-w-0 items-start gap-3 rounded-xl bg-slate-900/70 p-3 ring-1 ring-white/10">
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-xs font-extrabold text-primary ring-1 ring-primary/20">
+        {marker}
+      </div>
+      <div className="min-w-0">
+        <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">
+          {label}
+        </p>
+        <p className="mt-0.5 truncate text-sm font-extrabold text-slate-100">{value}</p>
+      </div>
+    </div>
   );
 }
