@@ -56,8 +56,9 @@ export function ResultsExportButton({ rows, sourceFileName }: Props) {
       type="button"
       disabled={rows.length === 0}
       onClick={download}
-      className="rounded-xl bg-primary px-5 py-3 text-sm font-bold text-white shadow-xl shadow-primary/30 transition hover:shadow-primary/50 disabled:cursor-not-allowed disabled:opacity-50"
+      className="lf-btn-primary inline-flex items-center gap-2 px-5 py-3 text-sm disabled:cursor-not-allowed disabled:opacity-50"
     >
+      <span className="material-symbols-outlined text-lg">download</span>
       Export to Excel
     </button>
   );

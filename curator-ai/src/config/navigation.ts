@@ -8,6 +8,7 @@ export const MAIN_NAV: NavItem[] = [
   { icon: "dashboard", label: "Discovery", href: "/discovery" },
   { icon: "network_intel_node", label: "Processing", href: "/processing" },
   { icon: "table_chart", label: "Results", href: "/results" },
+  { icon: "donut_large", label: "Analysis", href: "/analysis" },
 ];
 
 export function isNavActive(pathname: string, href: string): boolean {

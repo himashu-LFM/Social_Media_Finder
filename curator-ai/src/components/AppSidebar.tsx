@@ -8,10 +8,10 @@ export function AppSidebar() {
   const pathname = usePathname();
 
   return (
-    <nav className="fixed left-0 top-0 z-40 hidden h-screen w-64 flex-col gap-2 border-r border-white/5 bg-surface p-6 md:flex">
+    <nav className="fixed left-0 top-0 z-40 hidden h-screen w-64 flex-col gap-1.5 border-r border-white/5 bg-surface/95 p-6 backdrop-blur-xl md:flex">
       <Link
-        href="/discovery"
-        className="mb-8 inline-flex cursor-pointer items-center gap-2 rounded-lg font-[family-name:var(--font-manrope)] text-2xl font-black text-primary transition hover:opacity-90 hover:brightness-110"
+        href="/"
+        className="lf-card-hover mb-8 inline-flex cursor-pointer items-center gap-2.5 rounded-xl px-2 py-1 font-[family-name:var(--font-manrope)] text-2xl font-black text-primary"
       >
         <span className="inline-block h-2.5 w-2.5 rounded-full bg-primary shadow-[0_0_16px_rgba(242,209,0,0.8)]" />
         ListenFirst
@@ -23,29 +23,41 @@ export function AppSidebar() {
           <Link
             key={item.label}
             href={item.href}
-            className={`flex cursor-pointer items-center gap-3 rounded-lg px-4 py-3 text-sm font-medium transition hover:translate-x-0.5 hover:brightness-110 active:opacity-80 ${
+            className={`lf-card-hover group flex cursor-pointer items-center gap-3 rounded-xl px-4 py-3 text-sm font-medium transition ${
               active
-                ? "bg-surface-high text-primary shadow-sm ring-1 ring-white/5"
-                : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
+                ? "bg-primary/10 text-primary shadow-md shadow-primary/10 ring-1 ring-primary/25"
+                : "text-slate-400 hover:bg-white/5 hover:text-slate-100"
             }`}
           >
-            <span className="material-symbols-outlined text-[22px]">{item.icon}</span>
+            <span
+              className={`material-symbols-outlined text-[22px] transition-transform group-hover:scale-110 ${
+                active ? "text-primary" : ""
+              }`}
+            >
+              {item.icon}
+            </span>
             <span>{item.label}</span>
+            {active && (
+              <span className="ml-auto h-1.5 w-1.5 rounded-full bg-primary shadow-[0_0_8px_rgba(242,209,0,0.9)]" />
+            )}
           </Link>
         );
       })}
 
       <div className="mt-auto pt-6">
-        <div className="rounded-xl border border-primary/20 bg-primary/5 p-4">
-          <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-primary">
-            Pipeline
-          </p>
-          <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-700">
-            <div className="h-full w-[72%] rounded-full bg-primary" />
+        <div className="lf-gradient-border lf-card rounded-xl p-4">
+          <div className="relative z-10">
+            <p className="mb-2 inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-primary">
+              <span className="material-symbols-outlined text-sm">route</span>
+              Pipeline
+            </p>
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+              <div className="progress-shimmer h-full w-2/3 rounded-full bg-gradient-to-r from-primary-dim to-primary" />
+            </div>
+            <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
+              Search → Validate → Score → Export
+            </p>
           </div>
-          <p className="mt-2 text-[10px] text-slate-400">
-            Search {"->"} Validate {"->"} Export
-          </p>
         </div>
       </div>
     </nav>

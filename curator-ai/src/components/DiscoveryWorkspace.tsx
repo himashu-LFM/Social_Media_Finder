@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useToast } from "@/components/ToastProvider";
 import {
   getPythonApiUrl,
@@ -22,6 +22,11 @@ export function DiscoveryWorkspace() {
   const [ignoreSingle, setIgnoreSingle] = useState(true);
   const [hint, setHint] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const nameCount = useMemo(
+    () => parseNamesFromText(text, ignoreSingle).length,
+    [text, ignoreSingle],
+  );
 
   async function runDiscovery() {
     const names = parseNamesFromText(text, ignoreSingle);
@@ -88,65 +93,75 @@ export function DiscoveryWorkspace() {
 
   return (
     <>
-      <div className="rounded-2xl bg-surface p-8 ring-1 ring-white/5 shadow-[0_20px_40px_-10px_rgba(0,0,0,0.35)]">
-        <label
-          className="mb-4 block text-sm font-bold uppercase tracking-widest text-primary"
-          htmlFor="brand-names"
-        >
-          Target Entities
-        </label>
-        <textarea
-          id="brand-names"
-          rows={10}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          className="w-full resize-none rounded-xl border border-white/5 bg-surface-high/90 p-6 font-medium text-slate-100 placeholder:text-slate-500 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-primary/30"
-        />
-        <div className="mt-6 flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3 rounded-xl bg-surface-high/80 px-4 py-2.5 ring-1 ring-white/5">
-            <span className="text-xs font-semibold text-slate-400">
-              Ignore single-name entries
+      <div className="lf-enter lf-card lf-gradient-border p-6 sm:p-8">
+        <div className="relative z-10">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <label
+              className="inline-flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-primary"
+              htmlFor="brand-names"
+            >
+              <span className="material-symbols-outlined text-lg">groups</span>
+              Target Entities
+            </label>
+            <span className="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1 text-xs font-bold text-slate-300">
+              {nameCount} name{nameCount === 1 ? "" : "s"} ready
             </span>
+          </div>
+          <textarea
+            id="brand-names"
+            rows={10}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="One talent name per line…"
+            className="w-full resize-none rounded-xl border border-white/8 bg-slate-950/70 p-5 font-medium text-slate-100 placeholder:text-slate-500 transition focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-primary/25"
+          />
+          <div className="mt-6 flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-center gap-3 rounded-xl bg-slate-950/60 px-4 py-2.5 ring-1 ring-white/8">
+              <span className="material-symbols-outlined text-base text-slate-500">tune</span>
+              <span className="text-xs font-semibold text-slate-400">
+                Ignore single-name entries
+              </span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={ignoreSingle}
+                onClick={() => setIgnoreSingle((v) => !v)}
+                className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 ${
+                  ignoreSingle ? "bg-primary" : "bg-slate-600"
+                }`}
+              >
+                <span
+                  aria-hidden
+                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ${
+                    ignoreSingle ? "translate-x-4" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
             <button
               type="button"
-              role="switch"
-              aria-checked={ignoreSingle}
-              onClick={() => setIgnoreSingle((v) => !v)}
-              className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 ${
-                ignoreSingle ? "bg-primary" : "bg-slate-600"
-              }`}
+              disabled={loading}
+              onClick={() => void runDiscovery()}
+              className="lf-btn-primary inline-flex items-center gap-2 px-8 py-3 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              <span
-                aria-hidden
-                className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ${
-                  ignoreSingle ? "translate-x-4" : "translate-x-0.5"
-                }`}
-              />
+              <span className="material-symbols-outlined text-xl">
+                {loading ? "hourglass_top" : "rocket_launch"}
+              </span>
+              <span>{loading ? "Starting…" : "Run Discovery"}</span>
             </button>
           </div>
-          <button
-            type="button"
-            disabled={loading}
-            onClick={() => void runDiscovery()}
-            className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-primary-dim to-primary px-8 py-3 font-bold text-white shadow-lg shadow-indigo-500/20 transition hover:scale-[1.02] active:scale-95 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            <span>{loading ? "Starting…" : "Run Discovery"}</span>
-            <span className="material-symbols-outlined text-xl">arrow_forward</span>
-          </button>
         </div>
       </div>
 
       {hint && (
-        <p className="mt-4 text-sm text-amber-400" role="status">
+        <div
+          className="lf-enter mt-4 flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100"
+          role="status"
+        >
+          <span className="material-symbols-outlined text-base">warning</span>
           {hint}
-        </p>
+        </div>
       )}
-      {/* <p className="mt-4 text-xs text-slate-500">
-        With <code className="text-slate-400">NEXT_PUBLIC_PYTHON_API_URL</code> set, discovery runs on
-        the FastAPI backend in <code className="text-slate-400">C:\Testing</code> (heavy work stays in
-        Python). Otherwise Processing uses a short UI preview only. Then open Results for the exported
-        sheet.
-      </p> */}
     </>
   );
 }
