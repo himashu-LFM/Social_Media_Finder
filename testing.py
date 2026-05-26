@@ -1891,6 +1891,25 @@ def _metadata_tokens(search_keywords: str) -> List[str]:
     return [p for p in parts if p and p not in stop and len(p) > 2]
 
 
+def _talent_lookup_name(
+    talent: str,
+    title_category: str = "",
+    title_sub_category: str = "",
+) -> str:
+    """
+    Clean client-side suffix codes from person/athlete rows before search.
+    Example: "Ray Allen - DAR" should resolve as "Ray Allen", not as a separate identity.
+    """
+    name = re.sub(r"\s+", " ", (talent or "").strip())
+    if not name:
+        return ""
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=name)
+    if exp.get("expects_brand"):
+        return name
+    cleaned = re.sub(r"\s+[-–—|]\s+[A-Z0-9]{2,8}$", "", name).strip()
+    return cleaned or name
+
+
 def _athlete_handle_aliases(talent: str) -> List[str]:
     """Common compact athlete handles: tbey, tbey1, tylerbey, tylerbey1."""
     parts = [p.lower() for p in _brand_name_parts(talent)]
@@ -1909,6 +1928,7 @@ def _athlete_handle_aliases(talent: str) -> List[str]:
             aliases.append(value)
 
     add(first + last)
+    add(f"{first}{last}page")
     add(f"{first}{last}1")
     add(first[:1] + last)
     add(f"{first[:1]}{last}1")
@@ -1942,6 +1962,26 @@ def _parse_follower_count(text: str) -> Optional[float]:
     elif "k" in lower_full:
         val *= 1_000
     return val
+
+
+def _candidate_has_exact_profile_title(talent: str, candidate: dict) -> bool:
+    title = (candidate.get("title") or "").lower()
+    t = re.sub(r"\s+", " ", (talent or "").strip()).lower()
+    return bool(
+        t
+        and re.match(rf"^{re.escape(t)}\s*\(@[A-Za-z0-9_.-]{{2,30}}\)", title)
+    )
+
+
+def _candidate_has_name_matching_personal_website(talent: str, candidate: dict) -> bool:
+    blob = f"{candidate.get('title') or ''} {candidate.get('snippet') or ''}".lower()
+    name_slug = _slug_chars(talent)
+    website_match = re.search(r"website:\s*https?://(?:www\.)?([^/\s]+)", blob)
+    if not website_match or not name_slug:
+        return False
+    website_host = website_match.group(1).lower()
+    social_hosts = ("instagram.", "x.", "twitter.", "facebook.", "tiktok.", "youtube.")
+    return name_slug in _slug_chars(website_host) and not any(h in website_host for h in social_hosts)
 
 
 def build_candidate_signals(talent: str, candidate: dict, platform: str) -> dict:
@@ -2018,6 +2058,8 @@ def build_candidate_signals(talent: str, candidate: dict, platform: str) -> dict
         "url_depth":              url_depth,
         "handle":                 handle,
         "handle_suspicious":      handle_suspicious,
+        "exact_profile_title":    _candidate_has_exact_profile_title(talent, candidate),
+        "personal_website_match": _candidate_has_name_matching_personal_website(talent, candidate),
         "is_valid_profile_url":   is_valid_profile_url(link, platform),
         "search_position":        int(candidate.get("search_position", 99) or 99),
         "recovered_from_text":    bool(candidate.get("recovered_from_text")),
@@ -2182,6 +2224,7 @@ def entity_profile_rejected(
         "florida homes", "digital creator", "realtor sales",
         "realty & mortgage", "realty and mortgage",
         "listing agent", "homes for sale", "property management",
+        "nft creator", "crypto investor", "cryptocurrency", "web3",
     )
     non_sport_hit = any(m in blob for m in non_sport_professions)
 
@@ -2333,8 +2376,28 @@ def candidate_rank_score(
         blob = f"{title} {snippet}"
         position = int(c.get("search_position", 99) or 99)
         profile_handle = _path_handle_slug(link, platform)
+        profile_title_pattern = bool(
+            t
+            and t in title
+            and re.search(r"\(@[A-Za-z0-9_.-]{2,30}\)", c.get("title") or "")
+        )
+        exact_profile_title = bool(
+            _candidate_has_exact_profile_title(talent, c)
+        )
+        if profile_title_pattern and platform in {"X", "Instagram", "TikTok"}:
+            score += 7.0
+            if position <= 3:
+                score += 2.0
+        if exact_profile_title and platform in {"X", "Instagram", "TikTok"}:
+            score += 8.0
         if profile_handle and profile_handle in {_slug_chars(a) for a in _athlete_handle_aliases(talent)}:
             score += 7.0
+        if t and t in blob and any(s in query for s in ("official", "verified")):
+            score += 5.0
+            if position <= 3:
+                score += 2.0
+        if _candidate_has_name_matching_personal_website(talent, c):
+            score += 6.0
         if t and t in blob and any(s in query for s in ("basketball", "athlete", "hoops")):
             score += 4.0
             if position <= 3:
@@ -2408,8 +2471,18 @@ def candidate_rank_score(
         for src_plat, hint in username_hints.items():
             if src_plat == platform or not hint:
                 continue
-            if _slug_chars(hint) in path_slug:
-                score += 5.0   # exact handle match from another platform is very strong
+            hint_slug = _slug_chars(hint)
+            if hint_slug in path_slug:
+                hint_bonus = 5.0
+                if (
+                    not exp_rank.get("expects_brand")
+                    and (exp_rank["expects_athlete"] or exp_rank["expects_basketball"])
+                    and src_plat == "Facebook"
+                    and platform in {"X", "Instagram", "TikTok"}
+                    and hint_slug == name_slug
+                ):
+                    hint_bonus = 1.0
+                score += hint_bonus   # exact handle match from another platform is usually strong
                 break
 
     # ── Generic handle penalty ──
@@ -2532,6 +2605,10 @@ def build_queries(
         return unique
 
     if exp["expects_athlete"] or exp["expects_basketball"]:
+        for domain in domains:
+            queries.append(f'site:{domain} "{talent}" basketball')
+            queries.append(f'site:{domain} "{talent}" official')
+            queries.append(f'site:{domain} "{talent}" verified')
         for handle in _athlete_handle_aliases(talent):
             for domain in domains:
                 queries.append(f"site:{domain}/{handle}")
@@ -2855,6 +2932,59 @@ def _prefer_recovered_athlete_handle(
         )
         if score >= selected_score - 2.0:
             return c
+    return None
+
+
+def _prefer_personal_website_athlete_profile(
+    talent: str,
+    platform: str,
+    selected: str,
+    candidates: List[dict],
+    title_category: str,
+    title_sub_category: str,
+    search_keywords: str,
+) -> Optional[dict]:
+    """Prefer a top-ranked athlete profile that exposes a name-matching non-social website."""
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+    if exp.get("expects_brand") or not (exp["expects_athlete"] or exp["expects_basketball"]):
+        return None
+    if platform not in {"X", "Instagram", "TikTok"} or not candidates:
+        return None
+
+    top = candidates[0]
+    if not (
+        _candidate_has_exact_profile_title(talent, top)
+        and _candidate_has_name_matching_personal_website(talent, top)
+    ):
+        return None
+
+    selected_norm = normalize_profile_url(selected or "", platform).rstrip("/")
+    top_norm = normalize_profile_url(top.get("link", ""), platform).rstrip("/")
+    if selected_norm == top_norm:
+        return None
+
+    selected_candidate = next(
+        (
+            c for c in candidates
+            if normalize_profile_url(c.get("link", ""), platform).rstrip("/") == selected_norm
+        ),
+        None,
+    )
+    if selected_candidate and _candidate_has_name_matching_personal_website(talent, selected_candidate):
+        return None
+
+    top_score = candidate_rank_score(
+        talent, top, search_keywords, title_category, title_sub_category, platform=platform
+    )
+    selected_score = (
+        candidate_rank_score(
+            talent, selected_candidate, search_keywords, title_category, title_sub_category, platform=platform
+        )
+        if selected_candidate
+        else 0.0
+    )
+    if top_score >= selected_score:
+        return top
     return None
 
 
@@ -3536,12 +3666,13 @@ def search_one_platform(
     username_hints: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, str, float, str]:
     search_keywords = extract_search_keywords(title_category, title_sub_category)
-    exp_search = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+    lookup_talent = _talent_lookup_name(talent, title_category, title_sub_category)
+    exp_search = parse_entity_expectations(title_category, title_sub_category, talent=lookup_talent)
     all_candidates: List[dict] = []
     seen_links: set = set()
 
     queries = build_queries(
-        talent, platform, domains, search_keywords,
+        lookup_talent, platform, domains, search_keywords,
         title_category, title_sub_category,
         username_hints=username_hints,
     )
@@ -3549,7 +3680,7 @@ def search_one_platform(
     for query in queries:
         try:
             results = serper_search(query, num_results=RESULTS_PER_QUERY)
-            print(f"[QUERY] {platform} | {talent} | '{query}' -> {len(results)} raw results")
+            print(f"[QUERY] {platform} | {lookup_talent} | '{query}' -> {len(results)} raw results")
             for pos, item in enumerate(results, start=1):
                 raw_link = item.get("link", "")
                 prof = profile_from_candidate_url(raw_link, platform)
@@ -3589,16 +3720,16 @@ def search_one_platform(
 
     valid_candidates = [c for c in all_candidates if is_valid_profile_url(c.get("link", ""), platform)]
     if exp_search.get("expects_brand"):
-        canonical = _brand_canonical_slug(talent)
+        canonical = _brand_canonical_slug(lookup_talent)
         brand_clean: List[dict] = []
         for c in valid_candidates:
             clink = c.get("link", "")
             path_slug = _path_handle_slug(clink, platform)
-            if _brand_slug_is_vertical(canonical, path_slug, talent, platform):
+            if _brand_slug_is_vertical(canonical, path_slug, lookup_talent, platform):
                 print(f"  [BRAND] Skip vertical handle: {(clink or '')[:90]}")
                 continue
             rej_brand, why_brand = entity_profile_rejected(
-                talent, title_category, title_sub_category, c, platform
+                lookup_talent, title_category, title_sub_category, c, platform
             )
             if rej_brand:
                 print(f"  [BRAND] Skip mismatch: {(clink or '')[:90]} | {why_brand}")
@@ -3606,13 +3737,13 @@ def search_one_platform(
             brand_clean.append(c)
         valid_candidates = brand_clean
     valid_candidates = sort_candidates_for_ai(
-        talent, valid_candidates, search_keywords, title_category, title_sub_category,
+        lookup_talent, valid_candidates, search_keywords, title_category, title_sub_category,
         username_hints=username_hints, platform=platform,
     )
     top_candidates = valid_candidates[:MAX_CANDIDATES_FOR_AI]
 
     ctx = f" | kw: {search_keywords}" if search_keywords else ""
-    print(f"[INFO] {platform} | {talent}{ctx} -> {len(top_candidates)} profile-filtered candidates for AI")
+    print(f"[INFO] {platform} | {lookup_talent}{ctx} -> {len(top_candidates)} profile-filtered candidates for AI")
 
     if not top_candidates:
         return platform, "", 0.0, "No valid profile/channel URLs in search results."
@@ -3622,7 +3753,7 @@ def search_one_platform(
 
     try:
         ai_result  = ai_select_best_profile(
-            talent, platform, top_candidates,
+            lookup_talent, platform, top_candidates,
             title_category, title_sub_category, search_keywords,
             username_hints=username_hints,
         )
@@ -3631,7 +3762,7 @@ def search_one_platform(
         reason     = ai_result["reason"]
 
         recovered_pick = _prefer_recovered_athlete_handle(
-            talent, platform, selected, top_candidates,
+            lookup_talent, platform, selected, top_candidates,
             title_category, title_sub_category, search_keywords,
         )
         if recovered_pick:
@@ -3642,9 +3773,21 @@ def search_one_platform(
                 "that directly names the athlete."
             )
 
+        personal_site_pick = _prefer_personal_website_athlete_profile(
+            lookup_talent, platform, selected, top_candidates,
+            title_category, title_sub_category, search_keywords,
+        )
+        if personal_site_pick:
+            selected = personal_site_pick["link"]
+            confidence = max(confidence, 0.90)
+            reason = (
+                f"{reason} | Preferred top-ranked athlete profile with "
+                "a name-matching personal website."
+            )
+
         # ── If AI returned empty, try strong-rank fallback ──
         if not selected and fallback:
-            rej_fb, _ = entity_profile_rejected(talent, title_category, title_sub_category, top_candidate, platform)
+            rej_fb, _ = entity_profile_rejected(lookup_talent, title_category, title_sub_category, top_candidate, platform)
             if not rej_fb:
                 selected   = fallback
                 confidence = min(confidence, 0.42)
@@ -3653,7 +3796,7 @@ def search_one_platform(
         # ── If AI returned invalid URL, try fallback ──
         elif selected and not is_valid_profile_url(selected, platform):
             print(f"[WARN] AI returned non-profile URL; trying fallback.")
-            rej_fb, _ = entity_profile_rejected(talent, title_category, title_sub_category, top_candidate, platform)
+            rej_fb, _ = entity_profile_rejected(lookup_talent, title_category, title_sub_category, top_candidate, platform)
             if fallback and not rej_fb:
                 selected   = fallback
                 confidence = min(confidence, 0.42)
@@ -3673,9 +3816,9 @@ def search_one_platform(
             )
             emit_candidate = cand
             if cand:
-                rej, why = entity_profile_rejected(talent, title_category, title_sub_category, cand, platform)
+                rej, why = entity_profile_rejected(lookup_talent, title_category, title_sub_category, cand, platform)
                 if rej:
-                    print(f"[REJECT] {platform} | {talent} | {why}")
+                    print(f"[REJECT] {platform} | {lookup_talent} | {why}")
                     selected = ""; confidence = min(confidence, 0.15); reason = why
                     emit_candidate = None
 
@@ -3683,35 +3826,48 @@ def search_one_platform(
         if selected and confidence >= 0.55:
             cand_for_verify = emit_candidate or top_candidate
             verified, verify_conf, verify_rsn = ai_verify_selected_link(
-                talent, platform, selected,
+                lookup_talent, platform, selected,
                 cand_for_verify.get("title", "") if cand_for_verify else "",
                 cand_for_verify.get("snippet", "") if cand_for_verify else "",
                 title_category, title_sub_category, search_keywords,
             )
-            print(f"[VERIFY] {platform} | {talent} | verified={verified} conf={verify_conf:.2f} | {verify_rsn}")
+            print(f"[VERIFY] {platform} | {lookup_talent} | verified={verified} conf={verify_conf:.2f} | {verify_rsn}")
             path_slug = _path_handle_slug(selected, platform)
             cand_brand = emit_candidate or top_candidate
             brand_handle_ok = (
                 exp_search.get("expects_brand")
                 and (
-                    _brand_handle_matches_row(talent, path_slug, platform)
+                    _brand_handle_matches_row(lookup_talent, path_slug, platform)
                     or (
                         platform == "YouTube"
                         and _is_youtube_channel_id_slug(path_slug)
                         and cand_brand
-                        and _candidate_supports_brand(talent, cand_brand)
+                        and _candidate_supports_brand(lookup_talent, cand_brand)
                     )
                 )
             )
             if not verified and verify_conf < AI_VERIFY_MIN_CONFIDENCE:
+                athlete_profile_ok = (
+                    not exp_search.get("expects_brand")
+                    and (exp_search.get("expects_athlete") or exp_search.get("expects_basketball"))
+                    and cand_for_verify
+                    and _candidate_has_exact_profile_title(lookup_talent, cand_for_verify)
+                    and confidence >= 0.75
+                )
                 if brand_handle_ok and confidence >= 0.55:
                     print(
                         f"[VERIFY-WAIVER] {platform} | {talent} | "
                         "keeping brand handle match despite weak snippet verify"
                     )
                     reason = f"{reason} [verify waived: {verify_rsn}]"
+                elif athlete_profile_ok:
+                    print(
+                        f"[VERIFY-WAIVER] {platform} | {lookup_talent} | "
+                        "keeping exact athlete profile-title match despite weak snippet verify"
+                    )
+                    reason = f"{reason} [verify waived: {verify_rsn}]"
                 else:
-                    print(f"[VETO] Verify vetoed result for {platform} | {talent}")
+                    print(f"[VETO] Verify vetoed result for {platform} | {lookup_talent}")
                     selected   = ""
                     confidence = min(confidence, verify_conf)
                     reason     = f"Verify pass failed: {verify_rsn}"
@@ -3723,23 +3879,23 @@ def search_one_platform(
 
         # ── Final emission gate ──
         emit, conf_out, rsn_out = decide_emitted_link(
-            talent, platform, selected or "", confidence, reason,
+            lookup_talent, platform, selected or "", confidence, reason,
             top_candidate, search_keywords, title_category, title_sub_category,
             emit_candidate=emit_candidate,
         )
         return platform, emit, conf_out, rsn_out
 
     except Exception as exc:
-        print(f"[ERROR] AI/Verify failed for {platform} | {talent}: {exc}")
+        print(f"[ERROR] AI/Verify failed for {platform} | {lookup_talent}: {exc}")
         # Last-resort deterministic fallback
         if fallback:
-            rej_fb, _ = entity_profile_rejected(talent, title_category, title_sub_category, top_candidate, platform)
+            rej_fb, _ = entity_profile_rejected(lookup_talent, title_category, title_sub_category, top_candidate, platform)
             if not rej_fb:
                 rs = candidate_rank_score(
-                    talent, top_candidate, search_keywords, title_category, title_sub_category
+                    lookup_talent, top_candidate, search_keywords, title_category, title_sub_category
                 )
                 if rs >= MIN_RANK_SCORE_FOR_FALLBACK and talent_url_aligned(
-                    talent, fallback, title_category, title_sub_category,
+                    lookup_talent, fallback, title_category, title_sub_category,
                 ):
                     return (
                         platform,
