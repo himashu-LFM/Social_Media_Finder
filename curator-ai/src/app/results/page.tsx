@@ -3,6 +3,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import * as XLSX from "xlsx";
 import { AppMobileNav } from "@/components/AppMobileNav";
+import { AppPageHeader } from "@/components/AppPageHeader";
 import { ResultsAnalysisButton } from "@/components/ResultsAnalysisButton";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ResultsExportButton } from "@/components/ResultsExportButton";
@@ -214,60 +215,66 @@ export default async function ResultsPage() {
     : "Tip: set NEXT_PUBLIC_PYTHON_API_URL to your FastAPI URL so Results reads exports via Python when Excel locks the file.";
 
   return (
-    <div className="flex min-h-screen flex-col bg-background md:flex-row">
+    <div className="relative flex min-h-screen flex-col bg-background md:flex-row">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_100%_0%,rgba(242,209,0,0.06),transparent_30%)]"
+      />
       <AppSidebar />
 
-      <main className="md:ml-64 p-4 pb-32 md:p-8">
-        <header className="sticky top-0 z-30 mb-6 flex items-center justify-between bg-background/90 py-3 backdrop-blur-md">
-          <h1 className="text-lg font-bold text-slate-100">Results</h1>
-          <div className="flex items-center gap-2">
-            <ResultsAnalysisButton />
-            <ResultsExportButton rows={rows} sourceFileName={latestFileName} />
-          </div>
-        </header>
+      <main className="relative z-10 flex-1 p-4 pb-32 md:ml-64 md:p-8">
+        <AppPageHeader
+          title="Results"
+          subtitle="Export output"
+          icon="table_chart"
+          actions={
+            <>
+              <ResultsAnalysisButton />
+              <ResultsExportButton rows={rows} sourceFileName={latestFileName} />
+            </>
+          }
+        />
 
         <div className="mx-auto max-w-7xl space-y-6">
-          <div className="rounded-xl bg-slate-900/60 p-4 ring-1 ring-white/10">
-            <p className="text-sm text-slate-400">
-              Output schema: <code>Talent Name | title_category | title_sub_category | Facebook | Facebook Confidence | Instagram | Instagram Confidence | X | X Confidence | TikTok | TikTok Confidence | YouTube | YouTube Confidence | Confidence | Source</code>
-            </p>
-            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-              <span className="text-slate-400">Link confidence:</span>
-              <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-semibold text-emerald-300">
-                Green &gt; 85%
-              </span>
-              <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 font-semibold text-amber-300">
-                Yellow 70%-85%
-              </span>
-              <span className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 font-semibold text-rose-300">
-                Red &lt; 70%
-              </span>
+          <div className="lf-enter lf-card p-4 sm:p-5">
+            <div className="flex flex-wrap items-start gap-3">
+              <span className="material-symbols-outlined text-primary">schema</span>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm text-slate-300">
+                  Output schema: Talent Name, categories, five platform links + confidences, overall
+                  Confidence, Source.
+                </p>
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  <span className="text-slate-400">Link confidence:</span>
+                  <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-semibold text-emerald-300">
+                    Green &gt; 85%
+                  </span>
+                  <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 font-semibold text-amber-300">
+                    Yellow 70%-85%
+                  </span>
+                  <span className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 font-semibold text-rose-300">
+                    Red &lt; 70%
+                  </span>
+                </div>
+                <p className="mt-2 text-xs text-slate-500">
+                  Latest file: {latestFileName ?? "No Talent_Social_Lookup_*.xlsx found yet"}
+                </p>
+                {loadWarning && <p className="mt-1 text-xs text-sky-400">{loadWarning}</p>}
+                {loadError && (
+                  <p className="mt-1 text-xs text-amber-400">
+                    Could not read any workbook (possibly all open/locked): {loadError}
+                  </p>
+                )}
+                {apiHint && <p className="mt-2 text-xs text-slate-500">{apiHint}</p>}
+              </div>
             </div>
-            <p className="mt-2 text-xs text-slate-500">
-              Latest file: {latestFileName ?? "No Talent_Social_Lookup_*.xlsx found in C:\\Testing"}
-            </p>
-            {loadWarning && (
-              <p className="mt-1 text-xs text-sky-400">
-                {loadWarning}
-              </p>
-            )}
-            {loadError && (
-              <p className="mt-1 text-xs text-amber-400">
-                Could not read any workbook (possibly all open/locked): {loadError}
-              </p>
-            )}
-            {apiHint && (
-              <p className="mt-2 text-xs text-slate-500">
-                {apiHint}
-              </p>
-            )}
           </div>
 
-          <div className="overflow-hidden rounded-2xl bg-slate-900/75 ring-1 ring-white/10">
+          <div className="lf-enter lf-enter-delay-1 lf-card overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full min-w-[1300px] border-collapse text-left">
                 <thead>
-                  <tr className="border-b border-white/10 bg-slate-800/40">
+                  <tr className="border-b border-white/10 bg-slate-950/70">
                     {[
                       "Talent Name",
                       "Category",
@@ -280,15 +287,21 @@ export default async function ResultsPage() {
                       "Confidence",
                       "Source",
                     ].map((h) => (
-                      <th key={h} className="px-4 py-4 text-xs font-bold uppercase tracking-wider text-slate-500">
+                      <th
+                        key={h}
+                        className="px-4 py-4 text-xs font-bold uppercase tracking-wider text-slate-500"
+                      >
                         {h}
                       </th>
                     ))}
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-white/10">
+                <tbody className="divide-y divide-white/8">
                   {rows.map((r) => (
-                    <tr key={`${r.name}-${r.facebook}-${r.instagram}`} className="align-top transition-colors hover:bg-slate-800/30">
+                    <tr
+                      key={`${r.name}-${r.facebook}-${r.instagram}`}
+                      className="align-top transition-colors hover:bg-primary/[0.03]"
+                    >
                       <td className="px-4 py-4 font-semibold text-slate-100">{r.name}</td>
                       <td className="px-4 py-4 text-sm text-slate-300">{r.category || "-"}</td>
                       <td className="px-4 py-4 text-sm text-slate-300">{r.subCategory || "-"}</td>
@@ -320,28 +333,44 @@ export default async function ResultsPage() {
           </div>
 
           <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
-            <div className="rounded-2xl bg-slate-900/70 p-6 ring-1 ring-white/10">
-              <div className="text-xs font-bold uppercase tracking-wider text-slate-500">High Confidence Rows</div>
+            <div className="lf-enter lf-enter-delay-2 lf-card lf-card-hover lf-stat-glow-emerald p-6">
+              <div className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-500">
+                <span className="material-symbols-outlined text-base text-emerald-400">verified</span>
+                High Confidence Rows
+              </div>
               <div className="mt-2 text-4xl font-black text-emerald-400">{highCount}</div>
             </div>
-            <div className="rounded-2xl bg-slate-900/70 p-6 ring-1 ring-white/10">
-              <div className="text-xs font-bold uppercase tracking-wider text-slate-500">Ambiguous Rows</div>
+            <div className="lf-enter lf-enter-delay-2 lf-card lf-card-hover lf-stat-glow-amber p-6">
+              <div className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-500">
+                <span className="material-symbols-outlined text-base text-amber-400">help</span>
+                Ambiguous Rows
+              </div>
               <div className="mt-2 text-4xl font-black text-amber-400">{ambiguousCount}</div>
             </div>
-            <div className="rounded-2xl bg-primary p-6 text-white shadow-xl shadow-primary/30 ring-1 ring-primary/30">
-              <div className="text-xs font-bold uppercase tracking-wider text-indigo-100">Average Confidence</div>
-              <div className="mt-2 text-4xl font-black">
+            <div className="lf-enter lf-enter-delay-3 lf-card lf-card-hover lf-stat-glow-primary border-primary/25 bg-primary/10 p-6">
+              <div className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-primary/80">
+                <span className="material-symbols-outlined text-base">analytics</span>
+                Average Confidence
+              </div>
+              <div className="mt-2 text-4xl font-black text-slate-950">
                 {(avgConfidence * 100).toFixed(1)}%
               </div>
             </div>
           </div>
 
-          <div className="rounded-2xl border border-primary/30 bg-primary/10 p-6 ring-1 ring-primary/20">
-            <div className="text-xs font-bold uppercase tracking-wider text-indigo-200">Final Confidence Score</div>
-            <div className="mt-2 text-3xl font-black text-white">{(avgConfidence * 100).toFixed(2)}%</div>
-            <p className="mt-2 text-xs text-indigo-100/80">
-              Computed as average row confidence across all processed records.
-            </p>
+          <div className="lf-enter lf-enter-delay-3 lf-gradient-border lf-card border-primary/25 bg-primary/10 p-6">
+            <div className="relative z-10">
+              <div className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-primary">
+                <span className="material-symbols-outlined text-base">grade</span>
+                Final Confidence Score
+              </div>
+              <div className="mt-2 text-3xl font-black text-slate-950">
+                {(avgConfidence * 100).toFixed(2)}%
+              </div>
+              <p className="mt-2 text-xs text-slate-700">
+                Computed as average row confidence across all processed records.
+              </p>
+            </div>
           </div>
         </div>
       </main>

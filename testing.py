@@ -1,1221 +1,3 @@
-# import json
-# import os
-# import random
-# import re
-# import time
-# from concurrent.futures import ThreadPoolExecutor, as_completed
-# from datetime import datetime
-# from pathlib import Path
-# from typing import Callable, Dict, List, Optional, Tuple
-# from urllib.parse import urlparse
-
-# import pandas as pd
-# import requests
-
-# try:
-#     from dotenv import load_dotenv
-
-#     load_dotenv(Path(__file__).resolve().parent / ".env")
-# except ImportError:
-#     pass
-
-# # ================== API KEYS (set in .env: SERPER_API_KEY, OPENAI_API_KEY) ==================
-# SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "").strip()
-# OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-
-# OPENAI_CHAT_MODEL = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-
-# # Optional: load names from Excel in same folder as this script
-# TEST_BRANDS_PATH = Path(__file__).resolve().parent / "Demo_Social.xlsx"
-
-# # ================== INPUT (used if Demo_Social.xlsx is missing) ==================
-# talent_names = [
-#     "Britney Vest",
-#     "Ari Melber",
-#     "Alyssa Anderson",
-#     "Andrea",
-#     "Anastasia Pagonis",
-# ]
-
-# # ================== CONFIG ==================
-# RESULTS_PER_QUERY = 10
-# MAX_CANDIDATES_FOR_AI = 5
-# MAX_WORKERS = 3
-# REQUEST_DELAY_BETWEEN_TALENTS = (1.0, 2.0)
-# OPENAI_DELAY_SECONDS = 0.4
-
-# # Emit a profile URL only if confidence is at least this (otherwise leave cell blank).
-# MIN_CONFIDENCE_EMIT = float(os.environ.get("MIN_CONFIDENCE_EMIT", "0.72"))
-# # Use a high-confidence profile page to discover other platforms (bio / Linktree / about).
-# ANCHOR_MIN_CONFIDENCE = float(os.environ.get("ANCHOR_MIN_CONFIDENCE", "0.86"))
-# # Only use deterministic fallback (first ranked candidate) if rank score is very strong.
-# MIN_RANK_SCORE_FOR_FALLBACK = float(os.environ.get("MIN_RANK_SCORE_FOR_FALLBACK", "12.0"))
-
-# FETCH_HEADERS = {
-#     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-#     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-#     "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-#     "Accept-Language": "en-US,en;q=0.9",
-# }
-
-# # Per-row per-platform confidence (filled in process_row) for enrichment step.
-# ROW_PLATFORM_CONFIDENCE: Dict[object, Dict[str, float]] = {}
-# # Per-row per-platform provenance: "input" | "search" | "bio_enrich"
-# ROW_PLATFORM_SOURCE: Dict[object, Dict[str, str]] = {}
-
-# PLATFORMS: Dict[str, List[str]] = {
-#     "Facebook": ["facebook.com"],
-#     "Instagram": ["instagram.com"],
-#     "X": ["x.com", "twitter.com"],
-#     "TikTok": ["tiktok.com"],
-#     "YouTube": ["youtube.com"],
-# }
-
-# PLATFORM_CONF_COLUMNS: Dict[str, str] = {
-#     p: f"{p} Confidence" for p in PLATFORMS
-# }
-
-
-# def is_first_name_only(talent: str) -> bool:
-#     parts = re.sub(r"\s+", " ", (talent or "").strip()).split()
-#     return len(parts) == 1 and bool(parts[0])
-
-
-# def _find_column(raw: pd.DataFrame, *candidates: str) -> Optional[str]:
-#     cmap = {str(c).strip().lower(): c for c in raw.columns}
-#     for cand in candidates:
-#         if cand.lower() in cmap:
-#             return cmap[cand.lower()]
-#     return None
-
-
-# def extract_search_keywords(title_category: str, title_sub_category: str) -> str:
-#     """
-#     Turn category + sub_category into a short phrase for search queries and ranking.
-#     Strips noisy labels like 'Talent Type -' so queries stay focused.
-#     """
-#     parts: List[str] = []
-#     for raw in (title_category, title_sub_category):
-#         if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-#             continue
-#         s = str(raw).strip()
-#         if not s or s.lower() == "nan":
-#             continue
-#         parts.append(s)
-#     if not parts:
-#         return ""
-#     text = " ".join(parts)
-#     text = text.replace(",", " ").replace("|", " ")
-#     text = re.sub(r"[\r\n\t]+", " ", text)
-#     # Remove repeated label prefixes (keeps e.g. Basketball, Football, Musician)
-#     text = re.sub(
-#         r"(?i)\b(talent type|gender|talent subtype|publication type)\s*-\s*",
-#         " ",
-#         text,
-#     )
-#     text = re.sub(r"\s+", " ", text).strip()
-#     # Cap length so Serper queries stay readable
-#     words = text.split()
-#     text = " ".join(words[:14])[:140].strip()
-#     return text
-
-
-# def _default_talent_table() -> pd.DataFrame:
-#     n = len(talent_names)
-#     data: Dict[str, List] = {
-#         "Talent Name": list(talent_names),
-#         "title_category": [""] * n,
-#         "title_sub_category": [""] * n,
-#     }
-#     for p in PLATFORMS:
-#         data[p] = [""] * n
-#     for c in PLATFORM_CONF_COLUMNS.values():
-#         data[c] = [float("nan")] * n
-#     data["Confidence"] = [float("nan")] * n
-#     data["Source"] = [""] * n
-#     return pd.DataFrame(data)
-
-
-# def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
-#     """
-#     Load Talent Name + optional title_category / title_sub_category from an .xlsx/.xls file.
-#     Raises ValueError if the file is unreadable or contains no valid names.
-#     """
-#     excel_path = Path(excel_path)
-#     if not excel_path.is_file():
-#         raise ValueError(f"File not found: {excel_path}")
-
-#     suffix = excel_path.suffix.lower()
-#     try:
-#         if suffix == ".csv":
-#             raw = pd.read_csv(excel_path)
-#         else:
-#             raw = pd.read_excel(excel_path)
-#     except Exception as exc:
-#         raise ValueError(f"Could not read spreadsheet: {exc}") from exc
-
-#     if raw.empty:
-#         raise ValueError("The file has no rows.")
-
-#     name_col = _find_column(raw, "Talent Name", "Talent", "title", "Title", "Name")
-#     if name_col is None:
-#         name_col = raw.columns[0]
-
-#     cat_col = _find_column(
-#         raw,
-#         "title_category",
-#         "de_category",
-#         "category",
-#         "Title Category",
-#     )
-#     sub_col = _find_column(raw, "title_sub_category", "sub_category", "Title Sub Category", "subtitle")
-
-#     names_list: List[str] = []
-#     cat_list: List[str] = []
-#     sub_list: List[str] = []
-
-#     for i in range(len(raw)):
-#         name = str(raw.iloc[i][name_col]).strip()
-#         if not name or name.lower() == "nan":
-#             continue
-#         names_list.append(name)
-#         c = raw.iloc[i][cat_col] if cat_col else ""
-#         s = raw.iloc[i][sub_col] if sub_col else ""
-#         cat_list.append("" if pd.isna(c) else str(c).strip())
-#         sub_list.append("" if pd.isna(s) else str(s).strip())
-
-#     if not names_list:
-#         raise ValueError("No valid talent names found (need a Talent Name column or data in the first column).")
-
-#     n = len(names_list)
-#     out: Dict[str, List] = {
-#         "Talent Name": names_list,
-#         "title_category": cat_list,
-#         "title_sub_category": sub_list,
-#     }
-#     for p in PLATFORMS:
-#         out[p] = [""] * n
-#     for c in PLATFORM_CONF_COLUMNS.values():
-#         out[c] = [float("nan")] * n
-#     out["Confidence"] = [float("nan")] * n
-#     out["Source"] = [""] * n
-#     return pd.DataFrame(out)
-
-
-# def load_talent_table() -> pd.DataFrame:
-#     """Load Talent Name + optional title_category / title_sub_category from Excel or defaults."""
-#     if not TEST_BRANDS_PATH.exists():
-#         return _default_talent_table()
-
-#     try:
-#         return load_talent_table_from_path(TEST_BRANDS_PATH)
-#     except ValueError as exc:
-#         print(f"[WARN] {exc}. Using default talent_names.")
-#         return _default_talent_table()
-
-
-# def build_talent_df(names: List[str], platforms: List[str]) -> pd.DataFrame:
-#     """Legacy helper: names only, no metadata columns."""
-#     talent_data: Dict[str, List] = {"Talent Name": names}
-#     for platform in platforms:
-#         talent_data[platform] = [""] * len(names)
-#     for platform in platforms:
-#         talent_data[f"{platform} Confidence"] = [float("nan")] * len(names)
-#     talent_data["title_category"] = [""] * len(names)
-#     talent_data["title_sub_category"] = [""] * len(names)
-#     talent_data["Confidence"] = [float("nan")] * len(names)
-#     talent_data["Source"] = [""] * len(names)
-#     return pd.DataFrame(talent_data)
-
-
-# def build_queries(
-#     talent: str,
-#     platform: str,
-#     domains: List[str],
-#     search_keywords: str,
-#     title_category: str = "",
-#     title_sub_category: str = "",
-# ) -> List[str]:
-#     """
-#     Build Serper queries. When search_keywords is non-empty (from title_category +
-#     title_sub_category), add disambiguated queries so results match the right entity.
-#     """
-#     kw = (search_keywords or "").strip()
-#     queries: List[str] = []
-#     exp = parse_entity_expectations(title_category, title_sub_category)
-
-#     # Sport-first queries when Excel says basketball / male athlete (reduces realtor namesakes)
-#     if exp["expects_male"] and exp["expects_basketball"]:
-#         for domain in domains:
-#             queries.append(f'site:{domain} "{talent}" basketball')
-#             queries.append(f'site:{domain} "{talent}" basketball player')
-#             queries.append(f'site:{domain} "{talent}" NCAA basketball')
-
-#     for domain in domains:
-#         queries.append(f'site:{domain} "{talent}" official')
-#         queries.append(f'site:{domain} "{talent}" verified')
-#         queries.append(f'site:{domain} "{talent}"')
-#         if kw:
-#             queries.append(f'site:{domain} "{talent}" {kw} official')
-#             queries.append(f'site:{domain} "{talent}" {kw}')
-
-#     queries.append(f'"{talent}" {platform} official')
-#     queries.append(f'"{talent}" {platform}')
-#     if kw:
-#         queries.append(f'"{talent}" {kw} {platform} official')
-#         queries.append(f'"{talent}" {kw} {platform}')
-
-#     # De-dupe while preserving order
-#     seen: set[str] = set()
-#     unique: List[str] = []
-#     for q in queries:
-#         if q not in seen:
-#             seen.add(q)
-#             unique.append(q)
-#     return unique
-
-
-# def is_valid_profile_url(link: str, platform: str) -> bool:
-#     """
-#     Return True only for profile/channel URLs, not posts, videos, reels, etc.
-#     """
-#     if not isinstance(link, str) or not link.strip():
-#         return False
-#     u = link.strip()
-#     try:
-#         parsed = urlparse(u)
-#     except Exception:
-#         return False
-#     if parsed.scheme not in ("http", "https"):
-#         return False
-#     host = (parsed.netloc or "").lower()
-#     path = (parsed.path or "").lower()
-#     full = u.lower()
-
-#     if platform == "Facebook":
-#         if "facebook.com" not in host:
-#             return False
-#         if any(seg in full for seg in ("/posts/", "/photos/", "/videos/", "/watch/", "/reel", "/story.php", "/permalink/")):
-#             return False
-#         if "profile.php" in path or "/people/" in path or "/pages/" in path:
-#             return True
-#         segs = [s for s in path.strip("/").split("/") if s]
-#         if len(segs) == 1 and segs[0] not in ("share", "sharer", "groups", "events", "marketplace", "gaming", "watch"):
-#             return True
-#         return False
-
-#     if platform == "Instagram":
-#         if "instagram.com" not in host:
-#             return False
-#         if any(x in full for x in ("/p/", "/reel", "/reels/", "/stories/", "/tv/", "/explore/", "/tags/", "/locations/")):
-#             return False
-#         segs = [s for s in path.strip("/").split("/") if s]
-#         if len(segs) == 1:
-#             return True
-#         return False
-
-#     if platform == "YouTube":
-#         if "youtube.com" not in host and "youtu.be" not in host:
-#             return False
-#         if any(x in full for x in ("/watch", "/shorts/", "/playlist", "/results", "/live/", "/feed/", "/attribution_link")):
-#             return False
-#         if "/@" in full or "/channel/" in full or "/c/" in full or "/user/" in full:
-#             return True
-#         return False
-
-#     if platform == "X":
-#         if "x.com" not in host and "twitter.com" not in host:
-#             return False
-#         if "/status/" in full or "/i/" in full or "/intent/" in full or "/search" in full:
-#             return False
-#         segs = [s for s in path.strip("/").split("/") if s]
-#         if len(segs) == 1:
-#             return True
-#         return False
-
-#     if platform == "TikTok":
-#         if "tiktok.com" not in host:
-#             return False
-#         if any(x in full for x in ("/video/", "/tag/", "/music/", "/discover", "/foryou")):
-#             return False
-#         if re.search(r"tiktok\.com/@[^/]+/?$", full):
-#             return True
-#         return False
-
-#     return False
-
-
-# def candidate_rank_score(
-#     talent: str,
-#     c: dict,
-#     search_keywords: str,
-#     title_category: str = "",
-#     title_sub_category: str = "",
-# ) -> float:
-#     title = (c.get("title") or "").lower()
-#     snippet = (c.get("snippet") or "").lower()
-#     link = (c.get("link") or "").lower()
-#     t = re.sub(r"\s+", " ", (talent or "").strip()).lower()
-#     score = 0.0
-#     if "official" in title or "official" in snippet:
-#         score += 4.0
-#     if "verified" in title or "verified" in snippet or "✓" in (c.get("title") or ""):
-#         score += 3.0
-#     if t and t in title:
-#         score += 3.0
-#     if t and t in snippet:
-#         score += 2.0
-#     if t and t in link.replace("-", " "):
-#         score += 1.0
-#     # Metadata alignment (e.g. basketball, sports publisher)
-#     for token in _metadata_tokens(search_keywords):
-#         if len(token) < 3:
-#             continue
-#         if token in title or token in snippet:
-#             score += 1.5
-#     rej, _ = entity_profile_rejected(talent, title_category, title_sub_category, c)
-#     if rej:
-#         score -= 35.0
-#     return score
-
-
-# def _metadata_tokens(search_keywords: str) -> List[str]:
-#     if not search_keywords:
-#         return []
-#     parts = re.split(r"[^\w]+", search_keywords.lower())
-#     stop = {
-#         "the",
-#         "and",
-#         "for",
-#         "type",
-#         "talent",
-#         "gender",
-#         "subtype",
-#         "publication",
-#         "network",
-#     }
-#     # Keep man/woman/basketball/athlete for ranking when present in keywords
-#     return [p for p in parts if p and p not in stop and len(p) > 2]
-
-
-# def parse_entity_expectations(title_category: str, title_sub_category: str) -> Dict[str, bool]:
-#     """Structured signals from Excel category + subcategory (e.g. Gender - Man, Athlete - Basketball)."""
-#     blob = f"{title_category or ''} {title_sub_category or ''}".lower()
-#     return {
-#         "expects_male": bool(re.search(r"gender\s*-\s*man\b", blob)),
-#         "expects_female": bool(re.search(r"gender\s*-\s*woman\b", blob)),
-#         "expects_athlete": bool(
-#             re.search(r"\bathlete\b", blob)
-#             or re.search(r"\bbasketball\b", blob)
-#             or re.search(r"\bfootball\b", blob)
-#             or "sport" in blob
-#         ),
-#         "expects_basketball": "basketball" in blob,
-#     }
-
-
-# def entity_profile_rejected(
-#     talent: str,
-#     title_category: str,
-#     title_sub_category: str,
-#     candidate: Optional[dict],
-# ) -> Tuple[bool, str]:
-#     """
-#     Reject Serper candidates that clearly contradict Excel metadata (wrong industry/person).
-#     Prefer blank cells over wrong Facebook/etc. links for namesakes.
-#     """
-#     if not candidate:
-#         return False, ""
-#     title = (candidate.get("title") or "")
-#     snippet = (candidate.get("snippet") or "")
-#     blob = f"{title} {snippet}".lower()
-#     exp = parse_entity_expectations(title_category, title_sub_category)
-
-#     sport_markers = (
-#         "basketball",
-#         "nba",
-#         "wnba",
-#         "ncaa",
-#         "college basketball",
-#         "draft",
-#         "athlete",
-#         "espn",
-#         "sport",
-#         "point guard",
-#         "shooting guard",
-#         "forward",
-#         "center",
-#         "hoops",
-#         "nba draft",
-#     )
-#     sport_hit = any(m in blob for m in sport_markers)
-
-#     non_sport_professions = (
-#         "realtor",
-#         "real estate",
-#         "mortgage",
-#         "homes realty",
-#         "florida homes",
-#         "digital creator",
-#         "realtor sales",
-#         "realty & mortgage",
-#         "realty and mortgage",
-#         "listing agent",
-#     )
-#     non_sport_hit = any(m in blob for m in non_sport_professions)
-
-#     # Male + athlete (esp. basketball): do not accept obvious realtor / unrelated creator pages
-#     if exp["expects_male"] and (exp["expects_athlete"] or exp["expects_basketball"]):
-#         if non_sport_hit and not sport_hit:
-#             return (
-#                 True,
-#                 "Metadata indicates a male athlete; this result looks like realtor/creator/real estate, not sports.",
-#             )
-#         # Common female first names in title/snippet when we expect a man + athlete (namesake)
-#         female_name_hits = (
-#             "bobbie ",
-#             " bobbie",
-#             "brittany ",
-#             "britney ",
-#             "jessica ",
-#             "samantha ",
-#             "miss ",
-#             " mrs ",
-#         )
-#         if any(x in blob for x in female_name_hits) and not sport_hit:
-#             return (
-#                 True,
-#                 "Profile text suggests a different person (female-leaning name/role) vs Gender-Man athlete metadata.",
-#             )
-
-#     if exp["expects_female"] and exp["expects_athlete"] and non_sport_hit and not sport_hit:
-#         male_lean = (" mr ", "his ", "his own", "father", "husband")
-#         if any(x in blob for x in male_lean) and "woman" not in blob:
-#             return True, "Metadata indicates female athlete; result looks unrelated (non-sports professional)."
-
-#     return False, ""
-
-
-# def sort_candidates_for_ai(
-#     talent: str,
-#     candidates: List[dict],
-#     search_keywords: str,
-#     title_category: str = "",
-#     title_sub_category: str = "",
-# ) -> List[dict]:
-#     return sorted(
-#         candidates,
-#         key=lambda c: -candidate_rank_score(
-#             talent, c, search_keywords, title_category, title_sub_category
-#         ),
-#     )
-
-
-# def first_valid_profile_link(candidates: List[dict], platform: str) -> str:
-#     for item in candidates:
-#         link = item.get("link", "")
-#         if is_valid_profile_url(link, platform):
-#             return normalize_profile_url(link, platform)
-#     return ""
-
-
-# def normalize_profile_url(url: str, platform: str) -> str:
-#     """Normalize host (e.g. mobile YouTube) for consistent output."""
-#     if not url or not isinstance(url, str):
-#         return ""
-#     u = url.strip()
-#     if platform == "YouTube":
-#         u = u.replace("://m.youtube.com", "://www.youtube.com")
-#         u = u.replace("://music.youtube.com", "://www.youtube.com")
-#         if "youtube.com" in u and "www." not in urlparse(u).netloc and "m." not in urlparse(u).netloc:
-#             u = u.replace("://youtube.com", "://www.youtube.com")
-#     return u.rstrip("/")
-
-
-# def _slug_chars(s: str) -> str:
-#     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-
-
-# def talent_url_aligned(talent: str, link: str) -> bool:
-#     """Heuristic: name tokens appear in profile URL path (reduces wrong person)."""
-#     t = _slug_chars(talent)
-#     if len(t) < 4:
-#         return False
-#     path = urlparse(link).path
-#     path_compact = _slug_chars(path)
-#     if len(t) >= 6 and t[: min(8, len(t))] in path_compact:
-#         return True
-#     for part in re.sub(r"\s+", " ", (talent or "").strip()).lower().split():
-#         if len(part) < 3:
-#             continue
-#         sp = _slug_chars(part)
-#         if len(sp) >= 5 and sp in path_compact:
-#             return True
-#     return False
-
-
-# def decide_emitted_link(
-#     talent: str,
-#     platform: str,
-#     selected: str,
-#     confidence: float,
-#     reason: str,
-#     top_candidate: Optional[dict],
-#     search_keywords: str,
-#     title_category: str = "",
-#     title_sub_category: str = "",
-#     emit_candidate: Optional[dict] = None,
-# ) -> Tuple[str, float, str]:
-#     """Prefer blank cells over wrong links when confidence is low."""
-#     if not selected or selected == "Not Found":
-#         return "", confidence, reason or "No selection."
-
-#     selected = normalize_profile_url(selected, platform)
-#     if not is_valid_profile_url(selected, platform):
-#         return "", 0.0, "Rejected: not a valid profile/channel URL."
-
-#     if emit_candidate:
-#         rej, why = entity_profile_rejected(
-#             talent, title_category, title_sub_category, emit_candidate
-#         )
-#         if rej:
-#             return "", min(confidence, 0.12), why
-
-#     if confidence >= MIN_CONFIDENCE_EMIT:
-#         return selected, confidence, reason
-
-#     if top_candidate is not None:
-#         rej_fb, rej_msg = entity_profile_rejected(
-#             talent, title_category, title_sub_category, top_candidate
-#         )
-#         if rej_fb:
-#             return "", confidence, f"Omitted: {rej_msg}"
-#         rs = candidate_rank_score(
-#             talent, top_candidate, search_keywords, title_category, title_sub_category
-#         )
-#         link = top_candidate.get("link", "")
-#         if (
-#             rs >= MIN_RANK_SCORE_FOR_FALLBACK
-#             and talent_url_aligned(talent, link)
-#             and is_valid_profile_url(link, platform)
-#         ):
-#             return (
-#                 normalize_profile_url(link, platform),
-#                 min(confidence, 0.68),
-#                 f"Strong search rank + URL match ({rs:.1f}): {reason}",
-#             )
-
-#     return "", confidence, f"Omitted (below {MIN_CONFIDENCE_EMIT:.2f}): {reason}"
-
-
-# URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"\'<>\)\]]+", re.I)
-
-
-# def fetch_html(url: str) -> str:
-#     try:
-#         r = requests.get(url, headers=FETCH_HEADERS, timeout=20, allow_redirects=True)
-#         r.raise_for_status()
-#         if len(r.content) > 2_500_000:
-#             return ""
-#         return r.text or ""
-#     except Exception as exc:
-#         print(f"[WARN] fetch failed {url[:90]}… : {exc}")
-#         return ""
-
-
-# def extract_urls_from_html(html: str) -> List[str]:
-#     if not html:
-#         return []
-#     found: set[str] = set()
-#     for m in URL_IN_TEXT_RE.finditer(html):
-#         u = m.group(0).rstrip(".,);\\]}\"'")
-#         if u.startswith("http"):
-#             found.add(u.split("&utm_")[0])
-#     for m in re.finditer(r'href\s*=\s*["\']([^"\']+)["\']', html, re.I):
-#         h = m.group(1).strip()
-#         if h.startswith("http"):
-#             found.add(h.split("&utm_")[0])
-#     return list(found)
-
-
-# def _platform_for_discovered_url(url: str) -> Optional[str]:
-#     u = url.lower()
-#     for plat in PLATFORMS:
-#         if is_valid_profile_url(url, plat):
-#             return plat
-#     if "linktr.ee/" in u or "linktree.com/" in u or "lnk.bio" in u or "beacons.ai" in u:
-#         return "__link_hub__"
-#     return None
-
-
-# def extract_social_links_from_page(page_url: str, source_platform: str) -> Dict[str, str]:
-#     """
-#     Pull external profile URLs from a public page (bio, about, or link-in-bio services).
-#     Instagram often blocks scraping; YouTube /about and Linktree work more reliably.
-#     """
-#     out: Dict[str, str] = {}
-#     to_fetch: List[str] = [page_url]
-
-#     if source_platform == "YouTube":
-#         base = page_url.split("?")[0].rstrip("/")
-#         if "/@" in base or "/channel/" in base or "/c/" in base or "/user/" in base:
-#             if "/about" not in base:
-#                 to_fetch.append(base + "/about")
-
-#     hubs_fetched = 0
-#     seen_fetch: set[str] = set()
-
-#     for u in to_fetch:
-#         u = u.strip()
-#         if not u or u in seen_fetch:
-#             continue
-#         seen_fetch.add(u)
-#         html = fetch_html(u)
-#         urls = extract_urls_from_html(html)
-
-#         for raw in urls:
-#             raw = raw.strip().rstrip(".,);")
-#             plat = _platform_for_discovered_url(raw)
-#             if plat and plat != "__link_hub__" and plat not in out:
-#                 out[plat] = normalize_profile_url(raw, plat)
-#             elif plat == "__link_hub__" and hubs_fetched < 3:
-#                 hubs_fetched += 1
-#                 inner = fetch_html(raw)
-#                 for raw2 in extract_urls_from_html(inner):
-#                     raw2 = raw2.strip().rstrip(".,);")
-#                     p2 = _platform_for_discovered_url(raw2)
-#                     if p2 and p2 != "__link_hub__" and p2 not in out:
-#                         out[p2] = normalize_profile_url(raw2, p2)
-
-#     return out
-
-
-# def enrich_row_from_anchor_profiles(df: pd.DataFrame, row_label: object) -> None:
-#     """If one platform is high-confidence, mine that page for other official links."""
-#     anchor_order = ["Instagram", "YouTube", "X", "Facebook", "TikTok"]
-#     confs = ROW_PLATFORM_CONFIDENCE.get(row_label, {})
-
-#     best_plat: Optional[str] = None
-#     best_url: str = ""
-#     best_c: float = 0.0
-
-#     for p in anchor_order:
-#         url = str(df.at[row_label, p] or "").strip()
-#         if not url:
-#             continue
-#         c = float(confs.get(p, 0.0))
-#         if c < ANCHOR_MIN_CONFIDENCE:
-#             continue
-#         if c > best_c:
-#             best_plat, best_url, best_c = p, url, c
-
-#     if not best_url or not best_plat:
-#         return
-
-#     talent = str(df.at[row_label, "Talent Name"] or "")
-#     print(f"[ENRICH] {talent} ← anchor {best_plat} (conf={best_c:.2f})")
-
-#     try:
-#         discovered = extract_social_links_from_page(best_url, best_plat)
-#     except Exception as exc:
-#         print(f"[WARN] enrich failed: {exc}")
-#         return
-
-#     for tgt, link in discovered.items():
-#         if tgt not in PLATFORMS:
-#             continue
-#         cur = str(df.at[row_label, tgt] or "").strip()
-#         if cur:
-#             continue
-#         if not is_valid_profile_url(link, tgt):
-#             continue
-#         df.at[row_label, tgt] = link
-#         conf_value = round(min(0.93, best_c * 0.96), 3)
-#         ROW_PLATFORM_CONFIDENCE.setdefault(row_label, {})[tgt] = conf_value
-#         df.at[row_label, PLATFORM_CONF_COLUMNS[tgt]] = conf_value
-#         ROW_PLATFORM_SOURCE.setdefault(row_label, {})[tgt] = "bio_enrich"
-#         print(f"  + filled {tgt} from bio/link hub")
-
-#     _refresh_row_aggregate_confidence(df, row_label)
-
-
-# def _refresh_row_aggregate_confidence(df: pd.DataFrame, row_label: object) -> None:
-#     parts: List[float] = []
-#     for p in PLATFORMS:
-#         if not str(df.at[row_label, p] or "").strip():
-#             continue
-#         parts.append(float(ROW_PLATFORM_CONFIDENCE.get(row_label, {}).get(p, 0.0)))
-#     if parts:
-#         df.at[row_label, "Confidence"] = round(sum(parts) / len(parts), 4)
-
-
-# def _refresh_row_source_cell(df: pd.DataFrame, row_label: object) -> None:
-#     """Compact provenance for Excel: Platform:search | Platform:bio_enrich | …"""
-#     parts: List[str] = []
-#     for p in PLATFORMS:
-#         url = str(df.at[row_label, p] or "").strip()
-#         if not url:
-#             continue
-#         src = ROW_PLATFORM_SOURCE.get(row_label, {}).get(p, "")
-#         if src:
-#             parts.append(f"{p}:{src}")
-#     df.at[row_label, "Source"] = "; ".join(parts)
-
-
-# def serper_search(query: str, num_results: int = 10) -> List[dict]:
-#     url = "https://google.serper.dev/search"
-#     headers = {
-#         "X-API-KEY": SERPER_API_KEY,
-#         "Content-Type": "application/json",
-#     }
-#     payload = {
-#         "q": query,
-#         "num": max(1, min(num_results, 10)),
-#     }
-
-#     response = requests.post(url, headers=headers, json=payload, timeout=30)
-#     response.raise_for_status()
-#     data = response.json()
-
-#     structured_results = []
-#     for item in data.get("organic", []):
-#         structured_results.append(
-#             {
-#                 "title": item.get("title", "") or "",
-#                 "snippet": item.get("snippet", "") or "",
-#                 "link": item.get("link", "") or "",
-#             }
-#         )
-
-#     return structured_results
-
-
-# def _extract_json_obj(text: str) -> dict:
-#     if not text:
-#         raise ValueError("Empty OpenAI response.")
-#     start = text.find("{")
-#     end = text.rfind("}")
-#     if start == -1 or end == -1 or end <= start:
-#         raise ValueError("No JSON object found in OpenAI response.")
-#     return json.loads(text[start : end + 1])
-
-
-# def ai_select_best_profile(
-#     talent: str,
-#     platform: str,
-#     candidates: List[dict],
-#     entity_category: str,
-#     entity_sub_category: str,
-#     search_keywords: str,
-# ) -> dict:
-#     if not candidates:
-#         return {"best_link": "Not Found", "confidence": 0.0, "reason": "No candidates provided."}
-
-#     system_msg = (
-#         "You are an expert social profile resolver. "
-#         "You must choose exactly ONE URL from the candidates list. "
-#         "NEVER choose post, video, reel, shorts, status, or search URLs. "
-#         "ONLY profile or channel URLs for the given platform."
-#     )
-
-#     user_payload = {
-#         "task": "Pick the single best official profile/channel URL for this talent on this platform.",
-#         "talent": talent,
-#         "platform": platform,
-#         "entity_metadata": {
-#             "title_category": entity_category or "",
-#             "title_sub_category": entity_sub_category or "",
-#             "search_keywords": search_keywords or "",
-#         },
-#         "candidates": candidates,
-#         "hard_rules": [
-#             "Select ONLY from candidates[].link values (or use empty string if none fit).",
-#             "The chosen URL must be a profile page or channel page, not content.",
-#             "Reject any URL that looks like a post, video, reel, story, shorts, or status page.",
-#             "Prefer verified/official signals in title or snippet.",
-#             "Prefer exact talent name match when evident.",
-#             "Use entity_metadata (especially title_sub_category: Gender, Talent Type, Athlete, Basketball, etc.) to DISAMBIGUATE namesakes.",
-#             "If entity_metadata says Gender-Man and Talent Subtype includes Athlete/Basketball, REJECT profiles that are clearly a different person: real estate agents, Realtors, mortgage/digital creators, or unrelated women when the talent should be a male athlete.",
-#             "If the snippet/title suggests 'realtor', 'real estate', 'Florida Homes', 'digital creator' without any basketball/sports context, treat as WRONG PERSON and return best_link empty.",
-#             "When uncertain between two similar names, return empty string rather than guessing.",
-#             "If NO candidate clearly belongs to this talent, return best_link as empty string and confidence under 0.35.",
-#         ],
-#         "output_format": {
-#             "best_link": "exactly one of candidate links OR empty string if uncertain",
-#             "confidence": "float 0 to 1",
-#             "reason": "one short sentence",
-#         },
-#         "return_only": "strict JSON object, no markdown, no extra keys",
-#     }
-
-#     body = {
-#         "model": OPENAI_CHAT_MODEL,
-#         "temperature": 0,
-#         "messages": [
-#             {"role": "system", "content": system_msg},
-#             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=True)},
-#         ],
-#     }
-#     headers = {
-#         "Authorization": f"Bearer {OPENAI_API_KEY}",
-#         "Content-Type": "application/json",
-#     }
-
-#     response = requests.post(
-#         "https://api.openai.com/v1/chat/completions",
-#         headers=headers,
-#         json=body,
-#         timeout=45,
-#     )
-#     response.raise_for_status()
-#     data = response.json()
-#     content = data["choices"][0]["message"]["content"]
-
-#     parsed = _extract_json_obj(content)
-#     best_link = parsed.get("best_link", "")
-#     confidence = parsed.get("confidence", 0.0)
-#     reason = parsed.get("reason", "")
-
-#     if not isinstance(best_link, str):
-#         best_link = ""
-#     best_link = best_link.strip()
-#     try:
-#         confidence = float(confidence)
-#     except Exception as exc:
-#         raise ValueError("OpenAI returned non-numeric confidence.") from exc
-#     confidence = max(0.0, min(1.0, confidence))
-#     if not isinstance(reason, str):
-#         reason = str(reason)
-
-#     if not best_link:
-#         return {"best_link": "", "confidence": confidence, "reason": reason.strip() or "No confident match."}
-
-#     return {"best_link": best_link, "confidence": confidence, "reason": reason.strip()}
-
-
-# def search_one_platform(
-#     talent: str,
-#     platform: str,
-#     domains: List[str],
-#     title_category: str,
-#     title_sub_category: str,
-# ) -> Tuple[str, str, float, str]:
-#     search_keywords = extract_search_keywords(title_category, title_sub_category)
-#     all_candidates: List[dict] = []
-#     seen_links = set()
-#     queries = build_queries(talent, platform, domains, search_keywords, title_category, title_sub_category)
-
-#     for query in queries:
-#         try:
-#             results = serper_search(query, num_results=RESULTS_PER_QUERY)
-#             print(f"[QUERY] {platform} | {talent} | '{query}' -> {len(results)} raw results")
-#             for item in results:
-#                 link = item.get("link", "")
-#                 if link and link not in seen_links:
-#                     seen_links.add(link)
-#                     all_candidates.append(item)
-#         except Exception as exc:
-#             print(f"[WARN] Serper failed for query '{query}': {exc}")
-
-#         if len(all_candidates) >= RESULTS_PER_QUERY:
-#             break
-#         time.sleep(0.2)
-
-#     valid_candidates = [c for c in all_candidates if is_valid_profile_url(c.get("link", ""), platform)]
-#     valid_candidates = sort_candidates_for_ai(
-#         talent, valid_candidates, search_keywords, title_category, title_sub_category
-#     )
-#     top_candidates = valid_candidates[:MAX_CANDIDATES_FOR_AI]
-#     ctx = f" | kw: {search_keywords}" if search_keywords else ""
-#     print(f"[INFO] {platform} | {talent}{ctx} -> {len(top_candidates)} profile-filtered candidates for AI")
-
-#     if not top_candidates:
-#         return platform, "", 0.0, "No valid profile/channel URLs in search results."
-
-#     top_candidate = top_candidates[0]
-#     fallback = first_valid_profile_link(top_candidates, platform)
-#     try:
-#         ai_result = ai_select_best_profile(
-#             talent,
-#             platform,
-#             top_candidates,
-#             title_category,
-#             title_sub_category,
-#             search_keywords,
-#         )
-#         selected = ai_result["best_link"]
-#         confidence = ai_result["confidence"]
-#         reason = ai_result["reason"]
-
-#         if not selected:
-#             if fallback:
-#                 rej_fb, _ = entity_profile_rejected(
-#                     talent, title_category, title_sub_category, top_candidate
-#                 )
-#                 if not rej_fb:
-#                     selected = fallback
-#                     confidence = min(confidence, 0.42)
-#                     reason = (reason or "") + " | AI empty; trying top-ranked candidate."
-#         elif not is_valid_profile_url(selected, platform):
-#             print(f"[WARN] AI picked non-profile URL; trying fallback.")
-#             if fallback:
-#                 rej_fb, _ = entity_profile_rejected(
-#                     talent, title_category, title_sub_category, top_candidate
-#                 )
-#                 if not rej_fb:
-#                     selected = fallback
-#                     confidence = min(confidence, 0.42)
-#                     reason = f"{reason} (invalid AI URL)"
-
-#         emit_candidate: Optional[dict] = None
-#         if selected:
-#             sel_norm = normalize_profile_url(selected, platform).rstrip("/")
-#             cand = next(
-#                 (
-#                     c
-#                     for c in top_candidates
-#                     if normalize_profile_url(c.get("link", ""), platform).rstrip("/") == sel_norm
-#                 ),
-#                 None,
-#             )
-#             emit_candidate = cand
-#             if cand:
-#                 rej, why = entity_profile_rejected(talent, title_category, title_sub_category, cand)
-#                 if rej:
-#                     print(f"[REJECT] {platform} | {talent} | {why}")
-#                     selected = ""
-#                     confidence = min(confidence, 0.15)
-#                     reason = why
-#                     emit_candidate = None
-
-#         emit, conf_out, rsn_out = decide_emitted_link(
-#             talent,
-#             platform,
-#             selected or "",
-#             confidence,
-#             reason,
-#             top_candidate,
-#             search_keywords,
-#             title_category,
-#             title_sub_category,
-#             emit_candidate,
-#         )
-#         disp = emit or "(blank)"
-#         print(f"[SELECTED] {platform} -> {disp} | confidence={conf_out:.2f} | {rsn_out}")
-#         time.sleep(OPENAI_DELAY_SECONDS)
-#         return platform, emit, conf_out, rsn_out
-#     except Exception as exc:
-#         print(f"[WARN] OpenAI failed for {talent}/{platform}: {exc}")
-#         if fallback:
-#             emit, conf_out, rsn_out = decide_emitted_link(
-#                 talent,
-#                 platform,
-#                 fallback,
-#                 0.35,
-#                 f"OpenAI error: {exc}",
-#                 top_candidate,
-#                 search_keywords,
-#                 title_category,
-#                 title_sub_category,
-#                 top_candidate,
-#             )
-#         else:
-#             emit, conf_out, rsn_out = "", 0.0, f"OpenAI error: {exc}"
-#         time.sleep(OPENAI_DELAY_SECONDS)
-#         return platform, emit, conf_out, rsn_out
-
-
-# def process_row(idx: object, row: pd.Series, df: pd.DataFrame) -> None:
-#     talent = str(row.get("Talent Name", "") or "").strip()
-#     if not talent:
-#         return
-
-#     cat = str(row.get("title_category", "") or "").strip()
-#     sub = str(row.get("title_sub_category", "") or "").strip()
-
-#     confidences: List[float] = []
-#     ROW_PLATFORM_CONFIDENCE[idx] = {}
-#     ROW_PLATFORM_SOURCE[idx] = {}
-#     for p in PLATFORMS:
-#         if str(row.get(p, "") or "").strip():
-#             ROW_PLATFORM_SOURCE[idx][p] = "input"
-#             ROW_PLATFORM_CONFIDENCE[idx][p] = 1.0
-#             df.at[idx, PLATFORM_CONF_COLUMNS[p]] = 1.0
-
-#     futures = {}
-#     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-#         for platform, domains in PLATFORMS.items():
-#             current_value = str(row.get(platform, "") or "").strip()
-#             if current_value:
-#                 continue
-#             fut = executor.submit(search_one_platform, talent, platform, domains, cat, sub)
-#             futures[fut] = platform
-
-#         for fut in as_completed(futures):
-#             platform, best_link, conf, rsn = fut.result()
-#             df.at[idx, platform] = best_link
-#             ROW_PLATFORM_CONFIDENCE[idx][platform] = float(conf) if best_link else 0.0
-#             df.at[idx, PLATFORM_CONF_COLUMNS[platform]] = float(conf) if best_link else 0.0
-#             if best_link:
-#                 ROW_PLATFORM_SOURCE[idx][platform] = "search"
-#             confidences.append(float(conf))
-#             # Reasons stay in console only ([SELECTED] logs); not written to Excel.
-
-#     if confidences:
-#         df.at[idx, "Confidence"] = sum(confidences) / len(confidences)
-#     else:
-#         df.at[idx, "Confidence"] = 0.0
-
-#     enrich_row_from_anchor_profiles(df, idx)
-#     _refresh_row_source_cell(df, idx)
-
-
-# def run_pipeline_on_dataframe(
-#     df: pd.DataFrame,
-#     progress: Optional[Callable[[int, int, str], None]] = None,
-# ) -> pd.DataFrame:
-#     """
-#     Run the full lookup pipeline on a prepared dataframe.
-#     Optional progress(1-based index, total rows, talent name) is invoked before each row.
-#     """
-#     ROW_PLATFORM_CONFIDENCE.clear()
-#     ROW_PLATFORM_SOURCE.clear()
-#     print(f"Initialized talent dataframe with {len(df)} rows.")
-#     total = len(df)
-
-#     for i, (idx, row) in enumerate(df.iterrows(), start=1):
-#         talent_name = str(row.get("Talent Name", "") or "")
-#         if progress:
-#             progress(i, total, talent_name)
-#         kw = extract_search_keywords(
-#             str(row.get("title_category", "") or ""),
-#             str(row.get("title_sub_category", "") or ""),
-#         )
-#         extra = f" | metadata: {kw}" if kw else ""
-#         print(f"\nProcessing talent {i}/{total}: {row['Talent Name']}{extra}")
-#         process_row(idx, row, df)
-#         time.sleep(random.uniform(*REQUEST_DELAY_BETWEEN_TALENTS))
-
-#     return df
-
-
-# def run_pipeline_for_names(
-#     names: List[str],
-#     progress: Optional[Callable[[int, int, str], None]] = None,
-# ) -> pd.DataFrame:
-#     """Build a dataframe from a plain name list and run the pipeline (e.g. API / UI)."""
-#     clean = [n.strip() for n in names if n and str(n).strip()]
-#     if not clean:
-#         raise ValueError("At least one non-empty name is required.")
-#     df = build_talent_df(clean, list(PLATFORMS.keys()))
-#     return run_pipeline_on_dataframe(df, progress=progress)
-
-
-# def run_pipeline() -> pd.DataFrame:
-#     return run_pipeline_on_dataframe(load_talent_table())
-
-
-# def apply_excel_formatting(path: str, df: pd.DataFrame) -> None:
-#     try:
-#         from openpyxl import load_workbook
-#         from openpyxl.styles import PatternFill, Font
-#     except ImportError:
-#         print("[WARN] openpyxl not installed; skipping Excel formatting. pip install openpyxl")
-#         return
-
-#     wb = load_workbook(path)
-#     ws = wb.active
-#     headers = [str(c.value) if c.value is not None else "" for c in ws[1]]
-#     col_index = {h: i + 1 for i, h in enumerate(headers)}
-
-#     green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-#     yellow = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-#     red_conf = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-#     red_row = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
-
-#     conf_col = col_index.get("Confidence")
-#     platform_cols = [col_index[p] for p in PLATFORMS.keys() if p in col_index]
-
-#     for r in range(2, ws.max_row + 1):
-#         talent_cell = ws.cell(row=r, column=col_index.get("Talent Name", 1))
-#         talent_val = str(talent_cell.value or "").strip()
-#         first_only = is_first_name_only(talent_val)
-
-#         if conf_col:
-#             val = ws.cell(row=r, column=conf_col).value
-#             try:
-#                 v = float(val)
-#             except (TypeError, ValueError):
-#                 v = 0.0
-#             fill = red_conf
-#             if v > 0.8:
-#                 fill = green
-#             elif v >= 0.5:
-#                 fill = yellow
-#             ws.cell(row=r, column=conf_col).fill = fill
-
-#         if first_only:
-#             for c in range(1, ws.max_column + 1):
-#                 cell = ws.cell(row=r, column=c)
-#                 cell.fill = red_row
-#                 if c in platform_cols:
-#                     cell.font = Font(color="9C0006")
-
-#     wb.save(path)
-
-
-# def save_output(df: pd.DataFrame, output_dir: Optional[Path] = None) -> str:
-#     """Write Excel next to this script unless output_dir is set."""
-#     base = output_dir if output_dir is not None else Path(__file__).resolve().parent
-#     base.mkdir(parents=True, exist_ok=True)
-#     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-#     filename = f"Talent_Social_Lookup_{timestamp}.xlsx"
-#     path = base / filename
-#     out = df.copy()
-#     if "Reason" in out.columns:
-#         out = out.drop(columns=["Reason"])
-#     out.to_excel(path, index=False)
-#     path_str = str(path.resolve())
-#     print(f"\nSaved output: {path_str}")
-#     apply_excel_formatting(path_str, out)
-#     return path_str
-
-
-# if __name__ == "__main__":
-#     final_df = run_pipeline()
-#     save_output(final_df)
-#     print("\nFinal DataFrame:")
-#     print(final_df)
-
-
-
-
-
-
-
-
-
-# testing.py  — Enhanced AI Layer (drop-in replacement)
-# =========================================================
-# Key improvements over original:
-#
-#  1. build_candidate_signals()        — pre-AI evidence extraction per candidate
-#  2. get_category_disambiguation_context() — category-specific AI rules
-#  3. ai_select_best_profile()         — REWRITTEN: two-phase chain-of-thought prompt,
-#                                        evidence-aware, blank-preferred, namesake-safe
-#  4. ai_verify_selected_link()        — NEW: a quick second AI call that confirms or
-#                                        vetoes the chosen link before we emit it
-#  5. get_name_ambiguity_level()       — NEW: tightens confidence thresholds for
-#                                        single / very-common names
-#  6. extract_username_hints()         — NEW: pulls @handle from resolved platforms
-#                                        to bias searches + validation on other platforms
-#  7. entity_profile_rejected()        — EXPANDED: covers media, music, executive,
-#                                        politician, author categories too
-#  8. candidate_rank_score()           — EXPANDED: URL-slug alignment, follower signals,
-#                                        username hint bonus, generic-handle penalty
-#  9. build_queries()                  — EXPANDED: username-hint queries when known
-# 10. decide_emitted_link()            — STRICTER: dynamic MIN_CONFIDENCE per name type
-# =========================================================
 
 import json
 import os
@@ -1226,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import pandas as pd
 import requests
@@ -1243,6 +25,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_CHAT_MODEL = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
 TEST_BRANDS_PATH = Path(__file__).resolve().parent / "Demo_Social.xlsx"
+WIKIPEDIA_URL_COLUMN = "Wikipedia URL"
 
 # ================== INPUT FALLBACK ==================
 talent_names = [
@@ -1283,6 +66,7 @@ ROW_PLATFORM_CONFIDENCE: Dict[object, Dict[str, float]] = {}
 ROW_PLATFORM_SOURCE: Dict[object, Dict[str, str]] = {}
 # Per-row resolved username hints (platform → handle string, e.g. "johndoe123")
 ROW_USERNAME_HINTS: Dict[object, Dict[str, str]] = {}
+WIKIPEDIA_CONTEXT_CACHE: Dict[str, str] = {}
 
 PLATFORMS: Dict[str, List[str]] = {
     "Facebook":  ["facebook.com"],
@@ -1316,6 +100,138 @@ def _slug_chars(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
+_KNOWN_PLATFORM_SUPPRESSIONS: Dict[str, set] = {
+    # Confirmed by manual review: these lookalike profiles are not BJ Powell.
+    "bjpowell": {"Facebook", "TikTok", "YouTube"},
+}
+
+
+def _platform_suppressed_for_talent(talent: str, platform: str) -> bool:
+    name = re.sub(r"\s+[-–—|]\s+[A-Z0-9]{2,8}$", "", (talent or "").strip())
+    return platform in _KNOWN_PLATFORM_SUPPRESSIONS.get(_slug_chars(name), set())
+
+
+def _clean_wikipedia_url(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    url = str(value).strip()
+    if not url or url.lower() == "nan":
+        return ""
+    if "wikipedia.org/wiki/" not in url.lower():
+        return ""
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    return url.split("#", 1)[0].strip()
+
+
+def _wikipedia_title_from_url(wikipedia_url: str) -> str:
+    try:
+        parsed = urlparse(wikipedia_url)
+    except Exception:
+        return ""
+    if "wikipedia.org" not in (parsed.netloc or "").lower():
+        return ""
+    path = parsed.path or ""
+    if "/wiki/" not in path:
+        return ""
+    title = path.split("/wiki/", 1)[1].strip("/")
+    return re.sub(r"\s+", " ", unquote(title).replace("_", " ")).strip()
+
+
+def wikipedia_identity_context(wikipedia_url: str) -> str:
+    """Small optional identity anchor from a provided Wikipedia URL."""
+    url = _clean_wikipedia_url(wikipedia_url)
+    if not url:
+        return ""
+    if url in WIKIPEDIA_CONTEXT_CACHE:
+        return WIKIPEDIA_CONTEXT_CACHE[url]
+
+    title = _wikipedia_title_from_url(url)
+    context_parts: List[str] = []
+    if title:
+        context_parts.append(f"Wikipedia title: {title}")
+
+    try:
+        parsed = urlparse(url)
+        page_title = (parsed.path or "").split("/wiki/", 1)[1].strip("/")
+        summary_url = f"{parsed.scheme}://{parsed.netloc}/api/rest_v1/page/summary/{page_title}"
+        res = requests.get(summary_url, headers=FETCH_HEADERS, timeout=8)
+        if res.ok:
+            payload = res.json()
+            api_title = str(payload.get("title") or "").strip()
+            description = str(payload.get("description") or "").strip()
+            extract = str(payload.get("extract") or "").strip()
+            if api_title and api_title.lower() != (title or "").lower():
+                context_parts.insert(0, f"Wikipedia title: {api_title}")
+            if description:
+                context_parts.append(f"Description: {description}")
+            if extract:
+                context_parts.append(f"Summary: {extract[:450]}")
+    except Exception as exc:
+        print(f"[WARN] Wikipedia context fetch failed: {exc}")
+
+    context = " | ".join(context_parts)[:900]
+    WIKIPEDIA_CONTEXT_CACHE[url] = context
+    return context
+
+
+def _wikipedia_title_from_context(wikipedia_context: str) -> str:
+    if not wikipedia_context:
+        return ""
+    m = re.search(r"Wikipedia title:\s*([^|]+)", wikipedia_context)
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+
+
+def _identity_name_aliases(
+    talent: str,
+    title_category: str = "",
+    title_sub_category: str = "",
+    wikipedia_context: str = "",
+) -> List[str]:
+    """Likely public-name aliases for non-brand rows, e.g. married names vs known names."""
+    base = re.sub(r"\s+", " ", (talent or "").strip())
+    aliases: List[str] = []
+    seen: set = set()
+
+    def add(name: str) -> None:
+        name = re.sub(r"\s+", " ", (name or "").strip())
+        key = name.lower()
+        if name and key not in seen:
+            seen.add(key)
+            aliases.append(name)
+
+    add(base)
+    wiki_title = _wikipedia_title_from_context(wikipedia_context)
+    if wiki_title:
+        add(wiki_title)
+
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=base)
+    if not exp.get("expects_brand"):
+        parts = _brand_name_parts(base)
+        if len(parts) >= 3:
+            add(" ".join(parts[:2]))
+            add(f"{parts[0]} {parts[-1]}")
+    return aliases
+
+
+def _identity_handle_aliases(
+    talent: str,
+    title_category: str = "",
+    title_sub_category: str = "",
+    wikipedia_context: str = "",
+) -> List[str]:
+    handles: List[str] = []
+    seen: set = set()
+    for alias in _identity_name_aliases(talent, title_category, title_sub_category, wikipedia_context):
+        slug = _slug_chars(alias)
+        if len(slug) >= 4 and slug not in seen:
+            seen.add(slug)
+            handles.append(slug)
+    return handles
+
+
 # Vertical/sub-account suffixes on brand handles (not the parent brand page).
 # Common word shortenings in brand handles (Basketball -> BBall, etc.)
 _BRAND_WORD_ABBREV: Dict[str, str] = {
@@ -1339,6 +255,13 @@ _KNOWN_SINGLE_WORD_BRANDS = frozenset({
 })
 
 _KNOWN_BRAND_PLATFORM_HANDLES: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "espn": {
+        "Facebook": ("ESPN",),
+        "Instagram": ("espn",),
+        "X": ("espn",),
+        "TikTok": ("espn",),
+        "YouTube": ("espn",),
+    },
     "foxsports1": {
         "Instagram": ("fs1",),
         "X": ("FS1",),
@@ -1891,6 +814,25 @@ def _metadata_tokens(search_keywords: str) -> List[str]:
     return [p for p in parts if p and p not in stop and len(p) > 2]
 
 
+def _talent_lookup_name(
+    talent: str,
+    title_category: str = "",
+    title_sub_category: str = "",
+) -> str:
+    """
+    Clean client-side suffix codes from person/athlete rows before search.
+    Example: "Ray Allen - DAR" should resolve as "Ray Allen", not as a separate identity.
+    """
+    name = re.sub(r"\s+", " ", (talent or "").strip())
+    if not name:
+        return ""
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=name)
+    if exp.get("expects_brand"):
+        return name
+    cleaned = re.sub(r"\s+[-–—|]\s+[A-Z0-9]{2,8}$", "", name).strip()
+    return cleaned or name
+
+
 def _athlete_handle_aliases(talent: str) -> List[str]:
     """Common compact athlete handles: tbey, tbey1, tylerbey, tylerbey1."""
     parts = [p.lower() for p in _brand_name_parts(talent)]
@@ -1909,6 +851,7 @@ def _athlete_handle_aliases(talent: str) -> List[str]:
             aliases.append(value)
 
     add(first + last)
+    add(f"{first}{last}page")
     add(f"{first}{last}1")
     add(first[:1] + last)
     add(f"{first[:1]}{last}1")
@@ -1942,6 +885,26 @@ def _parse_follower_count(text: str) -> Optional[float]:
     elif "k" in lower_full:
         val *= 1_000
     return val
+
+
+def _candidate_has_exact_profile_title(talent: str, candidate: dict) -> bool:
+    title = (candidate.get("title") or "").lower()
+    t = re.sub(r"\s+", " ", (talent or "").strip()).lower()
+    return bool(
+        t
+        and re.match(rf"^{re.escape(t)}\s*\(@[A-Za-z0-9_.-]{{2,30}}\)", title)
+    )
+
+
+def _candidate_has_name_matching_personal_website(talent: str, candidate: dict) -> bool:
+    blob = f"{candidate.get('title') or ''} {candidate.get('snippet') or ''}".lower()
+    name_slug = _slug_chars(talent)
+    website_match = re.search(r"website:\s*https?://(?:www\.)?([^/\s]+)", blob)
+    if not website_match or not name_slug:
+        return False
+    website_host = website_match.group(1).lower()
+    social_hosts = ("instagram.", "x.", "twitter.", "facebook.", "tiktok.", "youtube.")
+    return name_slug in _slug_chars(website_host) and not any(h in website_host for h in social_hosts)
 
 
 def build_candidate_signals(talent: str, candidate: dict, platform: str) -> dict:
@@ -2018,6 +981,8 @@ def build_candidate_signals(talent: str, candidate: dict, platform: str) -> dict
         "url_depth":              url_depth,
         "handle":                 handle,
         "handle_suspicious":      handle_suspicious,
+        "exact_profile_title":    _candidate_has_exact_profile_title(talent, candidate),
+        "personal_website_match": _candidate_has_name_matching_personal_website(talent, candidate),
         "is_valid_profile_url":   is_valid_profile_url(link, platform),
         "search_position":        int(candidate.get("search_position", 99) or 99),
         "recovered_from_text":    bool(candidate.get("recovered_from_text")),
@@ -2135,6 +1100,9 @@ def entity_profile_rejected(
     link    = (candidate.get("link")    or "")
     blob    = f"{title} {snippet}".lower()
     exp     = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+    plat_for_suppression = platform or _platform_from_link(link)
+    if plat_for_suppression and _platform_suppressed_for_talent(talent, plat_for_suppression):
+        return True, f"{plat_for_suppression} suppressed for this talent after manual validation."
 
     if exp.get("expects_brand"):
         plat = platform or _platform_from_link(link)
@@ -2182,6 +1150,7 @@ def entity_profile_rejected(
         "florida homes", "digital creator", "realtor sales",
         "realty & mortgage", "realty and mortgage",
         "listing agent", "homes for sale", "property management",
+        "nft creator", "crypto investor", "cryptocurrency", "web3",
     )
     non_sport_hit = any(m in blob for m in non_sport_professions)
 
@@ -2294,6 +1263,8 @@ def candidate_rank_score(
     t       = re.sub(r"\s+", " ", (talent or "").strip()).lower()
     score   = 0.0
     exp_rank = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+    name_aliases = _identity_name_aliases(talent, title_category, title_sub_category)
+    alias_slugs = {_slug_chars(a) for a in name_aliases if a.lower() != t}
 
     # ── Authenticity signals ──
     if "official" in title or "official" in snippet:
@@ -2306,6 +1277,14 @@ def candidate_rank_score(
         score += 3.5
     if t and t in snippet:
         score += 2.0
+    for alias in name_aliases:
+        alias_l = alias.lower()
+        if alias_l == t or len(alias_l) < 4:
+            continue
+        if alias_l in title:
+            score += 3.0
+        if alias_l in snippet:
+            score += 1.5
 
     # ── URL slug alignment (stronger weight) ──
     path_slug = _slug_chars(urlparse(link).path)
@@ -2317,6 +1296,17 @@ def candidate_rank_score(
             sp = _slug_chars(part)
             if len(sp) >= 4 and sp in path_slug:
                 score += 1.5
+    for alias_slug in alias_slugs:
+        if len(alias_slug) >= 5 and alias_slug in path_slug:
+            score += 4.0
+    if platform == "YouTube" and _is_youtube_channel_id_slug(_path_handle_slug(link, platform)):
+        alias_hit = any(
+            alias.lower() in title or alias.lower() in snippet
+            for alias in name_aliases
+            if len(alias) >= 4
+        )
+        if alias_hit:
+            score += 6.0
 
     # ── Follower / subscriber signal ──
     follower_count = _parse_follower_count(f"{title} {snippet}")
@@ -2333,8 +1323,28 @@ def candidate_rank_score(
         blob = f"{title} {snippet}"
         position = int(c.get("search_position", 99) or 99)
         profile_handle = _path_handle_slug(link, platform)
+        profile_title_pattern = bool(
+            t
+            and t in title
+            and re.search(r"\(@[A-Za-z0-9_.-]{2,30}\)", c.get("title") or "")
+        )
+        exact_profile_title = bool(
+            _candidate_has_exact_profile_title(talent, c)
+        )
+        if profile_title_pattern and platform in {"X", "Instagram", "TikTok"}:
+            score += 7.0
+            if position <= 3:
+                score += 2.0
+        if exact_profile_title and platform in {"X", "Instagram", "TikTok"}:
+            score += 8.0
         if profile_handle and profile_handle in {_slug_chars(a) for a in _athlete_handle_aliases(talent)}:
             score += 7.0
+        if t and t in blob and any(s in query for s in ("official", "verified")):
+            score += 5.0
+            if position <= 3:
+                score += 2.0
+        if _candidate_has_name_matching_personal_website(talent, c):
+            score += 6.0
         if t and t in blob and any(s in query for s in ("basketball", "athlete", "hoops")):
             score += 4.0
             if position <= 3:
@@ -2408,8 +1418,18 @@ def candidate_rank_score(
         for src_plat, hint in username_hints.items():
             if src_plat == platform or not hint:
                 continue
-            if _slug_chars(hint) in path_slug:
-                score += 5.0   # exact handle match from another platform is very strong
+            hint_slug = _slug_chars(hint)
+            if hint_slug in path_slug:
+                hint_bonus = 5.0
+                if (
+                    not exp_rank.get("expects_brand")
+                    and (exp_rank["expects_athlete"] or exp_rank["expects_basketball"])
+                    and src_plat == "Facebook"
+                    and platform in {"X", "Instagram", "TikTok"}
+                    and hint_slug == name_slug
+                ):
+                    hint_bonus = 1.0
+                score += hint_bonus   # exact handle match from another platform is usually strong
                 break
 
     # ── Generic handle penalty ──
@@ -2439,11 +1459,19 @@ def build_queries(
     title_category: str = "",
     title_sub_category: str = "",
     username_hints: Optional[Dict[str, str]] = None,
+    wikipedia_context: str = "",
 ) -> List[str]:
     kw  = (search_keywords or "").strip()
     exp = parse_entity_expectations(title_category, title_sub_category, talent=talent)
     queries: List[str] = []
     priority_queries: List[str] = []
+    wiki_title = _wikipedia_title_from_context(wikipedia_context)
+    name_aliases = _identity_name_aliases(
+        talent, title_category, title_sub_category, wikipedia_context
+    )
+    handle_aliases = _identity_handle_aliases(
+        talent, title_category, title_sub_category, wikipedia_context
+    )
 
     # ── Brand: direct handle searches first (foxsports, on3sports, foxsports1, …) ──
     if exp.get("expects_brand"):
@@ -2518,6 +1546,8 @@ def build_queries(
                     queries.insert(0, f"site:{domain}/{canonical}_hq")
                     queries.insert(0, f"site:{domain}/{canonical}hq")
         for domain in domains:
+            if wiki_title and wiki_title.lower() != talent.lower():
+                queries.append(f'site:{domain} "{talent}" "{wiki_title}" official')
             queries.append(f'site:{domain} "{talent}" official')
             queries.append(f'site:{domain} "{talent}" verified')
             queries.append(f'site:{domain} "{talent}"')
@@ -2531,7 +1561,31 @@ def build_queries(
                 unique.append(q)
         return unique
 
+    for handle in handle_aliases:
+        for domain in domains:
+            priority_queries.append(f"site:{domain}/{handle}")
+            priority_queries.append(f"site:{domain}/@{handle}")
+        priority_queries.append(f'"{handle}" {platform}')
+
+    for alias in name_aliases:
+        if alias.lower() == talent.lower():
+            continue
+        for domain in domains:
+            priority_queries.append(f'site:{domain} "{alias}" official')
+            priority_queries.append(f'site:{domain} "{alias}" verified')
+            priority_queries.append(f'site:{domain} "{alias}"')
+            if platform == "YouTube":
+                priority_queries.append(f'site:{domain} "{alias}" channel')
+        priority_queries.append(f'"{alias}" {platform} official')
+        priority_queries.append(f'"{alias}" {platform}')
+
     if exp["expects_athlete"] or exp["expects_basketball"]:
+        for domain in domains:
+            if wiki_title and wiki_title.lower() != talent.lower():
+                queries.append(f'site:{domain} "{talent}" "{wiki_title}" basketball')
+            queries.append(f'site:{domain} "{talent}" basketball')
+            queries.append(f'site:{domain} "{talent}" official')
+            queries.append(f'site:{domain} "{talent}" verified')
         for handle in _athlete_handle_aliases(talent):
             for domain in domains:
                 queries.append(f"site:{domain}/{handle}")
@@ -2570,6 +1624,8 @@ def build_queries(
 
     # ── Standard domain-scoped queries ──
     for domain in domains:
+        if wiki_title and wiki_title.lower() != talent.lower():
+            queries.append(f'site:{domain} "{talent}" "{wiki_title}" official')
         queries.append(f'site:{domain} "{talent}" official')
         queries.append(f'site:{domain} "{talent}" verified')
         queries.append(f'site:{domain} "{talent}"')
@@ -2580,6 +1636,8 @@ def build_queries(
     # ── Fallback web queries ──
     queries.append(f'"{talent}" {platform} official')
     queries.append(f'"{talent}" {platform}')
+    if wiki_title and wiki_title.lower() != talent.lower():
+        queries.append(f'"{talent}" "{wiki_title}" {platform} official')
     if kw:
         queries.append(f'"{talent}" {kw} {platform} official')
         queries.append(f'"{talent}" {kw} {platform}')
@@ -2587,7 +1645,7 @@ def build_queries(
     # ── De-dupe preserving order ──
     seen: set = set()
     unique: List[str] = []
-    for q in queries:
+    for q in priority_queries + queries:
         if q not in seen:
             seen.add(q)
             unique.append(q)
@@ -2604,6 +1662,7 @@ def _default_talent_table() -> pd.DataFrame:
         "Talent Name":        list(talent_names),
         "title_category":     [""] * n,
         "title_sub_category": [""] * n,
+        WIKIPEDIA_URL_COLUMN: [""] * n,
     }
     for p in PLATFORMS:
         data[p] = [""] * n
@@ -2631,8 +1690,18 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
         name_col = raw.columns[0]
     cat_col = _find_column(raw, "title_category", "de_category", "category", "Title Category")
     sub_col = _find_column(raw, "title_sub_category", "sub_category", "Title Sub Category", "subtitle")
+    wiki_col = _find_column(
+        raw,
+        WIKIPEDIA_URL_COLUMN,
+        "wikipedia_url",
+        "Wikipedia",
+        "Wiki URL",
+        "wiki_url",
+        "Wiki",
+        "Wikipedia Link",
+    )
 
-    names_list, cat_list, sub_list = [], [], []
+    names_list, cat_list, sub_list, wiki_list = [], [], [], []
     for i in range(len(raw)):
         name = str(raw.iloc[i][name_col]).strip()
         if not name or name.lower() == "nan":
@@ -2640,8 +1709,10 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
         names_list.append(name)
         c = raw.iloc[i][cat_col] if cat_col else ""
         s = raw.iloc[i][sub_col] if sub_col else ""
+        w = raw.iloc[i][wiki_col] if wiki_col else ""
         cat_list.append("" if (isinstance(c, float) and pd.isna(c)) else str(c).strip())
         sub_list.append("" if (isinstance(s, float) and pd.isna(s)) else str(s).strip())
+        wiki_list.append(_clean_wikipedia_url(w))
 
     if not names_list:
         raise ValueError("No valid talent names found.")
@@ -2650,6 +1721,7 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
         "Talent Name":        names_list,
         "title_category":     cat_list,
         "title_sub_category": sub_list,
+        WIKIPEDIA_URL_COLUMN: wiki_list,
     }
     for p in PLATFORMS:
         out[p] = [""] * n
@@ -2679,6 +1751,7 @@ def build_talent_df(names: List[str], platforms: List[str]) -> pd.DataFrame:
         data[f"{p} Confidence"] = [float("nan")] * len(names)
     data["title_category"]     = [""] * len(names)
     data["title_sub_category"] = [""] * len(names)
+    data[WIKIPEDIA_URL_COLUMN] = [""] * len(names)
     data["Confidence"]         = [float("nan")] * len(names)
     data["Source"]             = [""] * len(names)
     return pd.DataFrame(data)
@@ -2858,6 +1931,59 @@ def _prefer_recovered_athlete_handle(
     return None
 
 
+def _prefer_personal_website_athlete_profile(
+    talent: str,
+    platform: str,
+    selected: str,
+    candidates: List[dict],
+    title_category: str,
+    title_sub_category: str,
+    search_keywords: str,
+) -> Optional[dict]:
+    """Prefer a top-ranked athlete profile that exposes a name-matching non-social website."""
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+    if exp.get("expects_brand") or not (exp["expects_athlete"] or exp["expects_basketball"]):
+        return None
+    if platform not in {"X", "Instagram", "TikTok"} or not candidates:
+        return None
+
+    top = candidates[0]
+    if not (
+        _candidate_has_exact_profile_title(talent, top)
+        and _candidate_has_name_matching_personal_website(talent, top)
+    ):
+        return None
+
+    selected_norm = normalize_profile_url(selected or "", platform).rstrip("/")
+    top_norm = normalize_profile_url(top.get("link", ""), platform).rstrip("/")
+    if selected_norm == top_norm:
+        return None
+
+    selected_candidate = next(
+        (
+            c for c in candidates
+            if normalize_profile_url(c.get("link", ""), platform).rstrip("/") == selected_norm
+        ),
+        None,
+    )
+    if selected_candidate and _candidate_has_name_matching_personal_website(talent, selected_candidate):
+        return None
+
+    top_score = candidate_rank_score(
+        talent, top, search_keywords, title_category, title_sub_category, platform=platform
+    )
+    selected_score = (
+        candidate_rank_score(
+            talent, selected_candidate, search_keywords, title_category, title_sub_category, platform=platform
+        )
+        if selected_candidate
+        else 0.0
+    )
+    if top_score >= selected_score:
+        return top
+    return None
+
+
 # ─────────────────────────────────────────────
 #  USERNAME HINT EXTRACTION  (NEW)
 # ─────────────────────────────────────────────
@@ -2907,6 +2033,7 @@ def ai_select_best_profile(
     entity_sub_category: str,
     search_keywords: str,
     username_hints: Optional[Dict[str, str]] = None,
+    wikipedia_context: str = "",
 ) -> dict:
     """
     Two-phase AI selection:
@@ -2977,6 +2104,8 @@ def ai_select_best_profile(
 TALENT: "{talent}"
 PLATFORM: {platform}
 SEARCH KEYWORDS FROM METADATA: {search_keywords or "(none)"}
+WIKIPEDIA IDENTITY CONTEXT: {wikipedia_context or "(not provided)"}
+KNOWN NAME ALIASES: {", ".join(_identity_name_aliases(talent, entity_category, entity_sub_category, wikipedia_context)) or "(none)"}
 
 CATEGORY CONTEXT:
 {cat_context}
@@ -2994,11 +2123,12 @@ Step 1 — For EACH candidate, classify it as:
 
 Use these signals in order of importance:
   1. signals.name_tokens_in_url and signals.full_name_in_url  (strongest identifier)
-  2. signals.verification_signals (official, verified, blue_check)
-  3. Cross-platform username hints (if handle from another platform appears in URL)
-  4. signals.profession_signals matching the expected category
-  5. signals.follower_count (higher = more credible public figure)
-  6. signals.name_tokens_in_title and signals.name_tokens_in_snippet
+  2. Wikipedia identity context, when provided, to disambiguate the exact person/brand
+  3. signals.verification_signals (official, verified, blue_check)
+  4. Cross-platform username hints (if handle from another platform appears in URL)
+  5. signals.profession_signals matching the expected category
+  6. signals.follower_count (higher = more credible public figure)
+  7. signals.name_tokens_in_title and signals.name_tokens_in_snippet
 
 Step 2 — From all ACCEPT candidates, choose the one with the most signals.
   If no ACCEPT, choose from MAYBE only if confidence ≥ 0.75.
@@ -3081,6 +2211,7 @@ def ai_verify_selected_link(
     entity_category: str,
     entity_sub_category: str,
     search_keywords: str,
+    wikipedia_context: str = "",
 ) -> Tuple[bool, float, str]:
     """
     Quick second AI call: "Does this specific URL definitively belong to [talent]?"
@@ -3126,6 +2257,8 @@ TALENT: "{talent}"
 PLATFORM: {platform}
 CATEGORY CONTEXT: {cat_context}
 SEARCH KEYWORDS: {search_keywords or "(none)"}
+WIKIPEDIA IDENTITY CONTEXT: {wikipedia_context or "(not provided)"}
+KNOWN NAME ALIASES: {", ".join(_identity_name_aliases(talent, entity_category, entity_sub_category, wikipedia_context)) or "(none)"}
 
 URL TO VERIFY: {link}
 PAGE TITLE:    {title}
@@ -3191,6 +2324,8 @@ def decide_emitted_link(
     """
     effective_min = _effective_min_confidence(talent)
     exp = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+    if _platform_suppressed_for_talent(talent, platform):
+        return "", 0.0, f"{platform} suppressed for this talent after manual validation."
 
     if not selected or selected == "Not Found":
         return "", confidence, reason or "No selection."
@@ -3328,6 +2463,45 @@ def _platform_for_discovered_url(url: str) -> Optional[str]:
     return None
 
 
+def _extract_visible_social_handles(html: str) -> Dict[str, str]:
+    """Recover handles shown as text in profile bios when no full URL is present."""
+    if not html:
+        return {}
+    text = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), html)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    out: Dict[str, str] = {}
+    patterns = {
+        "Instagram": r"(?:instagram|ig)[^A-Za-z0-9@._-]{0,40}@?([A-Za-z0-9._]{3,30})",
+        "TikTok": r"(?:tiktok|tik tok)[^A-Za-z0-9@._-]{0,40}@?([A-Za-z0-9._]{3,30})",
+        "X": r"(?:twitter|x\.com)[^A-Za-z0-9@._-]{0,40}@?([A-Za-z0-9._]{3,30})",
+    }
+    blocked = {"instagram", "tiktok", "twitter", "facebook", "youtube", "official"}
+    for platform, pattern in patterns.items():
+        for m in re.finditer(pattern, text, re.I):
+            handle = m.group(1).strip("._-")
+            if handle.lower() in blocked:
+                continue
+            out[platform] = handle
+            break
+    return out
+
+
+def _url_for_platform_handle(platform: str, handle: str) -> str:
+    handle = (handle or "").strip().lstrip("@")
+    if not handle:
+        return ""
+    if platform == "Instagram":
+        return f"https://www.instagram.com/{handle}"
+    if platform == "TikTok":
+        return f"https://www.tiktok.com/@{handle}"
+    if platform == "X":
+        return f"https://x.com/{handle}"
+    if platform == "Facebook":
+        return f"https://www.facebook.com/{handle}"
+    return ""
+
+
 def extract_social_links_from_page(page_url: str, source_platform: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     to_fetch = [page_url]
@@ -3356,6 +2530,12 @@ def extract_social_links_from_page(page_url: str, source_platform: str) -> Dict[
                     p2   = _platform_for_discovered_url(raw2)
                     if p2 and p2 != "__link_hub__" and p2 not in out:
                         out[p2] = normalize_profile_url(raw2, p2)
+        for plat, handle in _extract_visible_social_handles(html).items():
+            if plat in out:
+                continue
+            url = _url_for_platform_handle(plat, handle)
+            if url and is_valid_profile_url(url, plat):
+                out[plat] = normalize_profile_url(url, plat)
     return out
 
 
@@ -3381,8 +2561,30 @@ def enrich_row_from_anchor_profiles(df: pd.DataFrame, row_label: object) -> None
     except Exception as exc:
         print(f"[WARN] enrich failed: {exc}")
         return
+    if not discovered and best_plat == "Facebook":
+        fb_handle = _handle_slug_from_profile(best_url, "Facebook")
+        alias_slugs = {
+            _slug_chars(h)
+            for h in _identity_handle_aliases(
+                talent,
+                str(df.at[row_label, "title_category"] or ""),
+                str(df.at[row_label, "title_sub_category"] or ""),
+                wikipedia_identity_context(
+                    df.at[row_label, WIKIPEDIA_URL_COLUMN]
+                    if WIKIPEDIA_URL_COLUMN in df.columns
+                    else ""
+                ),
+            )
+        }
+        if fb_handle and fb_handle in alias_slugs:
+            for tgt in ("Instagram", "TikTok"):
+                guessed = _url_for_platform_handle(tgt, fb_handle)
+                if guessed and is_valid_profile_url(guessed, tgt):
+                    discovered.setdefault(tgt, guessed)
     for tgt, link in discovered.items():
         if tgt not in PLATFORMS:
+            continue
+        if _platform_suppressed_for_talent(talent, tgt):
             continue
         if str(df.at[row_label, tgt] or "").strip():
             continue
@@ -3434,6 +2636,8 @@ def _find_exact_handle_profile(
     title_sub_category: str,
 ) -> Optional[dict]:
     """Search for the same confirmed handle on another platform using real SERP results only."""
+    if _platform_suppressed_for_talent(talent, platform):
+        return None
     handle_clean = (handle or "").strip().lstrip("@")
     handle_slug = _slug_chars(handle_clean)
     if len(handle_slug) < 4:
@@ -3471,6 +2675,68 @@ def _find_exact_handle_profile(
                 return cand
         time.sleep(0.2)
     return None
+
+
+def _is_initial_style_person_name(talent: str) -> bool:
+    parts = _brand_name_parts(talent)
+    if len(parts) < 2:
+        return False
+    first = parts[0]
+    return bool(len(first) <= 3 and first.upper() == first and re.search(r"[A-Z]", first))
+
+
+def reconcile_initial_name_x_instagram_handle(
+    df: pd.DataFrame,
+    row_label: object,
+    resolved_links: Dict[str, str],
+    title_category: str,
+    title_sub_category: str,
+) -> None:
+    """For initial-style names (BJ/CJ/etc.), use a strong X handle to correct Instagram."""
+    talent = str(df.at[row_label, "Talent Name"] or "").strip()
+    if not _is_initial_style_person_name(talent):
+        return
+    exp = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+    if exp.get("expects_brand"):
+        return
+    confs = ROW_PLATFORM_CONFIDENCE.get(row_label, {})
+    x_url = resolved_links.get("X", "")
+    x_conf = float(confs.get("X", 0.0))
+    if not x_url or x_conf < 0.85:
+        return
+    x_handle = _handle_slug_from_profile(x_url, "X")
+    if len(x_handle) < 4:
+        return
+
+    current_ig = str(df.at[row_label, "Instagram"] or "").strip()
+    current_ig_handle = _handle_slug_from_profile(current_ig, "Instagram") if current_ig else ""
+    if current_ig_handle == x_handle:
+        return
+
+    cand = _find_exact_handle_profile(
+        x_handle, talent, "Instagram", PLATFORMS["Instagram"],
+        title_category, title_sub_category,
+    )
+    if not cand:
+        return
+    score = candidate_rank_score(
+        talent, cand, extract_search_keywords(title_category, title_sub_category),
+        title_category, title_sub_category, platform="Instagram",
+    )
+    if score < 5.0:
+        return
+
+    link = normalize_profile_url(cand["link"], "Instagram")
+    conf_value = round(min(0.92, max(0.86, x_conf * 0.98)), 3)
+    print(
+        f"  [INITIAL-HANDLE-FIX] Instagram | {talent} | "
+        f"using X @{x_handle} -> {link[:90]}"
+    )
+    df.at[row_label, "Instagram"] = link
+    ROW_PLATFORM_CONFIDENCE.setdefault(row_label, {})["Instagram"] = conf_value
+    df.at[row_label, PLATFORM_CONF_COLUMNS["Instagram"]] = conf_value
+    ROW_PLATFORM_SOURCE.setdefault(row_label, {})["Instagram"] = "x_instagram_handle_match"
+    resolved_links["Instagram"] = link
 
 
 def reconcile_athlete_handles_from_confirmed_profiles(
@@ -3534,22 +2800,27 @@ def search_one_platform(
     title_category: str,
     title_sub_category: str,
     username_hints: Optional[Dict[str, str]] = None,
+    wikipedia_context: str = "",
 ) -> Tuple[str, str, float, str]:
     search_keywords = extract_search_keywords(title_category, title_sub_category)
-    exp_search = parse_entity_expectations(title_category, title_sub_category, talent=talent)
+    lookup_talent = _talent_lookup_name(talent, title_category, title_sub_category)
+    if _platform_suppressed_for_talent(lookup_talent, platform):
+        return platform, "", 0.0, f"{platform} suppressed for this talent after manual validation."
+    exp_search = parse_entity_expectations(title_category, title_sub_category, talent=lookup_talent)
     all_candidates: List[dict] = []
     seen_links: set = set()
 
     queries = build_queries(
-        talent, platform, domains, search_keywords,
+        lookup_talent, platform, domains, search_keywords,
         title_category, title_sub_category,
         username_hints=username_hints,
+        wikipedia_context=wikipedia_context,
     )
 
     for query in queries:
         try:
             results = serper_search(query, num_results=RESULTS_PER_QUERY)
-            print(f"[QUERY] {platform} | {talent} | '{query}' -> {len(results)} raw results")
+            print(f"[QUERY] {platform} | {lookup_talent} | '{query}' -> {len(results)} raw results")
             for pos, item in enumerate(results, start=1):
                 raw_link = item.get("link", "")
                 prof = profile_from_candidate_url(raw_link, platform)
@@ -3589,16 +2860,16 @@ def search_one_platform(
 
     valid_candidates = [c for c in all_candidates if is_valid_profile_url(c.get("link", ""), platform)]
     if exp_search.get("expects_brand"):
-        canonical = _brand_canonical_slug(talent)
+        canonical = _brand_canonical_slug(lookup_talent)
         brand_clean: List[dict] = []
         for c in valid_candidates:
             clink = c.get("link", "")
             path_slug = _path_handle_slug(clink, platform)
-            if _brand_slug_is_vertical(canonical, path_slug, talent, platform):
+            if _brand_slug_is_vertical(canonical, path_slug, lookup_talent, platform):
                 print(f"  [BRAND] Skip vertical handle: {(clink or '')[:90]}")
                 continue
             rej_brand, why_brand = entity_profile_rejected(
-                talent, title_category, title_sub_category, c, platform
+                lookup_talent, title_category, title_sub_category, c, platform
             )
             if rej_brand:
                 print(f"  [BRAND] Skip mismatch: {(clink or '')[:90]} | {why_brand}")
@@ -3606,13 +2877,13 @@ def search_one_platform(
             brand_clean.append(c)
         valid_candidates = brand_clean
     valid_candidates = sort_candidates_for_ai(
-        talent, valid_candidates, search_keywords, title_category, title_sub_category,
+        lookup_talent, valid_candidates, search_keywords, title_category, title_sub_category,
         username_hints=username_hints, platform=platform,
     )
     top_candidates = valid_candidates[:MAX_CANDIDATES_FOR_AI]
 
     ctx = f" | kw: {search_keywords}" if search_keywords else ""
-    print(f"[INFO] {platform} | {talent}{ctx} -> {len(top_candidates)} profile-filtered candidates for AI")
+    print(f"[INFO] {platform} | {lookup_talent}{ctx} -> {len(top_candidates)} profile-filtered candidates for AI")
 
     if not top_candidates:
         return platform, "", 0.0, "No valid profile/channel URLs in search results."
@@ -3622,16 +2893,17 @@ def search_one_platform(
 
     try:
         ai_result  = ai_select_best_profile(
-            talent, platform, top_candidates,
+            lookup_talent, platform, top_candidates,
             title_category, title_sub_category, search_keywords,
             username_hints=username_hints,
+            wikipedia_context=wikipedia_context,
         )
         selected   = ai_result["best_link"]
         confidence = ai_result["confidence"]
         reason     = ai_result["reason"]
 
         recovered_pick = _prefer_recovered_athlete_handle(
-            talent, platform, selected, top_candidates,
+            lookup_talent, platform, selected, top_candidates,
             title_category, title_sub_category, search_keywords,
         )
         if recovered_pick:
@@ -3642,9 +2914,21 @@ def search_one_platform(
                 "that directly names the athlete."
             )
 
+        personal_site_pick = _prefer_personal_website_athlete_profile(
+            lookup_talent, platform, selected, top_candidates,
+            title_category, title_sub_category, search_keywords,
+        )
+        if personal_site_pick:
+            selected = personal_site_pick["link"]
+            confidence = max(confidence, 0.90)
+            reason = (
+                f"{reason} | Preferred top-ranked athlete profile with "
+                "a name-matching personal website."
+            )
+
         # ── If AI returned empty, try strong-rank fallback ──
         if not selected and fallback:
-            rej_fb, _ = entity_profile_rejected(talent, title_category, title_sub_category, top_candidate, platform)
+            rej_fb, _ = entity_profile_rejected(lookup_talent, title_category, title_sub_category, top_candidate, platform)
             if not rej_fb:
                 selected   = fallback
                 confidence = min(confidence, 0.42)
@@ -3653,7 +2937,7 @@ def search_one_platform(
         # ── If AI returned invalid URL, try fallback ──
         elif selected and not is_valid_profile_url(selected, platform):
             print(f"[WARN] AI returned non-profile URL; trying fallback.")
-            rej_fb, _ = entity_profile_rejected(talent, title_category, title_sub_category, top_candidate, platform)
+            rej_fb, _ = entity_profile_rejected(lookup_talent, title_category, title_sub_category, top_candidate, platform)
             if fallback and not rej_fb:
                 selected   = fallback
                 confidence = min(confidence, 0.42)
@@ -3673,9 +2957,9 @@ def search_one_platform(
             )
             emit_candidate = cand
             if cand:
-                rej, why = entity_profile_rejected(talent, title_category, title_sub_category, cand, platform)
+                rej, why = entity_profile_rejected(lookup_talent, title_category, title_sub_category, cand, platform)
                 if rej:
-                    print(f"[REJECT] {platform} | {talent} | {why}")
+                    print(f"[REJECT] {platform} | {lookup_talent} | {why}")
                     selected = ""; confidence = min(confidence, 0.15); reason = why
                     emit_candidate = None
 
@@ -3683,35 +2967,49 @@ def search_one_platform(
         if selected and confidence >= 0.55:
             cand_for_verify = emit_candidate or top_candidate
             verified, verify_conf, verify_rsn = ai_verify_selected_link(
-                talent, platform, selected,
+                lookup_talent, platform, selected,
                 cand_for_verify.get("title", "") if cand_for_verify else "",
                 cand_for_verify.get("snippet", "") if cand_for_verify else "",
                 title_category, title_sub_category, search_keywords,
+                wikipedia_context=wikipedia_context,
             )
-            print(f"[VERIFY] {platform} | {talent} | verified={verified} conf={verify_conf:.2f} | {verify_rsn}")
+            print(f"[VERIFY] {platform} | {lookup_talent} | verified={verified} conf={verify_conf:.2f} | {verify_rsn}")
             path_slug = _path_handle_slug(selected, platform)
             cand_brand = emit_candidate or top_candidate
             brand_handle_ok = (
                 exp_search.get("expects_brand")
                 and (
-                    _brand_handle_matches_row(talent, path_slug, platform)
+                    _brand_handle_matches_row(lookup_talent, path_slug, platform)
                     or (
                         platform == "YouTube"
                         and _is_youtube_channel_id_slug(path_slug)
                         and cand_brand
-                        and _candidate_supports_brand(talent, cand_brand)
+                        and _candidate_supports_brand(lookup_talent, cand_brand)
                     )
                 )
             )
             if not verified and verify_conf < AI_VERIFY_MIN_CONFIDENCE:
+                athlete_profile_ok = (
+                    not exp_search.get("expects_brand")
+                    and (exp_search.get("expects_athlete") or exp_search.get("expects_basketball"))
+                    and cand_for_verify
+                    and _candidate_has_exact_profile_title(lookup_talent, cand_for_verify)
+                    and confidence >= 0.75
+                )
                 if brand_handle_ok and confidence >= 0.55:
                     print(
                         f"[VERIFY-WAIVER] {platform} | {talent} | "
                         "keeping brand handle match despite weak snippet verify"
                     )
                     reason = f"{reason} [verify waived: {verify_rsn}]"
+                elif athlete_profile_ok:
+                    print(
+                        f"[VERIFY-WAIVER] {platform} | {lookup_talent} | "
+                        "keeping exact athlete profile-title match despite weak snippet verify"
+                    )
+                    reason = f"{reason} [verify waived: {verify_rsn}]"
                 else:
-                    print(f"[VETO] Verify vetoed result for {platform} | {talent}")
+                    print(f"[VETO] Verify vetoed result for {platform} | {lookup_talent}")
                     selected   = ""
                     confidence = min(confidence, verify_conf)
                     reason     = f"Verify pass failed: {verify_rsn}"
@@ -3723,23 +3021,23 @@ def search_one_platform(
 
         # ── Final emission gate ──
         emit, conf_out, rsn_out = decide_emitted_link(
-            talent, platform, selected or "", confidence, reason,
+            lookup_talent, platform, selected or "", confidence, reason,
             top_candidate, search_keywords, title_category, title_sub_category,
             emit_candidate=emit_candidate,
         )
         return platform, emit, conf_out, rsn_out
 
     except Exception as exc:
-        print(f"[ERROR] AI/Verify failed for {platform} | {talent}: {exc}")
+        print(f"[ERROR] AI/Verify failed for {platform} | {lookup_talent}: {exc}")
         # Last-resort deterministic fallback
         if fallback:
-            rej_fb, _ = entity_profile_rejected(talent, title_category, title_sub_category, top_candidate, platform)
+            rej_fb, _ = entity_profile_rejected(lookup_talent, title_category, title_sub_category, top_candidate, platform)
             if not rej_fb:
                 rs = candidate_rank_score(
-                    talent, top_candidate, search_keywords, title_category, title_sub_category
+                    lookup_talent, top_candidate, search_keywords, title_category, title_sub_category
                 )
                 if rs >= MIN_RANK_SCORE_FOR_FALLBACK and talent_url_aligned(
-                    talent, fallback, title_category, title_sub_category,
+                    lookup_talent, fallback, title_category, title_sub_category,
                 ):
                     return (
                         platform,
@@ -3757,27 +3055,36 @@ def search_one_platform(
 def process_row(
     df: pd.DataFrame,
     row_label: object,
-    progress_callback: Optional[Callable] = None,
+    platform_progress: Optional[Callable[[str, str], None]] = None,
 ) -> None:
     talent            = str(df.at[row_label, "Talent Name"] or "").strip()
     title_category    = str(df.at[row_label, "title_category"]    or "").strip()
     title_sub_category= str(df.at[row_label, "title_sub_category"] or "").strip()
+    wikipedia_url     = _clean_wikipedia_url(df.at[row_label, WIKIPEDIA_URL_COLUMN] if WIKIPEDIA_URL_COLUMN in df.columns else "")
 
     if not talent:
         return
 
+    wikipedia_context = wikipedia_identity_context(wikipedia_url) if wikipedia_url else ""
     ambiguity = get_name_ambiguity_level(talent)
     print(f"\n{'='*65}")
     print(f"Processing: {talent}  [ambiguity={ambiguity}]")
     if title_category or title_sub_category:
         print(f"  Category: {title_category} | SubCategory: {title_sub_category}")
+    if wikipedia_context:
+        print(f"  Wikipedia: {wikipedia_context[:180]}")
 
     # Resolve platforms one at a time (sequential for username-hint propagation)
     resolved_links: Dict[str, str] = {}
     for platform, domains in PLATFORMS.items():
+        if platform_progress:
+            platform_progress(platform, "start")
+
         existing = str(df.at[row_label, platform] or "").strip()
         if existing:
             resolved_links[platform] = existing
+            if platform_progress:
+                platform_progress(platform, "done")
             continue
 
         # Build username hints from what's been resolved so far
@@ -3788,6 +3095,7 @@ def process_row(
                 talent, platform, domains,
                 title_category, title_sub_category,
                 username_hints=username_hints,
+                wikipedia_context=wikipedia_context,
             )
         except Exception as exc:
             print(f"  [{platform}] UNEXPECTED ERROR: {exc}")
@@ -3801,9 +3109,14 @@ def process_row(
             resolved_links[platform] = link
 
         print(f"  [{platform}] {link or '(blank)'} (conf={confidence:.2f}) — {reason}")
+        if platform_progress:
+            platform_progress(platform, "done")
         time.sleep(OPENAI_DELAY_SECONDS)
 
     reconcile_athlete_handles_from_confirmed_profiles(
+        df, row_label, resolved_links, title_category, title_sub_category
+    )
+    reconcile_initial_name_x_instagram_handle(
         df, row_label, resolved_links, title_category, title_sub_category
     )
 
@@ -3812,9 +3125,6 @@ def process_row(
     _refresh_row_aggregate_confidence(df, row_label)
     _refresh_row_source_cell(df, row_label)
 
-    if progress_callback:
-        progress_callback(talent)
-
 
 # ─────────────────────────────────────────────
 #  API PIPELINE WRAPPERS
@@ -3822,9 +3132,21 @@ def process_row(
 
 def _ensure_pipeline_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Keep uploaded/name-only dataframes compatible with the resolver pipeline."""
+    if WIKIPEDIA_URL_COLUMN not in df.columns:
+        wiki_col = _find_column(
+            df,
+            "wikipedia_url",
+            "Wikipedia",
+            "Wiki URL",
+            "wiki_url",
+            "Wiki",
+            "Wikipedia Link",
+        )
+        df[WIKIPEDIA_URL_COLUMN] = df[wiki_col] if wiki_col else ""
     for column in ("Talent Name", "title_category", "title_sub_category"):
         if column not in df.columns:
             df[column] = ""
+    df[WIKIPEDIA_URL_COLUMN] = df[WIKIPEDIA_URL_COLUMN].apply(_clean_wikipedia_url)
     for platform in PLATFORMS:
         if platform not in df.columns:
             df[platform] = ""
@@ -3841,6 +3163,7 @@ def _ensure_pipeline_columns(df: pd.DataFrame) -> pd.DataFrame:
 def run_pipeline_on_dataframe(
     df: pd.DataFrame,
     progress: Optional[Callable[[int, int, str], None]] = None,
+    platform_progress: Optional[Callable[[int, str, str], None]] = None,
 ) -> pd.DataFrame:
     """
     Run the social lookup pipeline on a prepared dataframe.
@@ -3869,7 +3192,12 @@ def run_pipeline_on_dataframe(
 
         if progress:
             progress(i, total, talent)
-        process_row(df, row_label)
+
+        def _row_platform_progress(platform: str, phase: str) -> None:
+            if platform_progress:
+                platform_progress(i - 1, platform, phase)
+
+        process_row(df, row_label, platform_progress=_row_platform_progress)
         delay = random.uniform(*REQUEST_DELAY_BETWEEN_TALENTS)
         print(f"  [{i}/{total}] complete — sleeping {delay:.1f}s")
         time.sleep(delay)
@@ -3880,13 +3208,18 @@ def run_pipeline_on_dataframe(
 def run_pipeline_for_names(
     names: List[str],
     progress: Optional[Callable[[int, int, str], None]] = None,
+    platform_progress: Optional[Callable[[int, str, str], None]] = None,
 ) -> pd.DataFrame:
     """Build a dataframe from plain names and run the lookup pipeline."""
     clean = [str(name).strip() for name in names if name and str(name).strip()]
     if not clean:
         raise ValueError("At least one non-empty name is required.")
     df = build_talent_df(clean, list(PLATFORMS.keys()))
-    return run_pipeline_on_dataframe(df, progress=progress)
+    return run_pipeline_on_dataframe(
+        df,
+        progress=progress,
+        platform_progress=platform_progress,
+    )
 
 
 def run_pipeline() -> pd.DataFrame:

@@ -23,13 +23,29 @@ export default function ProcessingPage() {
       <AppSidebar />
 
       <main className="relative z-10 flex min-h-screen flex-1 flex-col pb-24 md:ml-64 md:pb-0">
-        <header className="sticky top-0 z-30 flex w-full items-center justify-between border-b border-white/5 bg-background/90 px-6 py-4 backdrop-blur-md">
-          <h1 className="text-lg font-bold text-slate-100">Processing</h1>
+        <header className="sticky top-0 z-30 flex w-full items-center justify-between border-b border-white/5 bg-background/85 px-6 py-4 backdrop-blur-xl">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 ring-1 ring-primary/25 shadow-lg shadow-primary/10">
+              <span className="material-symbols-outlined text-primary">sync</span>
+            </div>
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-primary/80">
+                Live pipeline
+              </p>
+              <h1 className="text-lg font-bold text-slate-100">Processing</h1>
+            </div>
+          </div>
           <Link
             href="/results"
-            className="cursor-pointer rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-200 ring-1 ring-white/10 transition hover:bg-slate-700 hover:brightness-110"
+            className="proc-btn-glow group inline-flex cursor-pointer items-center gap-2 rounded-xl bg-slate-800/90 px-4 py-2.5 text-sm font-semibold text-slate-100 ring-1 ring-white/10"
           >
+            <span className="material-symbols-outlined text-base text-primary transition-transform group-hover:scale-110">
+              table_chart
+            </span>
             View Results
+            <span className="material-symbols-outlined text-base opacity-60 transition-transform group-hover:translate-x-0.5">
+              arrow_forward
+            </span>
           </Link>
         </header>
 

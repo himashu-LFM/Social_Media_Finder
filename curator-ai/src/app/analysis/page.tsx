@@ -4,6 +4,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import * as XLSX from "xlsx";
 import { AppMobileNav } from "@/components/AppMobileNav";
+import { AppPageHeader } from "@/components/AppPageHeader";
 import { AppSidebar } from "@/components/AppSidebar";
 
 const REQUIRED_PREFIX = "Talent_Social_Lookup_";
@@ -33,7 +34,6 @@ function asConfidence(v: unknown): number {
   const cleaned = raw.replace(/,/g, "").replace(/%$/, "");
   const n = Number(cleaned);
   if (!Number.isFinite(n)) return 0;
-  // Treat 0..1 as already-normalized, 1..100 as percent points.
   if (n > 1) return Math.max(0, Math.min(1, n / 100));
   return Math.max(0, Math.min(1, n));
 }
@@ -154,31 +154,42 @@ export default async function AnalysisPage() {
   const asPct = (v: number) => (total ? `${((v / total) * 100).toFixed(1)}%` : "0.0%");
 
   return (
-    <div className="flex min-h-screen flex-col bg-background md:flex-row">
+    <div className="relative flex min-h-screen flex-col bg-background md:flex-row">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_0%_0%,rgba(242,209,0,0.06),transparent_32%)]"
+      />
       <AppSidebar />
 
-      <main className="md:ml-64 flex-1 p-4 pb-24 md:p-8 md:pb-8">
-        <header className="sticky top-0 z-30 mb-6 flex items-center justify-between bg-background/90 py-3 backdrop-blur-md">
-          <h1 className="text-lg font-bold text-slate-100">Analysis</h1>
-          <Link
-            href="/results"
-            className="inline-flex items-center gap-2 rounded-xl bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 ring-1 ring-white/10 transition hover:bg-slate-700"
-          >
-            <span className="material-symbols-outlined text-base">arrow_back</span>
-            Close Analysis
-          </Link>
-        </header>
+      <main className="relative z-10 flex-1 p-4 pb-24 md:ml-64 md:p-8 md:pb-8">
+        <AppPageHeader
+          title="Analysis"
+          subtitle="Confidence breakdown"
+          icon="donut_large"
+          actions={
+            <Link href="/results" className="lf-btn-secondary inline-flex items-center gap-2 px-4 py-2.5 text-sm">
+              <span className="material-symbols-outlined text-base">arrow_back</span>
+              Back to Results
+            </Link>
+          }
+        />
 
         <div className="mx-auto max-w-6xl space-y-8">
           <section className="grid grid-cols-1 gap-8 lg:grid-cols-2">
-            <div className="flex min-h-[500px] items-center justify-center rounded-2xl border border-white/10 bg-slate-900/75 p-6 ring-1 ring-white/10">
-              <div className="relative h-[360px] w-[360px] rounded-full p-5" style={chartStyle}>
-                <div className="absolute inset-[18%] flex items-center justify-center rounded-full bg-slate-900 ring-1 ring-white/10">
-                  <div className="text-center">
-                    <div className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-                      Total Links
+            <div className="lf-enter lf-card lf-card-hover flex min-h-[420px] items-center justify-center p-6 lg:min-h-[500px]">
+              <div className="relative">
+                <div
+                  className="relative h-[320px] w-[320px] rounded-full p-5 shadow-2xl shadow-black/40 ring-1 ring-white/10 sm:h-[360px] sm:w-[360px]"
+                  style={chartStyle}
+                >
+                  <div className="absolute inset-[18%] flex items-center justify-center rounded-full bg-slate-950 ring-1 ring-white/10">
+                    <div className="text-center">
+                      <div className="inline-flex items-center gap-1 text-xs font-semibold uppercase tracking-widest text-slate-400">
+                        <span className="material-symbols-outlined text-sm">link</span>
+                        Total Links
+                      </div>
+                      <div className="mt-1 text-4xl font-black text-slate-100">{total}</div>
                     </div>
-                    <div className="mt-1 text-4xl font-black text-slate-100">{total}</div>
                   </div>
                 </div>
               </div>
@@ -190,15 +201,24 @@ export default async function AnalysisPage() {
                 count={greenCount}
                 pct={asPct(greenCount)}
                 tone="emerald"
+                icon="check_circle"
               />
               <AnalysisRow
                 label="Yellow (70%-85%)"
                 count={yellowCount}
                 pct={asPct(yellowCount)}
                 tone="amber"
+                icon="warning"
               />
-              <AnalysisRow label="Red (<70%)" count={redCount} pct={asPct(redCount)} tone="rose" />
-              <div className="mt-4 rounded-xl border border-indigo-500/25 bg-indigo-500/10 px-4 py-3 text-sm text-indigo-100">
+              <AnalysisRow
+                label="Red (<70%)"
+                count={redCount}
+                pct={asPct(redCount)}
+                tone="rose"
+                icon="cancel"
+              />
+              <div className="lf-enter lf-enter-delay-2 lf-card mt-4 flex items-start gap-3 px-4 py-4 text-sm text-slate-300">
+                <span className="material-symbols-outlined text-primary">insights</span>
                 This chart includes all resolved platform links from the latest processed workbook.
               </div>
             </div>
@@ -216,25 +236,30 @@ function AnalysisRow({
   count,
   pct,
   tone,
+  icon,
 }: {
   label: string;
   count: number;
   pct: string;
   tone: "emerald" | "amber" | "rose";
+  icon: string;
 }) {
   const cls =
     tone === "emerald"
-      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200 lf-stat-glow-emerald"
       : tone === "amber"
-        ? "border-amber-500/30 bg-amber-500/10 text-amber-200"
+        ? "border-amber-500/30 bg-amber-500/10 text-amber-200 lf-stat-glow-amber"
         : "border-rose-500/30 bg-rose-500/10 text-rose-200";
+
   return (
-    <div className={`flex items-center justify-between rounded-xl border px-4 py-3 ${cls}`}>
-      <span className="text-sm font-semibold">{label}</span>
+    <div className={`lf-enter lf-card-hover flex items-center justify-between rounded-xl border px-4 py-4 ${cls}`}>
+      <span className="inline-flex items-center gap-2 text-sm font-semibold">
+        <span className="material-symbols-outlined text-base">{icon}</span>
+        {label}
+      </span>
       <span className="text-sm font-bold">
         {count} <span className="opacity-80">({pct})</span>
       </span>
     </div>
   );
 }
-

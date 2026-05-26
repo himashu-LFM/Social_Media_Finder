@@ -75,25 +75,67 @@ class StartJobBody(BaseModel):
     names: List[str] = Field(..., min_length=1)
 
 
+def _reset_row_platform_state(entry: Dict[str, Any]) -> None:
+    entry["current_platform"] = None
+    entry["completed_platforms"] = []
+
+
+def _apply_row_progress(job: Dict[str, Any], row_index: int) -> None:
+    for k, entry in enumerate(job["names"]):
+        if k < row_index:
+            entry["status"] = "done"
+            entry["current_platform"] = None
+            entry["completed_platforms"] = list(testing.PLATFORMS.keys())
+        elif k == row_index:
+            entry["status"] = "processing"
+            _reset_row_platform_state(entry)
+        else:
+            entry["status"] = "queued"
+            _reset_row_platform_state(entry)
+
+
+def _apply_platform_progress(
+    job: Dict[str, Any],
+    row_index: int,
+    platform: str,
+    phase: str,
+) -> None:
+    if row_index < 0 or row_index >= len(job["names"]):
+        return
+    entry = job["names"][row_index]
+    if phase == "start":
+        entry["current_platform"] = platform
+        return
+    if phase == "done":
+        completed = entry.setdefault("completed_platforms", [])
+        if platform not in completed:
+            completed.append(platform)
+
+
 def _run_job(job_id: str, names: List[str]) -> None:
     def progress(i: int, total: int, talent_name: str) -> None:
         with _jobs_lock:
             job = _jobs.get(job_id)
             if not job:
                 return
-            for k, entry in enumerate(job["names"]):
-                if k < i - 1:
-                    entry["status"] = "done"
-                elif k == i - 1:
-                    entry["status"] = "processing"
-                else:
-                    entry["status"] = "queued"
+            _apply_row_progress(job, i - 1)
+
+    def platform_progress(row_index: int, platform: str, phase: str) -> None:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if not job:
+                return
+            _apply_platform_progress(job, row_index, platform, phase)
 
     try:
         with _jobs_lock:
             _jobs[job_id]["status"] = "running"
 
-        final_df = testing.run_pipeline_for_names(names, progress=progress)
+        final_df = testing.run_pipeline_for_names(
+            names,
+            progress=progress,
+            platform_progress=platform_progress,
+        )
 
         out_path = testing.save_output(final_df, output_dir=ROOT)
 
@@ -104,6 +146,8 @@ def _run_job(job_id: str, names: List[str]) -> None:
                 job["output_path"] = out_path
                 for entry in job["names"]:
                     entry["status"] = "done"
+                    entry["current_platform"] = None
+                    entry["completed_platforms"] = list(testing.PLATFORMS.keys())
     except Exception as exc:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -118,20 +162,25 @@ def _run_job_from_file(job_id: str, path: Path) -> None:
             job = _jobs.get(job_id)
             if not job:
                 return
-            for k, entry in enumerate(job["names"]):
-                if k < i - 1:
-                    entry["status"] = "done"
-                elif k == i - 1:
-                    entry["status"] = "processing"
-                else:
-                    entry["status"] = "queued"
+            _apply_row_progress(job, i - 1)
+
+    def platform_progress(row_index: int, platform: str, phase: str) -> None:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if not job:
+                return
+            _apply_platform_progress(job, row_index, platform, phase)
 
     try:
         with _jobs_lock:
             _jobs[job_id]["status"] = "running"
 
         df = testing.load_talent_table_from_path(path)
-        final_df = testing.run_pipeline_on_dataframe(df, progress=progress)
+        final_df = testing.run_pipeline_on_dataframe(
+            df,
+            progress=progress,
+            platform_progress=platform_progress,
+        )
 
         out_path = testing.save_output(final_df, output_dir=ROOT)
 
@@ -142,6 +191,8 @@ def _run_job_from_file(job_id: str, path: Path) -> None:
                 job["output_path"] = out_path
                 for entry in job["names"]:
                     entry["status"] = "done"
+                    entry["current_platform"] = None
+                    entry["completed_platforms"] = list(testing.PLATFORMS.keys())
     except Exception as exc:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -176,7 +227,15 @@ def start_job(body: StartJobBody) -> dict[str, str]:
     with _jobs_lock:
         _jobs[job_id] = {
             "status": "queued",
-            "names": [{"name": n, "status": "queued"} for n in names],
+            "names": [
+                {
+                    "name": n,
+                    "status": "queued",
+                    "current_platform": None,
+                    "completed_platforms": [],
+                }
+                for n in names
+            ],
             "output_path": None,
             "error": None,
         }
@@ -235,7 +294,15 @@ async def start_job_from_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     with _jobs_lock:
         _jobs[job_id] = {
             "status": "queued",
-            "names": [{"name": n, "status": "queued"} for n in names],
+            "names": [
+                {
+                    "name": n,
+                    "status": "queued",
+                    "current_platform": None,
+                    "completed_platforms": [],
+                }
+                for n in names
+            ],
             "output_path": None,
             "error": None,
             "source_filename": raw_name,
