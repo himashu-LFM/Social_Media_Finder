@@ -55,7 +55,7 @@ export default function DiscoveryPage() {
               AI social resolver
             </span>
             <h2 className="mt-4 text-4xl font-extrabold tracking-tight text-slate-50 md:text-5xl">
-               <span className="block text-primary">Find official profiles</span>
+               <span className="block text-primary">Find Official Profiles</span>
             </h2>
             <p className="mt-4 max-w-2xl text-sm leading-relaxed text-slate-400 md:text-base">
               Paste talent names or upload a spreadsheet. ListenFirst searches five platforms,
