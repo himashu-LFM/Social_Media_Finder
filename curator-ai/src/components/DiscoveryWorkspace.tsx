@@ -1,167 +1,263 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useRef, useState } from "react";
 import { useToast } from "@/components/ToastProvider";
-import {
-  getPythonApiUrl,
-  parseNamesFromText,
-  saveProcessingNames,
-  setPythonJobId,
-} from "@/lib/processing-job";
+import { getPythonApiUrl, saveProcessingNames, setPythonJobId } from "@/lib/processing-job";
 
-const defaultNames = `Adam Grissom
-Akai Fleming
-BJ Powell
-ESPN`;
+const excelColumns = [
+  {
+    name: "Talent Name",
+    required: true,
+    example: "Jake Thompson",
+    note: "One person or brand per row. Also accepts: Talent, Name, Title (or first column).",
+  },
+  {
+    name: "title_category",
+    required: false,
+    example: "Talent Type - Athlete",
+    note: "Talent type, gender, subtype — used for search and identity checks.",
+  },
+  {
+    name: "title_sub_category",
+    required: false,
+    example: "Talent Subtype - Athlete - Baseball · Gender - Man",
+    note: "Extra metadata (sport, publication type, etc.).",
+  },
+  {
+    name: "Wikipedia URL",
+    required: false,
+    example: "en.wikipedia.org/wiki/…",
+    note: "Optional anchor link for disambiguation.",
+  },
+  {
+    name: "Instagram URL",
+    required: false,
+    example: "instagram.com/username",
+    note: "Optional known IG profile — used as a trusted anchor when provided.",
+  },
+] as const;
 
 export function DiscoveryWorkspace() {
   const router = useRouter();
   const { pushToast } = useToast();
-  const [text, setText] = useState(defaultNames);
-  const [ignoreSingle, setIgnoreSingle] = useState(true);
-  const [hint, setHint] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [status, setStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
 
-  const nameCount = useMemo(
-    () => parseNamesFromText(text, ignoreSingle).length,
-    [text, ignoreSingle],
-  );
+  const base = getPythonApiUrl();
 
-  async function runDiscovery() {
-    const names = parseNamesFromText(text, ignoreSingle);
-    if (names.length === 0) {
-      pushToast("Add at least one valid name.", "error");
-      setHint(
-        "Add at least one name line, or turn off “ignore single-name” if each line is a single word.",
-      );
-      return;
-    }
-    setHint(null);
+  function openPicker() {
+    inputRef.current?.click();
+  }
 
-    const base = getPythonApiUrl();
-    if (base) {
-      setLoading(true);
-      try {
-        const res = await fetch(`${base}/api/jobs`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ names }),
-        });
-        const payload = (await res.json().catch(() => ({}))) as {
-          detail?: string | { msg?: string }[];
-          job_id?: string;
-        };
-        if (!res.ok) {
-          const msg =
-            typeof payload.detail === "string"
-              ? payload.detail
-              : Array.isArray(payload.detail)
-                ? JSON.stringify(payload.detail)
-                : `Request failed (${res.status})`;
-          setHint(msg);
-          pushToast("Discovery start failed.", "error");
-          setLoading(false);
-          return;
+  async function uploadFile(file: File) {
+    if (!base) return;
+
+    setLoading(true);
+    setStatus(null);
+
+    const fd = new FormData();
+    fd.append("file", file);
+
+    try {
+      const res = await fetch(`${base}/api/upload`, {
+        method: "POST",
+        body: fd,
+      });
+      const payload = (await res.json().catch(() => ({}))) as {
+        detail?: string | unknown;
+        job_id?: string;
+        names?: string[];
+      };
+
+      if (!res.ok) {
+        let msg =
+          typeof payload.detail === "string"
+            ? payload.detail
+            : `Upload failed (${res.status})`;
+        if (res.status === 404) {
+          msg =
+            "Python API returned 404 — the running uvicorn process is outdated. In C:\\Testing stop the server (Ctrl+C), then start: uvicorn api_server:app --host 127.0.0.1 --port 8787 --reload";
         }
-        if (!payload.job_id) {
-          setHint("Invalid API response (missing job_id).");
-          pushToast("Invalid API response.", "error");
-          setLoading(false);
-          return;
+        if (res.status === 405) {
+          msg =
+            "405 Method Not Allowed — restart uvicorn from C:\\Testing with the latest api_server.py (use --reload).";
         }
-        saveProcessingNames(names);
-        setPythonJobId(payload.job_id);
-      } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        setHint(
-          `Cannot reach ${base} (${detail}). From C:\\Testing run: uvicorn api_server:app --host 127.0.0.1 --port 8787 — add NEXT_PUBLIC_PYTHON_API_URL=http://127.0.0.1:8787 to curator-ai/.env.local and restart npm run dev.`,
-        );
-        pushToast("Python API unreachable.", "error");
+        setStatus(msg);
+        pushToast("Upload failed.", "error");
         setLoading(false);
         return;
       }
-      setLoading(false);
-    } else {
-      setPythonJobId(null);
-      saveProcessingNames(names);
-    }
 
-    pushToast("Discovery started.", "success");
-    router.push("/processing");
+      if (!payload.job_id || !payload.names?.length) {
+        setStatus("Invalid response from server.");
+        pushToast("Invalid upload response.", "error");
+        setLoading(false);
+        return;
+      }
+
+      saveProcessingNames(payload.names);
+      setPythonJobId(payload.job_id);
+      setLoading(false);
+      pushToast("File uploaded.", "success");
+      router.push("/processing");
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      setStatus(
+        `Cannot reach ${base}: ${detail}. Run uvicorn from C:\\Testing (port 8787), set NEXT_PUBLIC_PYTHON_API_URL in .env.local, restart next dev.`,
+      );
+      pushToast("Cannot reach Python API.", "error");
+      setLoading(false);
+    }
+  }
+
+  async function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file || !base) return;
+    await uploadFile(file);
   }
 
   return (
     <>
-      <div className="lf-enter lf-card lf-gradient-border p-6 sm:p-8">
+      <div
+        className={`lf-enter lf-card lf-gradient-border relative overflow-hidden p-6 sm:p-8 transition ${
+          dragOver ? "border-primary/35 bg-primary/5" : ""
+        }`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(false);
+          const file = e.dataTransfer.files?.[0];
+          if (file) void uploadFile(file);
+        }}
+      >
+        <div className="absolute -right-10 -top-10 h-40 w-40 rounded-full bg-primary/10 blur-3xl" />
+        <div className="absolute -left-12 -bottom-12 h-48 w-48 rounded-full bg-sky-400/10 blur-3xl" />
         <div className="relative z-10">
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-            <label
-              className="inline-flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-primary"
-              htmlFor="brand-names"
-            >
-              <span className="material-symbols-outlined text-lg">groups</span>
-              Target Entities
-            </label>
+            <div className="inline-flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-primary">
+              <span className="material-symbols-outlined text-lg">table_view</span>
+              Excel input
+            </div>
             <span className="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1 text-xs font-bold text-slate-300">
-              {nameCount} name{nameCount === 1 ? "" : "s"} ready
+              .xlsx / .csv
             </span>
           </div>
-          <textarea
-            id="brand-names"
-            rows={10}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            placeholder="One talent name per line…"
-            className="w-full resize-none rounded-xl border border-white/8 bg-slate-950/70 p-5 font-medium text-slate-100 placeholder:text-slate-500 transition focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-primary/25"
-          />
-          <div className="mt-6 flex flex-wrap items-center justify-between gap-4">
-            <div className="flex items-center gap-3 rounded-xl bg-slate-950/60 px-4 py-2.5 ring-1 ring-white/8">
-              <span className="material-symbols-outlined text-base text-slate-500">tune</span>
-              <span className="text-xs font-semibold text-slate-400">
-                Ignore single-name entries
+
+          <p className="mb-5 max-w-3xl text-sm leading-relaxed text-slate-400">
+            Upload an Excel/CSV file. We’ll read the talent rows, resolve official profiles across
+            platforms, and export a confidence-scored workbook.
+          </p>
+
+          <div className="mb-6 rounded-xl border border-white/8 bg-slate-950/50 p-4 ring-1 ring-white/5 sm:p-5">
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <span className="material-symbols-outlined text-base text-primary">info</span>
+              <h4 className="text-sm font-bold text-slate-100">Spreadsheet format</h4>
+              <span className="text-xs text-slate-500">Row 1 = headers · one talent per row</span>
+            </div>
+
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+              Example row
+            </p>
+            <div className="mb-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {excelColumns.map((col) => (
+                <div
+                  key={col.name}
+                  className={`rounded-lg border border-white/6 bg-slate-950/80 px-3 py-2.5 ${
+                    col.name === "Talent Name" || col.name === "title_sub_category"
+                      ? "sm:col-span-2"
+                      : ""
+                  }`}
+                >
+                  <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <code className="font-mono text-[11px] font-semibold text-primary/90">
+                      {col.name}
+                    </code>
+                    <span
+                      className={`rounded-full px-1.5 py-px text-[10px] font-bold uppercase tracking-wide ${
+                        col.required
+                          ? "bg-primary/15 text-primary"
+                          : "bg-slate-800 text-slate-500"
+                      }`}
+                    >
+                      {col.required ? "required" : "optional"}
+                    </span>
+                  </div>
+                  <p className="mb-1 break-words text-xs font-medium text-slate-200">
+                    {col.example}
+                  </p>
+                  <p className="text-[11px] leading-relaxed text-slate-500">{col.note}</p>
+                </div>
+              ))}
+            </div>
+
+            <p className="mt-3 text-xs leading-relaxed text-slate-500">
+              <span className="font-semibold text-slate-400">Tip:</span>{" "}
+              <code className="text-slate-400">title_category</code> and{" "}
+              <code className="text-slate-400">title_sub_category</code> are read together for
+              gender, sport, and talent-type matching (e.g.{" "}
+              <span className="text-slate-400">
+                Talent Type - Athlete · Talent Subtype - Athlete - Baseball · Gender - Man
               </span>
+              ).
+            </p>
+
+            <div className="mt-4 flex flex-wrap gap-2 border-t border-white/6 pt-4">
+              <span className="lf-chip text-[11px]">.xlsx</span>
+              <span className="lf-chip text-[11px]">.xls</span>
+              <span className="lf-chip text-[11px]">.csv</span>
+              <span className="lf-chip text-[11px]">Max 25 MB</span>
+              <span className="lf-chip text-[11px]">Empty rows skipped</span>
+            </div>
+          </div>
+
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv"
+            className="hidden"
+            onChange={(e) => void onFileChange(e)}
+          />
+
+          {!base ? (
+            <div className="flex items-start gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+              <span className="material-symbols-outlined text-base">info</span>
+              <p>
+                Set <code className="text-amber-50/90">NEXT_PUBLIC_PYTHON_API_URL</code> in{" "}
+                <code className="text-amber-50/90">.env.local</code> and start the FastAPI server to
+                enable upload.
+              </p>
+            </div>
+          ) : (
+            <>
               <button
                 type="button"
-                role="switch"
-                aria-checked={ignoreSingle}
-                onClick={() => setIgnoreSingle((v) => !v)}
-                className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 ${
-                  ignoreSingle ? "bg-primary" : "bg-slate-600"
-                }`}
+                disabled={loading}
+                onClick={openPicker}
+                className="lf-btn-secondary group flex w-full items-center justify-center gap-2 px-4 py-4 text-sm disabled:cursor-not-allowed disabled:opacity-60"
               >
-                <span
-                  aria-hidden
-                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ${
-                    ignoreSingle ? "translate-x-4" : "translate-x-0.5"
-                  }`}
-                />
+                <span className="material-symbols-outlined text-lg transition-transform group-hover:-translate-y-0.5">
+                  {loading ? "hourglass_top" : "cloud_upload"}
+                </span>
+                {loading ? "Uploading…" : "Choose Excel / CSV or drop file here"}
               </button>
-            </div>
-            <button
-              type="button"
-              disabled={loading}
-              onClick={() => void runDiscovery()}
-              className="lf-btn-primary inline-flex items-center gap-2 px-8 py-3 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              <span className="material-symbols-outlined text-xl">
-                {loading ? "hourglass_top" : "rocket_launch"}
-              </span>
-              <span>{loading ? "Starting…" : "Run Discovery"}</span>
-            </button>
-          </div>
+              {status && (
+                <p className="mt-3 flex items-start gap-2 text-sm text-rose-300" role="alert">
+                  <span className="material-symbols-outlined text-base">error</span>
+                  {status}
+                </p>
+              )}
+            </>
+          )}
         </div>
       </div>
-
-      {hint && (
-        <div
-          className="lf-enter mt-4 flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100"
-          role="status"
-        >
-          <span className="material-symbols-outlined text-base">warning</span>
-          {hint}
-        </div>
-      )}
     </>
   );
 }

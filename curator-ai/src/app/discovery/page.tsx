@@ -58,8 +58,8 @@ export default function DiscoveryPage() {
                <span className="block text-primary">Find Official Profiles</span>
             </h2>
             <p className="mt-4 max-w-2xl text-sm leading-relaxed text-slate-400 md:text-base">
-              Paste talent names or upload a spreadsheet. ListenFirst searches five platforms,
-              validates identity with AI, and exports a confidence-scored workbook.
+              Upload a spreadsheet. ListenFirst searches five platforms, validates identity with AI,
+              and exports a confidence-scored workbook.
             </p>
           </section>
 
@@ -86,8 +86,6 @@ export default function DiscoveryPage() {
             </div>
 
             <div className="space-y-6">
-              <DiscoveryFileUpload />
-
               <div className="lf-enter lf-enter-delay-2 lf-card lf-card-hover p-6">
                 <div className="mb-4 flex items-center gap-2">
                   <span className="material-symbols-outlined text-primary">account_tree</span>
