@@ -3368,6 +3368,10 @@ try:
 except ImportError:
     pass
 
+# Profile discovery engine (Wikipedia + Serper + LLM verification workflow).
+# Imported AFTER load_dotenv so it reads API keys from the environment.
+import profile_discovery  # noqa: E402
+
 # ================== API KEYS ==================
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -3401,6 +3405,9 @@ ANCHOR_MIN_CONFIDENCE         = float(os.environ.get("ANCHOR_MIN_CONFIDENCE", "0
 EARLY_ENRICH_MIN_CONFIDENCE   = float(os.environ.get("EARLY_ENRICH_MIN_CONFIDENCE", "0.80"))
 MIN_RANK_SCORE_FOR_FALLBACK   = float(os.environ.get("MIN_RANK_SCORE_FOR_FALLBACK", "12.0"))
 AI_VERIFY_MIN_CONFIDENCE      = float(os.environ.get("AI_VERIFY_MIN_CONFIDENCE", "0.62"))
+
+# Step 6 of the discovery workflow — configurable LLM match threshold.
+PROFILE_MATCH_THRESHOLD       = profile_discovery.PROFILE_MATCH_THRESHOLD
 
 # ── NEW: enriched links derived from bio must exceed this to be trusted ──
 ENRICH_EMIT_MIN_CONFIDENCE    = float(os.environ.get("ENRICH_EMIT_MIN_CONFIDENCE", "0.75"))
@@ -6778,6 +6785,16 @@ def process_row(
     row_label: object,
     platform_progress: Optional[Callable[[str, str], None]] = None,
 ) -> None:
+    """Resolve all platforms for one talent via the Wikipedia + Serper + LLM workflow.
+
+    Discovery logic lives in profile_discovery.py. This function only:
+      • reads the row inputs (Talent Name + Wikipedia URL),
+      • honours any client-provided platform cells (treated as INPUT),
+      • writes results back into the existing wide-Excel columns, and
+      • refreshes the aggregate Confidence + Source cells.
+
+    Per-platform source ∈ {WIKIPEDIA, LLM_VERIFIED, INPUT}; blank when NOT_FOUND.
+    """
     talent             = str(df.at[row_label, "Talent Name"] or "").strip()
     title_category     = str(df.at[row_label, "title_category"]    or "").strip()
     title_sub_category = str(df.at[row_label, "title_sub_category"] or "").strip()
@@ -6788,122 +6805,95 @@ def process_row(
     if not talent:
         return
 
-    wikipedia_context = wikipedia_identity_context(wikipedia_url) if wikipedia_url else ""
-    ambiguity         = get_name_ambiguity_level(talent)
     print(f"\n{'='*65}")
-    print(f"Processing: {talent}  [ambiguity={ambiguity}]")
+    print(f"Processing: {talent}")
     if title_category or title_sub_category:
         print(f"  Category: {title_category} | SubCategory: {title_sub_category}")
-    if wikipedia_context:
-        print(f"  Wikipedia: {wikipedia_context[:180]}")
+    if wikipedia_url:
+        print(f"  Wikipedia URL: {wikipedia_url}")
 
     # ═══════════════════════════════════════════════════════════
-    # STEP 0 — Apply client-provided Instagram URL (NEW)
-    # Highest-priority step: mark as confidence=1.0, source=input.
-    # Immediately fires Phase-1 enrichment from this anchor so all
-    # subsequent platforms benefit before their AI calls.
+    # STEP 0 — Honour client-provided platform cells as INPUT
+    # (highest priority — confidence 1.0; skips discovery for that platform).
+    # Includes the dedicated "Instagram URL" input column for backward compat.
     # ═══════════════════════════════════════════════════════════
-    resolved_links: Dict[str, str] = {}
+    prefilled: Dict[str, str] = {}
 
     if INSTAGRAM_INPUT_COLUMN in df.columns:
         ig_input = _clean_instagram_input_url(df.at[row_label, INSTAGRAM_INPUT_COLUMN])
-        if ig_input:
-            existing_ig = str(df.at[row_label, "Instagram"] or "").strip()
-            if not existing_ig:
-                df.at[row_label, "Instagram"] = ig_input
-                ROW_PLATFORM_CONFIDENCE.setdefault(row_label, {})["Instagram"] = 1.0
-                df.at[row_label, PLATFORM_CONF_COLUMNS["Instagram"]] = 1.0
-                ROW_PLATFORM_SOURCE.setdefault(row_label, {})["Instagram"] = "input"
-                resolved_links["Instagram"] = ig_input
-                print(f"  [INPUT] Instagram <- {ig_input} (conf=1.00, source=input)")
-            else:
-                resolved_links["Instagram"] = existing_ig
+        if ig_input and not str(df.at[row_label, "Instagram"] or "").strip():
+            prefilled["Instagram"] = ig_input
+            print(f"  [INPUT] Instagram <- {ig_input} (conf=1.00, source=input)")
 
-    # Pre-seed other platforms already filled in the dataframe
     for platform in PLATFORMS:
         existing = str(df.at[row_label, platform] or "").strip()
-        if existing and platform not in resolved_links:
-            resolved_links[platform] = existing
-            ROW_PLATFORM_CONFIDENCE.setdefault(row_label, {})[platform] = 1.0
-            ROW_PLATFORM_SOURCE.setdefault(row_label, {})[platform]     = "input"
-            df.at[row_label, PLATFORM_CONF_COLUMNS[platform]] = 1.0
+        if existing and platform not in prefilled:
+            prefilled[platform] = existing
+
+    for platform, url in prefilled.items():
+        df.at[row_label, platform] = url
+        ROW_PLATFORM_CONFIDENCE.setdefault(row_label, {})[platform] = 1.0
+        ROW_PLATFORM_SOURCE.setdefault(row_label, {})[platform]     = "INPUT"
+        df.at[row_label, PLATFORM_CONF_COLUMNS[platform]] = 1.0
 
     # ═══════════════════════════════════════════════════════════
-    # STEP 1 — Phase-1 Early Enrichment (NEW — before AI decisions)
-    # If Instagram (or any other platform) is already resolved with
-    # conf >= EARLY_ENRICH_MIN_CONFIDENCE (0.80), mine its bio NOW
-    # so AI gets those links as extra candidates.
+    # STEP 1 + 2 — Wikipedia metadata + existing Wikipedia/Wikidata socials
     # ═══════════════════════════════════════════════════════════
-    early_enrich_cache = run_early_enrichment(df, row_label, resolved_links)
+    metadata = profile_discovery.extract_wikipedia_metadata(wikipedia_url, talent)
+    wiki_socials = profile_discovery.get_wikipedia_socials(
+        talent, wikipedia_url, title_category, title_sub_category,
+        target_platforms=list(PLATFORMS.keys()),
+    )
 
     # ═══════════════════════════════════════════════════════════
-    # STEP 2 — Search + AI resolution for remaining platforms
+    # STEP 3-6 — Per platform: Serper search -> candidates -> LLM verify -> gate
     # ═══════════════════════════════════════════════════════════
-    for platform, domains in PLATFORMS.items():
+    for platform in PLATFORMS:
         if platform_progress:
             platform_progress(platform, "start")
 
-        existing = str(df.at[row_label, platform] or "").strip()
-        if existing:
-            if platform not in resolved_links:
-                resolved_links[platform] = existing
+        if platform in prefilled:                 # already provided as INPUT
             if platform_progress:
                 platform_progress(platform, "done")
             continue
 
-        # Re-fetch early_enrich_cache after each resolved platform
-        # (cache may have grown if this is a second pass)
-        current_cache = ROW_EARLY_ENRICH_LINKS.get(row_label, early_enrich_cache)
-
-        username_hints = extract_username_hints(resolved_links)
-
         try:
-            plat_out, link, confidence, reason = search_one_platform(
-                talent, platform, domains,
-                title_category, title_sub_category,
-                username_hints=username_hints,
-                wikipedia_context=wikipedia_context,
-                early_enrich_cache=current_cache,
+            result = profile_discovery.discover_platform(
+                talent, platform, metadata,
+                wiki_url=wiki_socials.get(platform),
+                threshold=PROFILE_MATCH_THRESHOLD,
             )
-        except Exception as exc:
+        except RuntimeError:
+            raise                                 # fatal API error — fail the job
+        except Exception as exc:                  # noqa: BLE001 — defensive
             print(f"  [{platform}] UNEXPECTED ERROR: {exc}")
-            link, confidence, reason = "", 0.0, str(exc)
+            result = {
+                "profile_url": "", "source": profile_discovery.SOURCE_NOT_FOUND,
+                "confidence": 0.0, "reasoning": str(exc),
+            }
+
+        link       = result.get("profile_url", "") or ""
+        confidence = float(result.get("confidence", 0.0) or 0.0)
+        source     = result.get("source", profile_discovery.SOURCE_NOT_FOUND)
+        reason     = result.get("reasoning", "")
+        candidates = result.get("candidate_urls", []) or []
 
         df.at[row_label, platform] = link
         ROW_PLATFORM_CONFIDENCE.setdefault(row_label, {})[platform] = confidence
         df.at[row_label, PLATFORM_CONF_COLUMNS[platform]] = confidence if link else float("nan")
         if link:
-            ROW_PLATFORM_SOURCE.setdefault(row_label, {})[platform] = "search"
-            resolved_links[platform] = link
+            ROW_PLATFORM_SOURCE.setdefault(row_label, {})[platform] = source
 
-            # ── Re-run Phase-1 enrichment if this new result can act as a better anchor ──
-            if confidence >= EARLY_ENRICH_MIN_CONFIDENCE:
-                new_cache = run_early_enrichment(df, row_label, resolved_links)
-                if new_cache:
-                    early_enrich_cache = new_cache
-
-        print(f"  [{platform}] {link or '(blank)'} (conf={confidence:.2f}) — {reason}")
+        print(f"  [{platform}] {link or '(blank)'} (conf={confidence:.2f}, {source}) — {reason}")
+        if candidates:
+            print(f"           candidates ({len(candidates)}): {candidates}")
         if platform_progress:
             platform_progress(platform, "done")
         time.sleep(OPENAI_DELAY_SECONDS)
 
     # ═══════════════════════════════════════════════════════════
-    # STEP 3 — Post-search reconciliation (unchanged)
+    # STEP 7 — Aggregate row Confidence + Source cells
     # ═══════════════════════════════════════════════════════════
-    reconcile_athlete_handles_from_confirmed_profiles(
-        df, row_label, resolved_links, title_category, title_sub_category
-    )
-    reconcile_initial_name_x_instagram_handle(
-        df, row_label, resolved_links, title_category, title_sub_category
-    )
-
-    # ═══════════════════════════════════════════════════════════
-    # STEP 4 — Phase-2 conservative enrichment (last-resort fill)
-    # Only fills platforms still blank; anchor must be >= 0.86;
-    # enriched links capped below ANCHOR_MIN_CONFIDENCE so they
-    # cannot cascade.
-    # ═══════════════════════════════════════════════════════════
-    enrich_row_from_anchor_profiles(df, row_label)
     _refresh_row_aggregate_confidence(df, row_label)
     _refresh_row_source_cell(df, row_label)
 
