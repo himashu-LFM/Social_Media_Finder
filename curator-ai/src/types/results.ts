@@ -1,17 +1,16 @@
+/** Per-platform verification result. `confidence` is normalized to 0..1. */
+export type PlatformResult = {
+  link: string;
+  status: string;
+  confidence: number;
+};
+
+export type PlatformKey = "instagram" | "x" | "facebook" | "youtube" | "tiktok";
+
 export type ResultRow = {
   name: string;
-  category: string;
-  subCategory: string;
-  facebook: string;
-  facebookConfidence: number;
-  instagram: string;
-  instagramConfidence: number;
-  x: string;
-  xConfidence: number;
-  tiktok: string;
-  tiktokConfidence: number;
-  youtube: string;
-  youtubeConfidence: number;
+  wikipediaUrl: string;
+  platforms: Record<PlatformKey, PlatformResult>;
+  /** Overall confidence across resolved platforms, normalized to 0..1. */
   confidence: number;
-  source: string;
 };

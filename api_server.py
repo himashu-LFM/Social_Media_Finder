@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-import testing  # noqa: E402  — after dotenv so keys load
+import verification_pipeline as testing  # noqa: E402  — after dotenv so keys load
 
 _jobs_lock = threading.Lock()
 _jobs: Dict[str, Dict[str, Any]] = {}
@@ -217,12 +217,6 @@ def start_job(body: StartJobBody) -> dict[str, str]:
     if not names:
         raise HTTPException(status_code=400, detail="Provide at least one non-empty name.")
 
-    if not testing.SERPER_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="SERPER_API_KEY is not set in environment (.env).",
-        )
-
     job_id = str(uuid.uuid4())
     with _jobs_lock:
         _jobs[job_id] = {
@@ -256,12 +250,6 @@ async def start_job_from_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     registered as POST-only before GET /api/jobs/{job_id}, so it does not collide with the
     dynamic route.
     """
-    if not testing.SERPER_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="SERPER_API_KEY is not set in environment (.env).",
-        )
-
     raw_name = (file.filename or "upload").strip()
     lower = raw_name.lower()
     if not (lower.endswith(".xlsx") or lower.endswith(".xls") or lower.endswith(".csv")):

@@ -21,18 +21,18 @@ type RowPlatformProgress = {
 type RunSource = "idle" | "python" | "demo";
 
 const PIPELINE_STEPS = [
-  { label: "Searching social platforms", icon: "travel_explore", detail: "Serper + platform queries" },
-  { label: "Filtering profile URLs", icon: "filter_alt", detail: "Posts and reels removed" },
-  { label: "AI identity check", icon: "neurology", detail: "Match scoring per name" },
-  { label: "Confidence + export", icon: "fact_check", detail: "Workbook assembly" },
+  { label: "Wikipedia metadata", icon: "menu_book", detail: "Structured identity" },
+  { label: "Apify + Serper", icon: "hub", detail: "Candidate links" },
+  { label: "LLM verification", icon: "neurology", detail: "Rank per platform" },
+  { label: "Status + export", icon: "fact_check", detail: "Workbook assembly" },
 ] as const;
 
 const SOCIAL_PLATFORM_STEPS = [
-  { label: "Facebook", short: "FB", icon: "groups", color: "from-blue-500/20 to-blue-600/5" },
   { label: "Instagram", short: "IG", icon: "photo_camera", color: "from-pink-500/20 to-purple-600/5" },
   { label: "X", short: "X", icon: "alternate_email", color: "from-slate-400/20 to-slate-600/5" },
-  { label: "TikTok", short: "TT", icon: "music_note", color: "from-cyan-400/20 to-teal-600/5" },
+  { label: "Facebook", short: "FB", icon: "groups", color: "from-blue-500/20 to-blue-600/5" },
   { label: "YouTube", short: "YT", icon: "smart_display", color: "from-red-500/20 to-red-700/5" },
+  { label: "TikTok", short: "TT", icon: "music_note", color: "from-cyan-400/20 to-teal-600/5" },
 ] as const;
 
 const LIVE_MESSAGES = [
@@ -497,7 +497,7 @@ export function ProcessingRunner() {
 
               {!allDone && !backendError && (
                 <div className="mt-5 flex flex-wrap gap-2">
-                  {["Serper", "Filter", "AI score", "Export"].map((chip, i) => (
+                  {["Wikipedia", "Apify", "Verify", "Export"].map((chip, i) => (
                     <span
                       key={chip}
                       className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold ring-1 transition-all duration-300 ${

@@ -10,31 +10,13 @@ const excelColumns = [
     name: "Talent Name",
     required: true,
     example: "Jake Thompson",
-    note: "One person or brand per row. Also accepts: Talent, Name, Title (or first column).",
-  },
-  {
-    name: "title_category",
-    required: false,
-    example: "Talent Type - Athlete",
-    note: "Talent type, gender, subtype — used for search and identity checks.",
-  },
-  {
-    name: "title_sub_category",
-    required: false,
-    example: "Talent Subtype - Athlete - Baseball · Gender - Man",
-    note: "Extra metadata (sport, publication type, etc.).",
+    note: "One person per row. Also accepts: Talent, Name, Title (or first column).",
   },
   {
     name: "Wikipedia URL",
     required: false,
-    example: "en.wikipedia.org/wiki/…",
-    note: "Optional anchor link for disambiguation.",
-  },
-  {
-    name: "Instagram URL",
-    required: false,
-    example: "instagram.com/username",
-    note: "Optional known IG profile — used as a trusted anchor when provided.",
+    example: "https://en.wikipedia.org/wiki/Jake_Thompson",
+    note: "Recommended. Structured identity metadata (profession, nationality, aliases, known works) is extracted from it to verify each profile.",
   },
 ] as const;
 
@@ -171,7 +153,7 @@ export function DiscoveryWorkspace() {
                 <div
                   key={col.name}
                   className={`rounded-lg border border-white/6 bg-slate-950/80 px-3 py-2.5 ${
-                    col.name === "Talent Name" || col.name === "title_sub_category"
+                    col.name === "Talent Name" || col.name === "Wikipedia URL"
                       ? "sm:col-span-2"
                       : ""
                   }`}
@@ -199,14 +181,10 @@ export function DiscoveryWorkspace() {
             </div>
 
             <p className="mt-3 text-xs leading-relaxed text-slate-500">
-              <span className="font-semibold text-slate-400">Tip:</span>{" "}
-              <code className="text-slate-400">title_category</code> and{" "}
-              <code className="text-slate-400">title_sub_category</code> are read together for
-              gender, sport, and talent-type matching (e.g.{" "}
-              <span className="text-slate-400">
-                Talent Type - Athlete · Talent Subtype - Athlete - Baseball · Gender - Man
-              </span>
-              ).
+              <span className="font-semibold text-slate-400">Tip:</span> a{" "}
+              <code className="text-slate-400">Wikipedia URL</code> greatly improves accuracy — its
+              structured metadata anchors identity so each candidate profile is verified against the
+              right person. Without it, the pipeline falls back to a best-effort name search.
             </p>
 
             <div className="mt-4 flex flex-wrap gap-2 border-t border-white/6 pt-4">
