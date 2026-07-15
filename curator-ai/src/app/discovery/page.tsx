@@ -1,28 +1,27 @@
 import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppPageHeader } from "@/components/AppPageHeader";
 import { AppSidebar } from "@/components/AppSidebar";
-import { DiscoveryFileUpload } from "@/components/DiscoveryFileUpload";
 import { DiscoveryWorkspace } from "@/components/DiscoveryWorkspace";
 
 const outputColumns = [
   { label: "Talent Name", icon: "person" },
-  { label: "title_category", icon: "category" },
-  { label: "title_sub_category", icon: "subdirectory_arrow_right" },
-  { label: "Facebook", icon: "groups" },
+  { label: "Wikipedia URL", icon: "link" },
   { label: "Instagram", icon: "photo_camera" },
-  { label: "X", icon: "alternate_email" },
-  { label: "TikTok", icon: "music_note" },
+  { label: "Facebook", icon: "groups" },
   { label: "YouTube", icon: "smart_display" },
-  { label: "Confidence", icon: "verified" },
-  { label: "Source", icon: "source" },
+  { label: "TikTok", icon: "music_note" },
+  { label: "X / Twitter", icon: "alternate_email" },
+  { label: "+ Status (each)", icon: "verified" },
+  { label: "+ Confidence (each)", icon: "percent" },
+  { label: "+ Reason (each)", icon: "notes" },
 ];
 
 const pipelineSteps = [
-  { step: "01", text: "Serper query expansion with metadata.", icon: "travel_explore" },
-  { step: "02", text: "Platform profile URL filtering (no posts/reels/videos).", icon: "filter_alt" },
-  { step: "03", text: "AI selection + confidence thresholding.", icon: "neurology" },
-  { step: "04", text: "Optional bio/link-hub enrichment for missing platforms.", icon: "hub" },
-  { step: "05", text: "XLSX export with confidence highlighting.", icon: "description" },
+  { step: "01", text: "Build a rich Wikipedia/Wikidata ground-truth profile (no full page sent to the LLM).", icon: "menu_book" },
+  { step: "02", text: "Apify Social Media Finder discovers Instagram, Facebook, YouTube, TikTok links.", icon: "hub" },
+  { step: "03", text: "Serper extracts context for each link, and finds missing platforms (incl. X).", icon: "travel_explore" },
+  { step: "04", text: "LLM verifies each profile: Verified / Wrong / Manual Review Needed.", icon: "neurology" },
+  { step: "05", text: "Link + status + confidence + reason written to the XLSX export.", icon: "description" },
 ];
 
 export default function DiscoveryPage() {
@@ -58,8 +57,9 @@ export default function DiscoveryPage() {
                <span className="block text-primary">Find Official Profiles</span>
             </h2>
             <p className="mt-4 max-w-2xl text-sm leading-relaxed text-slate-400 md:text-base">
-              Upload a spreadsheet. ListenFirst searches five platforms, validates identity with AI,
-              and exports a confidence-scored workbook.
+              Upload a spreadsheet of talent names and Wikipedia URLs. ListenFirst pulls structured
+              identity metadata, finds candidate profiles via Apify (Serper as fallback), verifies
+              each with an LLM, and exports a status- and confidence-scored workbook.
             </p>
           </section>
 
