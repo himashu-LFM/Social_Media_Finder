@@ -156,7 +156,9 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
         return VerificationResult(platform=platform, status=STATUS_NOT_FOUND,
                                   reason="No candidate links to verify.")
     _enrich_candidates(candidates, platform)
-    return verification_service.verify_platform(platform, wiki_meta.to_prompt_dict(), candidates)
+    return verification_service.verify_platform(
+        platform, wiki_meta.to_prompt_dict(), candidates, is_person=wiki_meta.is_person
+    )
 
 
 def _score(result: VerificationResult) -> tuple:
@@ -197,18 +199,36 @@ def _resolve_platform(
 
 def _build_identifiers(wiki_meta: wikipedia_service.WikiMetadata) -> str:
     """Short distinguishing-facts string for Serper backup-discovery queries."""
-    parts: List[str] = []
-    if wiki_meta.professions:
-        parts.append(wiki_meta.professions[0])
     attrs = wiki_meta.attributes or {}
-    for key in ("sports", "teams", "genres"):
-        value = attrs.get(key)
-        if isinstance(value, list) and value:
-            parts.append(str(value[0]))
-        elif isinstance(value, str) and value:
-            parts.append(value)
-    if wiki_meta.nationalities:
-        parts.append(wiki_meta.nationalities[0])
+    parts: List[str] = []
+
+    def add_attr(*keys: str) -> None:
+        for key in keys:
+            value = attrs.get(key)
+            if isinstance(value, list) and value:
+                parts.append(str(value[0]))
+            elif isinstance(value, str) and value:
+                parts.append(value)
+
+    if wiki_meta.is_person:
+        # Person (talent) — unchanged behaviour.
+        if wiki_meta.professions:
+            parts.append(wiki_meta.professions[0])
+        add_attr("sports", "teams", "genres")
+        if wiki_meta.nationalities:
+            parts.append(wiki_meta.nationalities[0])
+    else:
+        # Works boost (films / TV shows / video games): these fields are present
+        # only for those entities, so brands / networks / franchises / universities
+        # fall straight through to the generic org signals below unchanged.
+        add_attr("series", "director", "network", "developers", "publishers")
+        # Organization / brand / TV network / franchise — generic org facts.
+        add_attr("industry", "genres")
+        if wiki_meta.known_works:
+            parts.append(wiki_meta.known_works[0])
+        add_attr("member_of", "employers")
+        if wiki_meta.nationalities:
+            parts.append(wiki_meta.nationalities[0])
 
     out: List[str] = []
     seen: set = set()

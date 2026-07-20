@@ -13,7 +13,7 @@ export default function ProcessingPage() {
   const stars = Array.from({ length: 50 }, (_, i) => i + 1);
 
   return (
-    <div className="relative flex min-h-screen flex-col bg-background md:flex-row">
+    <div className="relative flex min-h-screen flex-col md:flex-row">
       <div className="lf-stars" aria-hidden>
         {stars.map((n) => (
           <div key={n} className="lf-star" />

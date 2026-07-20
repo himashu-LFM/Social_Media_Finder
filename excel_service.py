@@ -21,6 +21,7 @@ Public interface:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -84,10 +85,43 @@ def empty_result_columns() -> List[str]:
 # ────────────────────────────────────────────────────────────────────────────
 
 def _find_column(raw: pd.DataFrame, *candidates: str) -> Optional[str]:
+    """Exact (case-insensitive) header match against known aliases."""
     cmap = {str(c).strip().lower(): c for c in raw.columns}
     for cand in candidates:
         if cand.lower() in cmap:
             return cmap[cand.lower()]
+    return None
+
+
+def _find_column_contains(raw: pd.DataFrame, *keywords: str,
+                          exclude: Optional[set] = None) -> Optional[str]:
+    """Match the first header that contains any of the given keywords."""
+    exclude = exclude or set()
+    for col in raw.columns:
+        if col in exclude:
+            continue
+        header = str(col).strip().lower()
+        if any(kw in header for kw in keywords):
+            return col
+    return None
+
+
+_WIKI_URL_RE = re.compile(r"wikipedia\.org/wiki/", re.I)
+
+
+def _detect_wiki_column(raw: pd.DataFrame, exclude: Optional[set] = None) -> Optional[str]:
+    """
+    Find the Wikipedia column by its CONTENT, not its header — so the header can
+    be named anything. Picks the first column whose cells contain
+    'wikipedia.org/wiki/...' links.
+    """
+    exclude = exclude or set()
+    for col in raw.columns:
+        if col in exclude:
+            continue
+        for value in raw[col].dropna().astype(str).head(25):
+            if _WIKI_URL_RE.search(value):
+                return col
     return None
 
 
@@ -96,6 +130,15 @@ def _clean_str(value: object) -> str:
         return ""
     text = str(value).strip()
     return "" if text.lower() == "nan" else text
+
+
+# Internal client tag appended to names (e.g. "Chris Brown - DAR"); strip it so
+# it doesn't pollute Apify/Serper searches or the displayed name.
+_NAME_TAG_SUFFIX_RE = re.compile(r"\s*[-–—]\s*DAR\s*$", re.I)
+
+
+def _clean_talent_name(name: str) -> str:
+    return _NAME_TAG_SUFFIX_RE.sub("", name).strip()
 
 
 def _new_frame(rows: List[Dict[str, str]]) -> pd.DataFrame:
@@ -126,12 +169,24 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
     if raw.empty:
         raise ValueError("The file has no rows.")
 
-    name_col = _find_column(raw, TALENT_COL, "Talent", "Name", "Title", "title")
-    if name_col is None:
-        name_col = raw.columns[0]
-    wiki_col = _find_column(
-        raw, WIKI_COL, "wikipedia_url", "Wikipedia", "Wiki URL", "wiki_url",
-        "Wiki", "Wikipedia Link",
+    # Name column: known aliases → any header mentioning talent/name/title/brand
+    # → fall back to the first column.
+    name_col = (
+        _find_column(raw, TALENT_COL, "Talent", "Name", "Title", "title")
+        or _find_column_contains(raw, "talent", "name", "title", "brand", "entity")
+        or raw.columns[0]
+    )
+
+    # Wikipedia column, resilient to arbitrary header names:
+    #   1) known aliases, 2) any header containing "wiki",
+    #   3) sniff the cell values for wikipedia.org/wiki/ links.
+    wiki_col = (
+        _find_column(
+            raw, WIKI_COL, "wikipedia_url", "wikipedia_page", "Wikipedia Page",
+            "Wikipedia", "Wiki URL", "wiki_url", "Wiki", "Wikipedia Link", "wiki_page",
+        )
+        or _find_column_contains(raw, "wiki", exclude={name_col})
+        or _detect_wiki_column(raw, exclude={name_col})
     )
 
     # Every column that is neither the name nor the Wikipedia URL becomes
@@ -140,7 +195,7 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
 
     rows: List[Dict[str, object]] = []
     for i in range(len(raw)):
-        name = _clean_str(raw.iloc[i][name_col])
+        name = _clean_talent_name(_clean_str(raw.iloc[i][name_col]))
         if not name:
             continue
         wiki = _clean_str(raw.iloc[i][wiki_col]) if wiki_col else ""

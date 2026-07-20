@@ -191,7 +191,7 @@ export default async function ResultsPage() {
     : "Tip: set NEXT_PUBLIC_PYTHON_API_URL to your FastAPI URL so Results reads exports via Python when Excel locks the file.";
 
   return (
-    <div className="relative flex min-h-screen flex-col bg-background md:flex-row">
+    <div className="relative flex min-h-screen flex-col md:flex-row">
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_100%_0%,rgba(242,209,0,0.06),transparent_30%)]"

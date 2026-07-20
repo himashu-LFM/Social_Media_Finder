@@ -44,6 +44,10 @@ _PROP_OFFICIAL_SITE = "P856"     # official website
 _PROP_NICKNAME = "P1449"         # nickname
 _PROP_WORK_START = "P2031"       # work period (start)
 _PROP_WORK_END = "P2032"         # work period (end)
+_PROP_INSTANCE_OF = "P31"        # instance of (Q5 = human)
+_QID_HUMAN = "Q5"
+_PROP_PUB_DATE = "P577"          # publication/release date (films, games)
+_PROP_START_TIME = "P580"        # start time (TV series premiere)
 
 # Additional entity-valued properties, resolved to English labels in one batch.
 # {prop: (field_name, max_values, single_valued)}
@@ -59,6 +63,16 @@ _ENTITY_PROPS: Dict[str, tuple] = {
     "P463": ("member_of", 5, False),    # member of (orgs)
     "P19":  ("birthplace", 1, True),    # place of birth
     "P452": ("industry", 2, False),     # industry
+    # ── Works boost (films / TV shows / video games) — these properties exist
+    #    only on those work entities, so persons and org-brands get nothing here. ──
+    "P57":  ("director", 2, False),     # director (film)
+    "P161": ("cast", 5, False),         # cast member (film / TV)
+    "P170": ("creators", 3, False),     # creator (TV / film)
+    "P179": ("series", 1, True),        # part of the series / franchise
+    "P449": ("network", 2, False),      # original broadcaster (TV)
+    "P178": ("developers", 3, False),   # developer (video game)
+    "P123": ("publishers", 3, False),   # publisher (video game / work)
+    "P400": ("platforms", 4, False),    # platform (video game)
 }
 
 # External-identifier properties that anchor identity on other authoritative
@@ -100,6 +114,10 @@ class WikiMetadata:
     # Extra identity columns provided in the input spreadsheet. Especially
     # important when no Wikipedia URL / Wikidata entity is available.
     input_metadata: Dict[str, str] = field(default_factory=dict)
+    # Entity type. Defaults to person so name-only / unknown inputs keep the
+    # exact current (talent) behaviour; set False for brands / networks / orgs.
+    is_person: bool = True
+    entity_type: str = ""
     found: bool = False
 
     def to_prompt_dict(self) -> dict:
@@ -127,6 +145,8 @@ class WikiMetadata:
         if self.input_metadata:
             # Identity details supplied directly in the spreadsheet.
             data["provided_metadata"] = self.input_metadata
+        # Tell the LLM whether this is a person or an organization/brand.
+        data["entity_type"] = self.entity_type or ("person" if self.is_person else "organization")
         # Drop empty top-level fields to keep the payload tight.
         return {k: v for k, v in data.items() if v not in ("", None, [], {})}
 
@@ -285,6 +305,16 @@ def _extract_extended_attributes(claims: dict) -> tuple:
     if active:
         attributes["active_years"] = active
 
+    # Release/premiere year — for works (films, games, TV series). These date
+    # properties don't appear on person entities, so persons are unaffected.
+    for prop in (_PROP_PUB_DATE, _PROP_START_TIME):
+        year = None
+        for snak in claims.get(prop, [])[:1]:
+            year = _time_year(snak)
+        if year:
+            attributes["release_year"] = year
+            break
+
     return attributes, entity_field_qids, all_qids
 
 
@@ -442,9 +472,14 @@ def fetch_wiki_metadata(
         occupation_qids = _claim_qids(claims, _PROP_OCCUPATION)
         citizenship_qids = _claim_qids(claims, _PROP_CITIZENSHIP)
         work_qids = _claim_qids(claims, _PROP_NOTABLE_WORK)
+        instance_of_qids = _claim_qids(claims, _PROP_INSTANCE_OF, limit=4)
         labels = _resolve_labels(
-            occupation_qids + citizenship_qids + work_qids + extended_qids
+            occupation_qids + citizenship_qids + work_qids + extended_qids + instance_of_qids
         )
+
+        # Entity type: person (Q5) vs organization/brand/network/franchise.
+        meta.is_person = _QID_HUMAN in instance_of_qids
+        meta.entity_type = next((labels[q] for q in instance_of_qids if q in labels), "")
 
         meta.professions = [labels[q] for q in occupation_qids if q in labels]
         meta.nationalities = [labels[q] for q in citizenship_qids if q in labels]

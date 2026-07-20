@@ -11,7 +11,7 @@ export default function CoverPage() {
   ];
 
   return (
-    <div className="relative min-h-screen overflow-hidden bg-background">
+    <div className="relative min-h-screen overflow-hidden">
       <div className="lf-stars lf-stars-cover" aria-hidden>
         {stars.map((n) => (
           <div key={n} className="lf-star" />

@@ -111,7 +111,7 @@ export default async function AnalysisPage() {
   const asPct = (v: number) => (total ? `${((v / total) * 100).toFixed(1)}%` : "0.0%");
 
   return (
-    <div className="relative flex min-h-screen flex-col bg-background md:flex-row">
+    <div className="relative flex min-h-screen flex-col md:flex-row">
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_0%_0%,rgba(242,209,0,0.06),transparent_32%)]"

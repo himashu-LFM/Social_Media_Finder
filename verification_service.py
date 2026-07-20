@@ -153,19 +153,30 @@ _SYSTEM_MSG = (
     "unlikely/contradicted."
 )
 
-# Extra clause applied only for Facebook.
-_FACEBOOK_RULE = (
-    "\n\nSTRICT FACEBOOK RULE: choose decision='verified' ONLY when ALL of the "
-    "following are simultaneously true: (1) the display name matches the person's "
+# Extra Facebook clause — person vs organization/brand.
+_FACEBOOK_RULE_PERSON = (
+    "\n\nSTRICT FACEBOOK RULE (person): choose decision='verified' ONLY when ALL of "
+    "the following are simultaneously true: (1) the display name matches the person's "
     "name/aliases, (2) the bio/description matches the person's profession/career, "
     "and (3) the profile shows a HIGH follower/like count consistent with a public "
     "figure. If any one of these is missing or unproven, you MUST NOT verify — use "
     "decision='wrong'. Do NOT use manual_review for Facebook."
 )
+_FACEBOOK_RULE_ORG = (
+    "\n\nSTRICT FACEBOOK RULE (organization/brand/network/franchise): choose "
+    "decision='verified' ONLY when ALL of the following are simultaneously true: "
+    "(1) the page name matches the entity's name or aliases, (2) the "
+    "description/category matches the entity's industry/category, and (3) the page "
+    "shows a HIGH follower/like count consistent with an official brand page. If any "
+    "one is missing or unproven, you MUST NOT verify — use decision='wrong'. Do NOT "
+    "use manual_review for Facebook."
+)
 
 
-def _system_message(platform: str) -> str:
-    return _SYSTEM_MSG + (_FACEBOOK_RULE if platform == "Facebook" else "")
+def _system_message(platform: str, is_person: bool = True) -> str:
+    if platform != "Facebook":
+        return _SYSTEM_MSG
+    return _SYSTEM_MSG + (_FACEBOOK_RULE_PERSON if is_person else _FACEBOOK_RULE_ORG)
 
 
 def _apply_facebook_rule(
@@ -188,8 +199,8 @@ def _apply_facebook_rule(
         return STATUS_VERIFIED, confidence, reason
     if status == STATUS_MANUAL:
         return STATUS_WRONG, confidence, (
-            reason + " | Facebook requires name + profession + high followers to verify; "
-            "insufficient, marked Wrong."
+            reason + " | Facebook requires name + profession/industry + high followers "
+            "to verify; insufficient, marked Wrong."
         )
     return status, confidence, reason
 
@@ -277,9 +288,11 @@ def verify_platform(
     platform: str,
     wiki_meta: Dict[str, Any],
     candidates: List[dict],
+    is_person: bool = True,
 ) -> VerificationResult:
     """
     Verify candidate profiles for one platform in a single LLM request.
+    ``is_person`` selects the person vs organization Facebook rule.
     Failures degrade to a Manual Review result rather than aborting the run.
     """
     if not candidates:
@@ -297,7 +310,7 @@ def verify_platform(
 
     user_msg = _build_user_message(platform, wiki_meta, candidates)
     try:
-        parsed = _call_openai(_system_message(platform), user_msg)
+        parsed = _call_openai(_system_message(platform, is_person), user_msg)
     except requests.Timeout:
         print(f"  [VERIFY] {platform} timeout — flagged for manual review.")
         return VerificationResult(
