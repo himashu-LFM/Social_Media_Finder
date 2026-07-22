@@ -30,18 +30,29 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
 import requests
 
 import social_urls
+from retry_util import request_with_retry
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "").strip()
 APIFY_ACTOR_ID = os.environ.get("APIFY_ACTOR_ID", "").strip()
 APIFY_ACTOR_INPUT = os.environ.get("APIFY_ACTOR_INPUT", "").strip()
 APIFY_TIMEOUT_SECONDS = int(os.environ.get("APIFY_TIMEOUT_SECONDS", "120"))
+# Batch settings: how many names per actor run, and how many runs in parallel.
+# The actor rejects/times out on large runs, so we keep chunks small and get
+# throughput from running several chunks concurrently. A chunk that still fails
+# is auto-split (see _run_chunk), so a bad name never wipes out a whole batch.
+APIFY_CHUNK_SIZE = max(1, int(os.environ.get("APIFY_CHUNK_SIZE", "5")))
+APIFY_CHUNK_WORKERS = max(1, int(os.environ.get("APIFY_CHUNK_WORKERS", "4")))
 
 _APIFY_BASE = "https://api.apify.com/v2"
+
+# Socials this actor supports (matches the tri_angle/social-media-finder enum).
+_DEFAULT_SOCIALS = ["instagram", "facebook", "tiktok", "youtube"]
 
 # Case-insensitive key hints used to pull profile metadata off a dataset item.
 _META_KEYS: Dict[str, List[str]] = {
@@ -58,25 +69,34 @@ def is_configured() -> bool:
     return bool(APIFY_TOKEN and APIFY_ACTOR_ID)
 
 
-def _build_actor_input(talent: str, website: str) -> dict:
-    """Render the configured input template (or a sensible default)."""
-    template = APIFY_ACTOR_INPUT or '{"name": "{name}"}'
-    rendered = template.replace("{name}", talent).replace("{website}", website or "")
-    try:
-        return json.loads(rendered)
-    except json.JSONDecodeError as exc:
-        print(f"  [APIFY] Invalid APIFY_ACTOR_INPUT template ({exc}); using default.")
-        return {"name": talent}
+def _configured_socials() -> List[str]:
+    """Socials list from the env template if the user set one, else the default."""
+    if APIFY_ACTOR_INPUT:
+        try:
+            tpl = json.loads(APIFY_ACTOR_INPUT.replace("{name}", "x").replace("{website}", ""))
+            socials = tpl.get("socials")
+            if isinstance(socials, list) and socials:
+                return socials
+        except json.JSONDecodeError:
+            pass
+    return list(_DEFAULT_SOCIALS)
+
+
+def _actor_input(names: List[str]) -> dict:
+    """
+    Build the actor input for one or many names. Built as a real dict (then
+    JSON-encoded by requests), so names containing quotes/backslashes can never
+    corrupt the payload — that previously caused Apify to return nothing.
+    """
+    return {"profileNames": list(names), "socials": _configured_socials()}
 
 
 def _run_actor(actor_input: dict) -> List[dict]:
     """Run the actor synchronously and return its dataset items (list of dicts)."""
     url = f"{_APIFY_BASE}/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
     params = {"token": APIFY_TOKEN, "timeout": APIFY_TIMEOUT_SECONDS}
-    resp = requests.post(
-        url,
-        params=params,
-        json=actor_input,
+    resp = request_with_retry(
+        "POST", url, params=params, json=actor_input,
         timeout=APIFY_TIMEOUT_SECONDS + 15,
     )
     resp.raise_for_status()
@@ -141,33 +161,86 @@ def _collect_candidates(items: List[dict]) -> Dict[str, List[dict]]:
     return by_platform
 
 
-def find_social_links(talent: str, website: str = "") -> Dict[str, List[dict]]:
-    """
-    Look up social-profile candidates for a talent via Apify.
+def _item_name(item: dict) -> str:
+    """The profile name the actor echoes back for a result row."""
+    if not isinstance(item, dict):
+        return ""
+    for key in ("inputProfileName", "profileName", "query", "input"):
+        val = item.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
 
-    Returns ``{platform: [candidate, ...]}``. On any failure (not configured,
-    network/timeout error, bad payload) returns ``{}`` so the caller can fall
-    back to Serper without the run aborting.
-    """
-    if not is_configured():
-        print("  [APIFY] Skipped — APIFY_TOKEN / APIFY_ACTOR_ID not set.")
-        return {}
 
-    actor_input = _build_actor_input(talent, website)
+def _run_chunk(chunk: List[str]) -> List[dict]:
+    """
+    Run one actor call for a chunk of names. If it fails (the actor 400s or
+    times out on a too-large / problematic chunk), split the chunk in half and
+    retry each half — so the failure self-heals down to per-name calls instead
+    of losing the whole chunk. Never raises (returns [] only for a single name
+    that genuinely fails).
+    """
     try:
-        items = _run_actor(actor_input)
-    except requests.Timeout:
-        print(f"  [APIFY] Timeout running actor for '{talent}'.")
-        return {}
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "?"
-        print(f"  [APIFY] Actor HTTP error ({status}) for '{talent}'.")
-        return {}
-    except Exception as exc:  # noqa: BLE001 — never let Apify abort the row
-        print(f"  [APIFY] Actor call failed for '{talent}': {exc.__class__.__name__}: {exc}")
-        return {}
+        return _run_actor(_actor_input(chunk))
+    except (requests.Timeout, requests.HTTPError, requests.ConnectionError) as exc:
+        detail = getattr(getattr(exc, "response", None), "status_code", exc.__class__.__name__)
+        if len(chunk) > 1:
+            mid = len(chunk) // 2
+            print(f"  [APIFY] chunk of {len(chunk)} failed ({detail}) — splitting and retrying.")
+            return _run_chunk(chunk[:mid]) + _run_chunk(chunk[mid:])
+        print(f"  [APIFY] name '{chunk[0]}' failed ({detail}).")
+        return []
+    except Exception as exc:  # noqa: BLE001 — never let Apify abort the run
+        print(f"  [APIFY] Chunk call failed: {exc.__class__.__name__}: {exc}")
+        return []
 
-    candidates = _collect_candidates(items)
-    summary = {p: len(c) for p, c in candidates.items()}
-    print(f"  [APIFY] '{talent}' -> {summary or 'no profiles found'}")
-    return candidates
+
+def find_social_links_batch(names: List[str]) -> Dict[str, Dict[str, List[dict]]]:
+    """
+    Discover social-profile candidates for MANY talents in one batched pass.
+
+    Names are sent to the actor in chunks (APIFY_CHUNK_SIZE) with a few chunks
+    running in parallel (APIFY_CHUNK_WORKERS), instead of one actor run per
+    talent — this removes most of the per-run overhead. Results are grouped back
+    to each talent by the actor's echoed profile name.
+
+    Returns ``{talent_name: {platform: [candidate, ...]}}``.
+    """
+    clean = [n for n in dict.fromkeys(n.strip() for n in names) if n]
+    empty = {n: {} for n in clean}
+    if not clean or not is_configured():
+        if not is_configured():
+            print("  [APIFY] Skipped — APIFY_TOKEN / APIFY_ACTOR_ID not set.")
+        return empty
+
+    chunks = [clean[i:i + APIFY_CHUNK_SIZE] for i in range(0, len(clean), APIFY_CHUNK_SIZE)]
+    workers = min(APIFY_CHUNK_WORKERS, len(chunks))
+
+    all_items: List[dict] = []
+    if workers <= 1:
+        for chunk in chunks:
+            all_items.extend(_run_chunk(chunk))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for items in pool.map(_run_chunk, chunks):
+                all_items.extend(items)
+
+    # Group items back to each requested talent by the echoed name.
+    lookup = {n.lower(): n for n in clean}
+    grouped: Dict[str, List[dict]] = {n: [] for n in clean}
+    for item in all_items:
+        echoed = _item_name(item).lower()
+        target = lookup.get(echoed)
+        if target:
+            grouped[target].append(item)
+
+    results = {n: _collect_candidates(items) for n, items in grouped.items()}
+    total = sum(len(c) for r in results.values() for c in r.values())
+    print(f"  [APIFY] Batch: {len(clean)} name(s) in {len(chunks)} chunk(s) -> "
+          f"{total} candidate link(s)")
+    return results
+
+
+def find_social_links(talent: str, website: str = "") -> Dict[str, List[dict]]:
+    """Single-talent convenience wrapper around :func:`find_social_links_batch`."""
+    return find_social_links_batch([talent]).get(talent.strip(), {})

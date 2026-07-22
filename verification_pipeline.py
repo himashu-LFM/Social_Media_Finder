@@ -29,8 +29,9 @@ Design notes:
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
@@ -67,8 +68,16 @@ _STATUS_RANK = {
 # Statuses whose confidence counts toward the overall per-talent score.
 _USABLE_STATUSES = {STATUS_VERIFIED, STATUS_MANUAL}
 
+# Platforms where the direct OG-tag page fetch actually works. IG/TikTok/X block
+# it, so we skip it there (Serper context is the evidence source for those).
+_OG_FETCH_PLATFORMS = {"Facebook", "YouTube"}
+
 # Max concurrent per-platform verifications within a single talent row.
 _MAX_PLATFORM_WORKERS = 5
+
+# Max talent rows processed concurrently. Tune to your API plan (higher = faster
+# but more requests/min → risk of rate limits). Env-overridable.
+PIPELINE_ROW_WORKERS = max(1, int(os.environ.get("PIPELINE_ROW_WORKERS", "4")))
 
 # Delegated so callers can use the pipeline as a single import.
 load_talent_table_from_path = excel_service.load_talent_table_from_path
@@ -146,8 +155,11 @@ def _enrich_candidates(candidates: List[dict], platform: str) -> None:
                 merged.update({k: v for k, v in cand["meta"].items() if v not in ("", None)})
                 cand["meta"] = merged
         cand["_enriched"] = True
-    # Supplement with OG-tag profile metadata (fills verified badge / bio on FB/YT).
-    profile_metadata.enrich_candidates(candidates, platform)
+    # Supplement with OG-tag profile metadata ONLY where it works — Facebook and
+    # YouTube expose OG tags (verified badge / bio / followers). Instagram, TikTok
+    # and X block it and return nothing, so we skip the wasted fetch there.
+    if platform in _OG_FETCH_PLATFORMS:
+        profile_metadata.enrich_candidates(candidates, platform)
 
 
 def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
@@ -244,36 +256,21 @@ def _build_identifiers(wiki_meta: wikipedia_service.WikiMetadata) -> str:
 #  Row / dataframe processing
 # ────────────────────────────────────────────────────────────────────────────
 
-def _write_result(df: pd.DataFrame, row_label: object, result: VerificationResult) -> None:
-    platform = result.platform
-    has_link = bool(result.best_candidate)
-    df.at[row_label, excel_service.link_col(platform)] = result.best_candidate
-    df.at[row_label, excel_service.status_col(platform)] = result.status
-    df.at[row_label, excel_service.conf_col(platform)] = result.confidence if has_link else ""
-    df.at[row_label, excel_service.reason_col(platform)] = result.reason
-
-
-def process_row(
-    df: pd.DataFrame,
-    row_label: object,
+def _resolve_row_result(
+    talent: str,
+    wiki_url: str,
+    input_metadata: dict,
+    apify_candidates: Optional[Dict[str, List[dict]]] = None,
     platform_progress: Optional[Callable[[str, str], None]] = None,
-) -> None:
-    """Run the full verification workflow for one talent row (in place)."""
-    talent = str(df.at[row_label, excel_service.TALENT_COL] or "").strip()
-    wiki_url = str(df.at[row_label, excel_service.WIKI_COL] or "").strip()
-    if not talent:
-        return
+) -> Dict[str, Any]:
+    """
+    Run the full verification workflow for ONE talent and return a dict of
+    {column -> value}. Pure compute (no DataFrame writes), so it is safe to run
+    in a worker thread; the caller writes the returned dict into the frame.
 
-    # Extra identity columns from the input spreadsheet (used as context,
-    # especially when no Wikipedia URL is available for this talent).
-    input_metadata: dict = {}
-    if excel_service.INPUT_META_COL in df.columns:
-        raw_meta = df.at[row_label, excel_service.INPUT_META_COL]
-        if isinstance(raw_meta, dict):
-            input_metadata = raw_meta
-
-    print(f"\n{'=' * 65}\nProcessing: {talent}")
-
+    ``apify_candidates`` is the pre-fetched batch slice for this talent; if None,
+    a per-talent Apify lookup is done (used by the single-row path).
+    """
     # Step 1: rich Wikipedia/Wikidata ground-truth profile (no full page to LLM).
     try:
         wiki_meta = wikipedia_service.fetch_wiki_metadata(
@@ -288,12 +285,12 @@ def process_row(
 
     identifiers = _build_identifiers(wiki_meta)
 
-    # Step 2: one Apify lookup per talent (all supported platforms at once).
-    try:
-        apify_candidates = apify_service.find_social_links(talent, wiki_meta.official_website)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [PIPELINE] Apify lookup failed for '{talent}': {exc}")
-        apify_candidates = {}
+    if apify_candidates is None:
+        try:
+            apify_candidates = apify_service.find_social_links(talent, wiki_meta.official_website)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [PIPELINE] Apify lookup failed for '{talent}': {exc}")
+            apify_candidates = {}
 
     # Steps 3-4: per-platform context + verification (concurrent across platforms).
     def _task(platform: str) -> VerificationResult:
@@ -315,66 +312,135 @@ def process_row(
     results: List[VerificationResult] = []
     workers = min(_MAX_PLATFORM_WORKERS, len(PLATFORMS))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_task, p): p for p in PLATFORMS}
-        for future in as_completed(futures):
-            results.append(future.result())
+        for result in executor.map(_task, list(PLATFORMS)):
+            results.append(result)
 
-    # Step 5: write results + overall confidence (main thread, no races).
+    # Assemble the row's column values + overall confidence.
+    out: Dict[str, Any] = {}
     usable_confidences: List[int] = []
     for result in results:
-        _write_result(df, row_label, result)
-        if result.best_candidate and result.status in _USABLE_STATUSES:
+        has_link = bool(result.best_candidate)
+        out[excel_service.link_col(result.platform)] = result.best_candidate
+        out[excel_service.status_col(result.platform)] = result.status
+        out[excel_service.conf_col(result.platform)] = result.confidence if has_link else ""
+        out[excel_service.reason_col(result.platform)] = result.reason
+        if has_link and result.status in _USABLE_STATUSES:
             usable_confidences.append(result.confidence)
-
-    df.at[row_label, excel_service.OVERALL_CONF_COL] = (
+    out[excel_service.OVERALL_CONF_COL] = (
         round(sum(usable_confidences) / len(usable_confidences)) if usable_confidences else ""
     )
+    return out
+
+
+def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
+    """Read (talent, wiki_url, input_metadata) for a row."""
+    talent = str(df.at[row_label, excel_service.TALENT_COL] or "").strip()
+    wiki_url = str(df.at[row_label, excel_service.WIKI_COL] or "").strip()
+    input_metadata: dict = {}
+    if excel_service.INPUT_META_COL in df.columns:
+        raw_meta = df.at[row_label, excel_service.INPUT_META_COL]
+        if isinstance(raw_meta, dict):
+            input_metadata = raw_meta
+    return talent, wiki_url, input_metadata
+
+
+def process_row(
+    df: pd.DataFrame,
+    row_label: object,
+    platform_progress: Optional[Callable[[str, str], None]] = None,
+) -> None:
+    """Single-row entry point (in place). Kept for the sequential / CLI path."""
+    talent, wiki_url, input_metadata = _row_inputs(df, row_label)
+    if not talent:
+        return
+    print(f"\n{'=' * 65}\nProcessing: {talent}")
+    result = _resolve_row_result(talent, wiki_url, input_metadata,
+                                 apify_candidates=None, platform_progress=platform_progress)
+    for col, val in result.items():
+        df.at[row_label, col] = val
 
 
 def run_pipeline_on_dataframe(
     df: pd.DataFrame,
-    progress: Optional[Callable[[int, int, str], None]] = None,
+    row_status: Optional[Callable[[int, str], None]] = None,
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
 ) -> pd.DataFrame:
-    """Process every row of a talent dataframe and return the populated frame."""
+    """
+    Process every row and return the populated frame.
+
+    Rows run concurrently (up to PIPELINE_ROW_WORKERS at once); Apify discovery
+    is batched once for all names up front. Each worker only computes results —
+    the DataFrame is written on the main thread as futures complete, so there
+    are no concurrent pandas writes. ``row_status(row_index, status)`` reports
+    per-row lifecycle ("processing"/"done").
+    """
     df = df.copy()
     for col in excel_service.ordered_columns():
         if col not in df.columns:
             df[col] = ""
-    # Ensure schema columns are object dtype (mixed str/int cells).
     df = df.astype({col: object for col in excel_service.ordered_columns() if col in df.columns})
 
     wikipedia_service.clear_cache()
     profile_metadata.clear_cache()
+    serper_service.clear_cache()
 
-    total = len(df)
-    print(f"[PIPELINE] Verification run started for {total} talent row(s).")
+    # Collect processable rows (skip blank names), preserving 0-based index.
+    rows = []
+    for idx, row_label in enumerate(df.index):
+        talent, wiki_url, input_metadata = _row_inputs(df, row_label)
+        if talent:
+            rows.append((idx, row_label, talent, wiki_url, input_metadata))
 
-    for i, row_label in enumerate(df.index, start=1):
-        talent = str(df.at[row_label, excel_service.TALENT_COL] or "").strip()
-        if not talent:
-            continue
+    total = len(rows)
+    print(f"[PIPELINE] Verification run started for {total} talent row(s) "
+          f"(row workers={PIPELINE_ROW_WORKERS}).")
 
-        if progress:
-            progress(i, total, talent)
+    # Step 2 (batched): one Apify pass for ALL names, grouped per talent.
+    try:
+        apify_map = apify_service.find_social_links_batch([r[2] for r in rows])
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [PIPELINE] Batched Apify failed: {exc}")
+        apify_map = {}
 
-        def _row_platform_progress(platform: str, phase: str) -> None:
+    def _row_task(entry: tuple) -> tuple:
+        idx, row_label, talent, wiki_url, input_metadata = entry
+        if row_status:
+            row_status(idx, "processing")
+
+        def _pp(platform: str, phase: str) -> None:
             if platform_progress:
-                platform_progress(i - 1, platform, phase)
+                platform_progress(idx, platform, phase)
 
         try:
-            process_row(df, row_label, platform_progress=_row_platform_progress)
+            result = _resolve_row_result(
+                talent, wiki_url, input_metadata,
+                apify_candidates=apify_map.get(talent, {}),
+                platform_progress=_pp,
+            )
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
             print(f"  [PIPELINE] Row failed for '{talent}': {exc}")
+            result = {}
+        return row_label, idx, result
 
-        print(f"  [{i}/{total}] complete")
+    workers = max(1, min(PIPELINE_ROW_WORKERS, total or 1))
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_row_task, entry) for entry in rows]
+        for future in as_completed(futures):
+            row_label, idx, result = future.result()
+            for col, val in result.items():  # main-thread write — no races
+                df.at[row_label, col] = val
+            if row_status:
+                row_status(idx, "done")
+            done += 1
+            print(f"  [{done}/{total}] complete")
 
     return df
 
 
 def run_pipeline_for_names(
     names: List[str],
-    progress: Optional[Callable[[int, int, str], None]] = None,
+    row_status: Optional[Callable[[int, str], None]] = None,
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
 ) -> pd.DataFrame:
     """Names-only entry point (no Wikipedia URLs — metadata falls back to search)."""
@@ -382,4 +448,4 @@ def run_pipeline_for_names(
     if not clean:
         raise ValueError("At least one non-empty name is required.")
     df = excel_service.build_talent_df(clean)
-    return run_pipeline_on_dataframe(df, progress=progress, platform_progress=platform_progress)
+    return run_pipeline_on_dataframe(df, row_status=row_status, platform_progress=platform_progress)

@@ -35,6 +35,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from retry_util import request_with_retry
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_CHAT_MODEL = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
@@ -278,7 +280,7 @@ def _call_openai(system_msg: str, user_msg: str) -> dict:
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-    response = requests.post(_OPENAI_URL, headers=headers, json=body, timeout=60)
+    response = request_with_retry("POST", _OPENAI_URL, headers=headers, json=body, timeout=60)
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
     return _extract_json_obj(content)

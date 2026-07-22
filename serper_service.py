@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 import requests
 
 import social_urls
+from retry_util import request_with_retry
 
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "").strip()
 
@@ -49,6 +50,14 @@ _COUNT_RE = re.compile(
 )
 
 
+# Per-run cache so the same profile URL isn't looked up on Serper twice.
+_CONTEXT_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def clear_cache() -> None:
+    _CONTEXT_CACHE.clear()
+
+
 def is_configured() -> bool:
     return bool(SERPER_API_KEY)
 
@@ -61,7 +70,7 @@ def serper_search_raw(query: str, num_results: int = 10) -> dict:
     """Full Serper JSON (organic + knowledgeGraph + …). Raises on fatal errors."""
     headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
     payload = {"q": query, "num": max(1, min(num_results, 10))}
-    response = requests.post(_SERPER_URL, headers=headers, json=payload, timeout=30)
+    response = request_with_retry("POST", _SERPER_URL, headers=headers, json=payload, timeout=30)
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -137,6 +146,8 @@ def context_for_url(url: str, top_results: int = 2) -> Dict[str, Any]:
     """
     if not is_configured() or not url:
         return {}
+    if url in _CONTEXT_CACHE:
+        return _CONTEXT_CACHE[url]
     try:
         data = serper_search_raw(url, num_results=max(top_results, 5))
     except RuntimeError:
@@ -163,6 +174,7 @@ def context_for_url(url: str, top_results: int = 2) -> Dict[str, Any]:
         + [str(kg.get("attributes", "")), kg.get("description", "")]
     )
     context.update(_parse_counts(blob))
+    _CONTEXT_CACHE[url] = context
     return context
 
 
