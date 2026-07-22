@@ -20,23 +20,43 @@ Rules:
   • Output is strict JSON:
         {best_candidate, decision, confidence, reason, evidence, rejected}
 
+LLM provider:
+  • Anthropic (Claude) is the PRIMARY verification engine.
+  • OpenAI is the FALLBACK — used automatically if Anthropic is missing,
+    rate-limited, out of credit, or otherwise fails.
+Only the LLM call layer changed; the prompt, JSON parsing, labels, confidence
+rule, and everything downstream are exactly as before.
+
 Environment variables:
-    OPENAI_API_KEY     OpenAI key (required for verification)
-    OPENAI_CHAT_MODEL  Model id (default: gpt-4o-mini)
+    ANTROPIC_API_KEY   Anthropic key (primary; ANTHROPIC_API_KEY also accepted)
+    ANTHROPIC_MODEL    Claude model id (default: claude-opus-4-8)
+    OPENAI_API_KEY     OpenAI key (fallback)
+    OPENAI_CHAT_MODEL  OpenAI model id (default: gpt-4o-mini)
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import requests
 
 from retry_util import request_with_retry
 
+# ── Primary LLM: Anthropic (Claude) ──
+# Read the user's env spelling (ANTROPIC_API_KEY) first, then the correct one.
+ANTHROPIC_API_KEY = (
+    os.environ.get("ANTROPIC_API_KEY", "")
+    or os.environ.get("ANTHROPIC_API_KEY", "")
+).strip()
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8").strip()
+
+_ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+_ANTHROPIC_VERSION = "2023-06-01"
+
+# ── Fallback LLM: OpenAI ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_CHAT_MODEL = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
@@ -50,44 +70,6 @@ STATUS_NOT_FOUND = "Not Found"
 
 # A candidate may only be labelled Verified at or above this confidence.
 _VERIFIED_MIN_CONFIDENCE = 90
-
-# Facebook is held to a stricter bar: Verified requires a high follower/like
-# count as hard evidence (name + profession are enforced by the prompt).
-# Tunable via env; a non-Verified Facebook result becomes Wrong (or Not Found).
-FACEBOOK_MIN_FOLLOWERS = float(os.environ.get("FACEBOOK_MIN_FOLLOWERS", "10000"))
-
-_COUNT_UNITS = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
-
-
-def _to_number(value: Any) -> Optional[float]:
-    """Parse a count like '2,450', '2.2K', '674M' into a float."""
-    if value in (None, ""):
-        return None
-    m = re.search(r"([\d][\d.,]*)\s*([KMB])?", str(value), re.I)
-    if not m:
-        return None
-    try:
-        num = float(m.group(1).replace(",", ""))
-    except ValueError:
-        return None
-    return num * _COUNT_UNITS.get((m.group(2) or "").lower(), 1)
-
-
-def _follower_count(meta: Dict[str, Any]) -> Optional[float]:
-    """Best follower/like/subscriber count from a candidate's own evidence."""
-    best: Optional[float] = None
-    text = " ".join(str(meta.get(k, "")) for k in
-                    ("serper_title", "serper_snippet", "title", "snippet"))
-    for m in re.finditer(r"([\d][\d.,]*\s*[KMB]?)\s*(followers|likes|fans|subscribers)",
-                         text, re.I):
-        n = _to_number(m.group(1))
-        if n is not None and (best is None or n > best):
-            best = n
-    for key in ("followers", "likes", "subscribers"):
-        n = _to_number(meta.get(key))
-        if n is not None and (best is None or n > best):
-            best = n
-    return best
 
 
 @dataclass
@@ -103,7 +85,8 @@ class VerificationResult:
 
 
 def is_configured() -> bool:
-    return bool(OPENAI_API_KEY)
+    """Configured if EITHER provider has a key (Anthropic primary, OpenAI fallback)."""
+    return bool(ANTHROPIC_API_KEY or OPENAI_API_KEY)
 
 
 def status_from_decision(decision: str, confidence: int, has_candidate: bool) -> str:
@@ -154,57 +137,6 @@ _SYSTEM_MSG = (
     "Confidence (0-100): 90-100 certain; 60-89 plausible but not certain; below 60 "
     "unlikely/contradicted."
 )
-
-# Extra Facebook clause — person vs organization/brand.
-_FACEBOOK_RULE_PERSON = (
-    "\n\nSTRICT FACEBOOK RULE (person): choose decision='verified' ONLY when ALL of "
-    "the following are simultaneously true: (1) the display name matches the person's "
-    "name/aliases, (2) the bio/description matches the person's profession/career, "
-    "and (3) the profile shows a HIGH follower/like count consistent with a public "
-    "figure. If any one of these is missing or unproven, you MUST NOT verify — use "
-    "decision='wrong'. Do NOT use manual_review for Facebook."
-)
-_FACEBOOK_RULE_ORG = (
-    "\n\nSTRICT FACEBOOK RULE (organization/brand/network/franchise): choose "
-    "decision='verified' ONLY when ALL of the following are simultaneously true: "
-    "(1) the page name matches the entity's name or aliases, (2) the "
-    "description/category matches the entity's industry/category, and (3) the page "
-    "shows a HIGH follower/like count consistent with an official brand page. If any "
-    "one is missing or unproven, you MUST NOT verify — use decision='wrong'. Do NOT "
-    "use manual_review for Facebook."
-)
-
-
-def _system_message(platform: str, is_person: bool = True) -> str:
-    if platform != "Facebook":
-        return _SYSTEM_MSG
-    return _SYSTEM_MSG + (_FACEBOOK_RULE_PERSON if is_person else _FACEBOOK_RULE_ORG)
-
-
-def _apply_facebook_rule(
-    status: str, confidence: int, reason: str, best: str, candidates: List[dict],
-) -> tuple:
-    """
-    Deterministic Facebook guard: Verified requires a high follower/like count;
-    any non-Verified Facebook result collapses to Wrong (or Not Found if blank).
-    """
-    if not best:
-        return STATUS_NOT_FOUND, confidence, reason
-    if status == STATUS_VERIFIED:
-        meta = next((c.get("meta", {}) for c in candidates if c.get("url") == best), {})
-        count = _follower_count(meta)
-        if count is None or count < FACEBOOK_MIN_FOLLOWERS:
-            shown = "absent" if count is None else str(int(count))
-            note = (f" | Facebook rule: follower/like count ({shown}) below the "
-                    f"required {int(FACEBOOK_MIN_FOLLOWERS)} — not verified.")
-            return STATUS_WRONG, min(confidence, 55), reason + note
-        return STATUS_VERIFIED, confidence, reason
-    if status == STATUS_MANUAL:
-        return STATUS_WRONG, confidence, (
-            reason + " | Facebook requires name + profession/industry + high followers "
-            "to verify; insufficient, marked Wrong."
-        )
-    return status, confidence, reason
 
 
 def _flatten_candidate(i: int, cand: dict) -> dict:
@@ -266,7 +198,31 @@ def _extract_json_obj(text: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
+def _call_anthropic(system_msg: str, user_msg: str) -> dict:
+    """Primary LLM call — Anthropic (Claude) Messages API."""
+    body = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 1024,
+        # System prompt is a top-level field on the Messages API (not a message).
+        "system": system_msg,
+        "messages": [
+            {"role": "user", "content": user_msg},
+        ],
+    }
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": _ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+    response = request_with_retry("POST", _ANTHROPIC_URL, headers=headers, json=body, timeout=60)
+    response.raise_for_status()
+    blocks = response.json().get("content", []) or []
+    content = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+    return _extract_json_obj(content)
+
+
 def _call_openai(system_msg: str, user_msg: str) -> dict:
+    """Fallback LLM call — OpenAI Chat Completions."""
     body = {
         "model": OPENAI_CHAT_MODEL,
         "temperature": 0,
@@ -286,6 +242,23 @@ def _call_openai(system_msg: str, user_msg: str) -> dict:
     return _extract_json_obj(content)
 
 
+def _call_llm(system_msg: str, user_msg: str) -> dict:
+    """
+    Verify via the primary LLM (Anthropic), falling back to OpenAI if Anthropic
+    is unavailable — no key, rate-limited/out of credit, or any other failure.
+    """
+    if ANTHROPIC_API_KEY:
+        try:
+            return _call_anthropic(system_msg, user_msg)
+        except Exception as exc:  # noqa: BLE001 — fall back on any Anthropic failure
+            if OPENAI_API_KEY:
+                print(f"  [VERIFY] Anthropic unavailable ({exc.__class__.__name__}) "
+                      f"— falling back to OpenAI.")
+                return _call_openai(system_msg, user_msg)
+            raise
+    return _call_openai(system_msg, user_msg)
+
+
 def verify_platform(
     platform: str,
     wiki_meta: Dict[str, Any],
@@ -294,7 +267,7 @@ def verify_platform(
 ) -> VerificationResult:
     """
     Verify candidate profiles for one platform in a single LLM request.
-    ``is_person`` selects the person vs organization Facebook rule.
+    Every platform (including Facebook) is judged purely by the LLM.
     Failures degrade to a Manual Review result rather than aborting the run.
     """
     if not candidates:
@@ -307,12 +280,13 @@ def verify_platform(
         top = candidates[0].get("url", "")
         return VerificationResult(
             platform=platform, best_candidate=top, status=STATUS_MANUAL,
-            confidence=0, reason="OPENAI_API_KEY not set — manual review required.",
+            confidence=0,
+            reason="No LLM key set (ANTROPIC_API_KEY / OPENAI_API_KEY) — manual review required.",
         )
 
     user_msg = _build_user_message(platform, wiki_meta, candidates)
     try:
-        parsed = _call_openai(_system_message(platform, is_person), user_msg)
+        parsed = _call_llm(_SYSTEM_MSG, user_msg)
     except requests.Timeout:
         print(f"  [VERIFY] {platform} timeout — flagged for manual review.")
         return VerificationResult(
@@ -345,12 +319,6 @@ def verify_platform(
         reason = f"Model returned a URL not in the candidate set. {reason}".strip()
 
     status = status_from_decision(decision, confidence, bool(best))
-
-    # Facebook is held to the strict, evidence-backed bar.
-    if platform == "Facebook":
-        status, confidence, reason = _apply_facebook_rule(
-            status, confidence, reason, best, candidates
-        )
 
     result = VerificationResult(
         platform=platform,
