@@ -6,6 +6,8 @@ import * as XLSX from "xlsx";
 import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppPageHeader } from "@/components/AppPageHeader";
 import { AppSidebar } from "@/components/AppSidebar";
+import { mapRecordToRow, RESULT_PLATFORMS } from "@/lib/results-mapper";
+import type { ResultRow } from "@/types/results";
 
 const REQUIRED_PREFIX = "Talent_Social_Lookup_";
 const REQUIRED_SUFFIX = ".xlsx";
@@ -14,7 +16,7 @@ export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Analysis | ListenFirst",
-  description: "Confidence distribution analysis for resolved social links.",
+  description: "Confidence distribution analysis for verified social links.",
 };
 
 function getPythonApiUrl(): string | null {
@@ -22,51 +24,7 @@ function getPythonApiUrl(): string | null {
   return u && u.length > 0 ? u : null;
 }
 
-function asString(v: unknown): string {
-  if (v === undefined || v === null) return "";
-  return String(v).trim();
-}
-
-function asConfidence(v: unknown): number {
-  if (typeof v === "number") return Math.max(0, Math.min(1, v));
-  const raw = String(v ?? "").trim();
-  if (!raw) return 0;
-  const cleaned = raw.replace(/,/g, "").replace(/%$/, "");
-  const n = Number(cleaned);
-  if (!Number.isFinite(n)) return 0;
-  if (n > 1) return Math.max(0, Math.min(1, n / 100));
-  return Math.max(0, Math.min(1, n));
-}
-
-type RowShape = {
-  facebook: string;
-  facebookConfidence: number;
-  instagram: string;
-  instagramConfidence: number;
-  x: string;
-  xConfidence: number;
-  tiktok: string;
-  tiktokConfidence: number;
-  youtube: string;
-  youtubeConfidence: number;
-};
-
-function mapRecordToRow(r: Record<string, unknown>): RowShape {
-  return {
-    facebook: asString(r["Facebook"]),
-    facebookConfidence: asConfidence(r["Facebook Confidence"]),
-    instagram: asString(r["Instagram"]),
-    instagramConfidence: asConfidence(r["Instagram Confidence"]),
-    x: asString(r["X"]),
-    xConfidence: asConfidence(r["X Confidence"]),
-    tiktok: asString(r["TikTok"]),
-    tiktokConfidence: asConfidence(r["TikTok Confidence"]),
-    youtube: asString(r["YouTube"]),
-    youtubeConfidence: asConfidence(r["YouTube Confidence"]),
-  };
-}
-
-function readRowsFromWorkbook(wb: XLSX.WorkBook): RowShape[] {
+function readRowsFromWorkbook(wb: XLSX.WorkBook): ResultRow[] {
   const firstSheetName = wb.SheetNames[0];
   if (!firstSheetName) return [];
   const sheet = wb.Sheets[firstSheetName];
@@ -74,7 +32,7 @@ function readRowsFromWorkbook(wb: XLSX.WorkBook): RowShape[] {
   return jsonRows.map((r) => mapRecordToRow(r));
 }
 
-async function readRowsFromPathWithRetry(fullPath: string): Promise<RowShape[]> {
+async function readRowsFromPathWithRetry(fullPath: string): Promise<ResultRow[]> {
   let lastErr = "";
   for (let i = 0; i < 12; i++) {
     try {
@@ -89,7 +47,7 @@ async function readRowsFromPathWithRetry(fullPath: string): Promise<RowShape[]> 
   throw new Error(lastErr || "Unknown read error");
 }
 
-async function loadRows(): Promise<RowShape[]> {
+async function loadRows(): Promise<ResultRow[]> {
   const api = getPythonApiUrl();
   if (api) {
     try {
@@ -125,13 +83,12 @@ async function loadRows(): Promise<RowShape[]> {
 
 export default async function AnalysisPage() {
   const rows = await loadRows();
-  const platformLinks = rows.flatMap((r) => [
-    { link: r.facebook, conf: r.facebookConfidence },
-    { link: r.instagram, conf: r.instagramConfidence },
-    { link: r.x, conf: r.xConfidence },
-    { link: r.tiktok, conf: r.tiktokConfidence },
-    { link: r.youtube, conf: r.youtubeConfidence },
-  ]);
+  const platformLinks = rows.flatMap((r) =>
+    RESULT_PLATFORMS.map((p) => ({
+      link: r.platforms[p.key].link,
+      conf: r.platforms[p.key].confidence,
+    })),
+  );
   const resolvedLinks = platformLinks.filter((x) => x.link && x.link.trim().length > 0);
   const greenCount = resolvedLinks.filter((x) => x.conf * 100 > 85).length;
   const yellowCount = resolvedLinks.filter((x) => x.conf * 100 >= 70 && x.conf * 100 <= 85).length;
@@ -154,7 +111,7 @@ export default async function AnalysisPage() {
   const asPct = (v: number) => (total ? `${((v / total) * 100).toFixed(1)}%` : "0.0%");
 
   return (
-    <div className="relative flex min-h-screen flex-col bg-background md:flex-row">
+    <div className="relative flex min-h-screen flex-col md:flex-row">
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_0%_0%,rgba(242,209,0,0.06),transparent_32%)]"

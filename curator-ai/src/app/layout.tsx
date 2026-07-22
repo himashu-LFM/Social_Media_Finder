@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, Manrope } from "next/font/google";
+import { BackgroundScene } from "@/components/three/BackgroundScene";
 import { ToastProvider } from "@/components/ToastProvider";
 import "./globals.css";
 
@@ -35,7 +36,10 @@ export default function RootLayout({
           href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0&display=swap"
         />
       </head>
-      <body className="min-h-full bg-background text-foreground">
+      <body className="min-h-full text-foreground">
+        {/* Animated gradient + lazy Three.js scene, behind all page content. */}
+        <div className="lf-aurora" aria-hidden />
+        <BackgroundScene />
         <ToastProvider>{children}</ToastProvider>
       </body>
     </html>

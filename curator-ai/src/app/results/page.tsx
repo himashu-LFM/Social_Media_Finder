@@ -7,7 +7,12 @@ import { AppPageHeader } from "@/components/AppPageHeader";
 import { ResultsAnalysisButton } from "@/components/ResultsAnalysisButton";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ResultsExportButton } from "@/components/ResultsExportButton";
-import type { ResultRow } from "@/types/results";
+import {
+  mapRecordToRow,
+  RESULT_PLATFORMS,
+  statusTone,
+} from "@/lib/results-mapper";
+import type { PlatformResult, ResultRow } from "@/types/results";
 
 const REQUIRED_PREFIX = "Talent_Social_Lookup_";
 const REQUIRED_SUFFIX = ".xlsx";
@@ -16,49 +21,12 @@ export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Results | ListenFirst",
-  description: "Profile lookup output table aligned with python export schema.",
+  description: "Verified social profile output aligned with the python export schema.",
 };
 
 function getPythonApiUrl(): string | null {
   const u = process.env.NEXT_PUBLIC_PYTHON_API_URL?.trim().replace(/\/$/, "");
   return u && u.length > 0 ? u : null;
-}
-
-function asString(v: unknown): string {
-  if (v === undefined || v === null) return "";
-  return String(v).trim();
-}
-
-function asConfidence(v: unknown): number {
-  if (typeof v === "number") return Math.max(0, Math.min(1, v));
-  const raw = String(v ?? "").trim();
-  if (!raw) return 0;
-  const cleaned = raw.replace(/,/g, "").replace(/%$/, "");
-  const n = Number(cleaned);
-  if (!Number.isFinite(n)) return 0;
-  // Treat 0..1 as already-normalized, 1..100 as percent points.
-  if (n > 1) return Math.max(0, Math.min(1, n / 100));
-  return Math.max(0, Math.min(1, n));
-}
-
-function mapRecordToRow(r: Record<string, unknown>): ResultRow {
-  return {
-    name: asString(r["Talent Name"]),
-    category: asString(r["title_category"] || r["de_category"] || r["category"]),
-    subCategory: asString(r["title_sub_category"] || r["sub_category"]),
-    facebook: asString(r["Facebook"]),
-    facebookConfidence: asConfidence(r["Facebook Confidence"]),
-    instagram: asString(r["Instagram"]),
-    instagramConfidence: asConfidence(r["Instagram Confidence"]),
-    x: asString(r["X"]),
-    xConfidence: asConfidence(r["X Confidence"]),
-    tiktok: asString(r["TikTok"]),
-    tiktokConfidence: asConfidence(r["TikTok Confidence"]),
-    youtube: asString(r["YouTube"]),
-    youtubeConfidence: asConfidence(r["YouTube Confidence"]),
-    confidence: asConfidence(r["Confidence"]),
-    source: asString(r["Source"]),
-  };
 }
 
 function readRowsFromWorkbook(wb: XLSX.WorkBook): ResultRow[] {
@@ -174,26 +142,34 @@ function ConfBadge({ value }: { value: number }) {
   return <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-bold ring-1 ${cls}`}>{pct}%</span>;
 }
 
-function LinkCell({ href, confidence }: { href: string; confidence: number }) {
-  if (!href) return <span className="text-slate-600">-</span>;
-  const pct = Math.round(confidence * 100);
-  const cls =
-    pct > 85
-      ? "bg-emerald-500/10 text-emerald-300 ring-emerald-500/30"
-      : pct >= 70
-        ? "bg-amber-500/10 text-amber-300 ring-amber-500/30"
-        : "bg-rose-500/10 text-rose-300 ring-rose-500/30";
+function PlatformCell({ result }: { result: PlatformResult }) {
+  const pct = Math.round(result.confidence * 100);
+  const tone = statusTone(result.status);
   return (
-    <div className={`rounded-md px-2 py-1 ring-1 ${cls}`}>
-      <a
-        href={href}
-        target="_blank"
-        rel="noreferrer"
-        className="cursor-pointer text-xs break-all underline-offset-2 transition hover:underline"
-      >
-        {href}
-      </a>
-      <div className="mt-1 text-[10px] font-semibold opacity-90">{pct}%</div>
+    <div className="min-w-[160px] space-y-1.5">
+      <div className="flex items-center gap-2">
+        <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ring-1 ${tone}`}>
+          {result.status || "—"}
+        </span>
+        {result.link && <span className="text-[10px] font-semibold text-slate-400">{pct}%</span>}
+      </div>
+      {result.link ? (
+        <a
+          href={result.link}
+          target="_blank"
+          rel="noreferrer"
+          className="block cursor-pointer text-xs break-all text-slate-300 underline-offset-2 transition hover:text-primary hover:underline"
+        >
+          {result.link}
+        </a>
+      ) : (
+        <span className="text-xs text-slate-600">No profile</span>
+      )}
+      {result.reason && (
+        <p className="text-[10px] leading-snug text-slate-500" title={result.reason}>
+          {result.reason.length > 140 ? `${result.reason.slice(0, 140)}…` : result.reason}
+        </p>
+      )}
     </div>
   );
 }
@@ -215,7 +191,7 @@ export default async function ResultsPage() {
     : "Tip: set NEXT_PUBLIC_PYTHON_API_URL to your FastAPI URL so Results reads exports via Python when Excel locks the file.";
 
   return (
-    <div className="relative flex min-h-screen flex-col bg-background md:flex-row">
+    <div className="relative flex min-h-screen flex-col md:flex-row">
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_100%_0%,rgba(242,209,0,0.06),transparent_30%)]"
@@ -225,7 +201,7 @@ export default async function ResultsPage() {
       <main className="relative z-10 flex-1 p-4 pb-32 md:ml-64 md:p-8">
         <AppPageHeader
           title="Results"
-          subtitle="Export output"
+          subtitle="Verification output"
           icon="table_chart"
           actions={
             <>
@@ -241,19 +217,22 @@ export default async function ResultsPage() {
               <span className="material-symbols-outlined text-primary">schema</span>
               <div className="min-w-0 flex-1">
                 <p className="text-sm text-slate-300">
-                  Output schema: Talent Name, categories, five platform links + confidences, overall
-                  Confidence, Source.
+                  Output schema: Talent Name, Wikipedia URL, and per platform a link, verification
+                  Status, Confidence, and Reason.
                 </p>
                 <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-                  <span className="text-slate-400">Link confidence:</span>
+                  <span className="text-slate-400">Status:</span>
                   <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-semibold text-emerald-300">
-                    Green &gt; 85%
+                    Verified
                   </span>
                   <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 font-semibold text-amber-300">
-                    Yellow 70%-85%
+                    Manual Review Needed
                   </span>
                   <span className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 font-semibold text-rose-300">
-                    Red &lt; 70%
+                    Wrong
+                  </span>
+                  <span className="rounded-full border border-slate-500/30 bg-slate-500/10 px-2 py-0.5 font-semibold text-slate-400">
+                    Not Found
                   </span>
                 </div>
                 <p className="mt-2 text-xs text-slate-500">
@@ -272,58 +251,59 @@ export default async function ResultsPage() {
 
           <div className="lf-enter lf-enter-delay-1 lf-card overflow-hidden">
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1300px] border-collapse text-left">
+              <table className="w-full min-w-[1400px] border-collapse text-left">
                 <thead>
                   <tr className="border-b border-white/10 bg-slate-950/70">
-                    {[
-                      "Talent Name",
-                      "Category",
-                      "Sub Category",
-                      "Facebook",
-                      "Instagram",
-                      "X",
-                      "TikTok",
-                      "YouTube",
-                      "Confidence",
-                      "Source",
-                    ].map((h) => (
-                      <th
-                        key={h}
-                        className="px-4 py-4 text-xs font-bold uppercase tracking-wider text-slate-500"
-                      >
-                        {h}
-                      </th>
-                    ))}
+                    {["Talent Name", "Wikipedia URL", ...RESULT_PLATFORMS.map((p) => p.label), "Confidence"].map(
+                      (h) => (
+                        <th
+                          key={h}
+                          className="px-4 py-4 text-xs font-bold uppercase tracking-wider text-slate-500"
+                        >
+                          {h}
+                        </th>
+                      ),
+                    )}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/8">
-                  {rows.map((r) => (
+                  {rows.map((r, i) => (
                     <tr
-                      key={`${r.name}-${r.facebook}-${r.instagram}`}
+                      key={`${r.name}-${i}`}
                       className="align-top transition-colors hover:bg-primary/[0.03]"
                     >
                       <td className="px-4 py-4 font-semibold text-slate-100">{r.name}</td>
-                      <td className="px-4 py-4 text-sm text-slate-300">{r.category || "-"}</td>
-                      <td className="px-4 py-4 text-sm text-slate-300">{r.subCategory || "-"}</td>
-                      <td className="px-4 py-4"><LinkCell href={r.facebook} confidence={r.facebookConfidence} /></td>
-                      <td className="px-4 py-4"><LinkCell href={r.instagram} confidence={r.instagramConfidence} /></td>
-                      <td className="px-4 py-4"><LinkCell href={r.x} confidence={r.xConfidence} /></td>
-                      <td className="px-4 py-4"><LinkCell href={r.tiktok} confidence={r.tiktokConfidence} /></td>
-                      <td className="px-4 py-4"><LinkCell href={r.youtube} confidence={r.youtubeConfidence} /></td>
+                      <td className="px-4 py-4 text-sm">
+                        {r.wikipediaUrl ? (
+                          <a
+                            href={r.wikipediaUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="cursor-pointer break-all text-xs text-slate-400 underline-offset-2 hover:text-primary hover:underline"
+                          >
+                            {r.wikipediaUrl}
+                          </a>
+                        ) : (
+                          <span className="text-slate-600">-</span>
+                        )}
+                      </td>
+                      {RESULT_PLATFORMS.map((p) => (
+                        <td key={p.key} className="px-4 py-4">
+                          <PlatformCell result={r.platforms[p.key]} />
+                        </td>
+                      ))}
                       <td className="px-4 py-4"><ConfBadge value={r.confidence} /></td>
-                      <td className="px-4 py-4 text-xs text-slate-400">{r.source || "-"}</td>
                     </tr>
                   ))}
                   {rows.length === 0 && (
                     <tr>
                       <td
-                        colSpan={10}
+                        colSpan={RESULT_PLATFORMS.length + 3}
                         className="px-6 py-10 text-center text-sm text-slate-500"
                       >
-                        No output rows found yet. Run the Python pipeline first to
-                        generate a `Talent_Social_Lookup_*.xlsx` file in
-                        `C:\\Testing`, or ensure `NEXT_PUBLIC_PYTHON_API_URL` points at your
-                        running FastAPI server.
+                        No output rows found yet. Run the pipeline first to generate a
+                        `Talent_Social_Lookup_*.xlsx` file, or ensure
+                        `NEXT_PUBLIC_PYTHON_API_URL` points at your running FastAPI server.
                       </td>
                     </tr>
                   )}

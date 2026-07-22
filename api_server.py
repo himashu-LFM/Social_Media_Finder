@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-import testing  # noqa: E402  — after dotenv so keys load
+import verification_pipeline as testing  # noqa: E402  — after dotenv so keys load
 
 _jobs_lock = threading.Lock()
 _jobs: Dict[str, Dict[str, Any]] = {}
@@ -80,18 +80,17 @@ def _reset_row_platform_state(entry: Dict[str, Any]) -> None:
     entry["completed_platforms"] = []
 
 
-def _apply_row_progress(job: Dict[str, Any], row_index: int) -> None:
-    for k, entry in enumerate(job["names"]):
-        if k < row_index:
-            entry["status"] = "done"
-            entry["current_platform"] = None
-            entry["completed_platforms"] = list(testing.PLATFORMS.keys())
-        elif k == row_index:
-            entry["status"] = "processing"
-            _reset_row_platform_state(entry)
-        else:
-            entry["status"] = "queued"
-            _reset_row_platform_state(entry)
+def _apply_row_status(job: Dict[str, Any], row_index: int, status: str) -> None:
+    """Set a single row's status independently (rows run concurrently now)."""
+    if row_index < 0 or row_index >= len(job["names"]):
+        return
+    entry = job["names"][row_index]
+    entry["status"] = status
+    if status == "processing":
+        _reset_row_platform_state(entry)
+    elif status == "done":
+        entry["current_platform"] = None
+        entry["completed_platforms"] = list(testing.PLATFORMS.keys())
 
 
 def _apply_platform_progress(
@@ -113,12 +112,12 @@ def _apply_platform_progress(
 
 
 def _run_job(job_id: str, names: List[str]) -> None:
-    def progress(i: int, total: int, talent_name: str) -> None:
+    def row_status(row_index: int, status: str) -> None:
         with _jobs_lock:
             job = _jobs.get(job_id)
             if not job:
                 return
-            _apply_row_progress(job, i - 1)
+            _apply_row_status(job, row_index, status)
 
     def platform_progress(row_index: int, platform: str, phase: str) -> None:
         with _jobs_lock:
@@ -133,7 +132,7 @@ def _run_job(job_id: str, names: List[str]) -> None:
 
         final_df = testing.run_pipeline_for_names(
             names,
-            progress=progress,
+            row_status=row_status,
             platform_progress=platform_progress,
         )
 
@@ -157,12 +156,12 @@ def _run_job(job_id: str, names: List[str]) -> None:
 
 
 def _run_job_from_file(job_id: str, path: Path) -> None:
-    def progress(i: int, total: int, talent_name: str) -> None:
+    def row_status(row_index: int, status: str) -> None:
         with _jobs_lock:
             job = _jobs.get(job_id)
             if not job:
                 return
-            _apply_row_progress(job, i - 1)
+            _apply_row_status(job, row_index, status)
 
     def platform_progress(row_index: int, platform: str, phase: str) -> None:
         with _jobs_lock:
@@ -178,7 +177,7 @@ def _run_job_from_file(job_id: str, path: Path) -> None:
         df = testing.load_talent_table_from_path(path)
         final_df = testing.run_pipeline_on_dataframe(
             df,
-            progress=progress,
+            row_status=row_status,
             platform_progress=platform_progress,
         )
 
@@ -217,12 +216,6 @@ def start_job(body: StartJobBody) -> dict[str, str]:
     if not names:
         raise HTTPException(status_code=400, detail="Provide at least one non-empty name.")
 
-    if not testing.SERPER_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="SERPER_API_KEY is not set in environment (.env).",
-        )
-
     job_id = str(uuid.uuid4())
     with _jobs_lock:
         _jobs[job_id] = {
@@ -256,12 +249,6 @@ async def start_job_from_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     registered as POST-only before GET /api/jobs/{job_id}, so it does not collide with the
     dynamic route.
     """
-    if not testing.SERPER_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="SERPER_API_KEY is not set in environment (.env).",
-        )
-
     raw_name = (file.filename or "upload").strip()
     lower = raw_name.lower()
     if not (lower.endswith(".xlsx") or lower.endswith(".xls") or lower.endswith(".csv")):

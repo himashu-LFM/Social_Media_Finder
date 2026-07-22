@@ -2,6 +2,7 @@
 
 import * as XLSX from "xlsx";
 import { useToast } from "@/components/ToastProvider";
+import { RESULT_PLATFORMS } from "@/lib/results-mapper";
 import type { ResultRow } from "@/types/results";
 
 type Props = {
@@ -9,6 +10,11 @@ type Props = {
   /** e.g. Talent_Social_Lookup_20260409_170736.xlsx — used as download filename */
   sourceFileName: string | null;
 };
+
+/** Confidence is stored normalized (0..1); the workbook schema uses 0-100. */
+function toPercent(value: number): number | "" {
+  return value > 0 ? Math.round(value * 100) : "";
+}
 
 export function ResultsExportButton({ rows, sourceFileName }: Props) {
   const { pushToast } = useToast();
@@ -19,23 +25,21 @@ export function ResultsExportButton({ rows, sourceFileName }: Props) {
       return;
     }
 
-    const sheetRows = rows.map((r) => ({
-      "Talent Name": r.name,
-      title_category: r.category,
-      title_sub_category: r.subCategory,
-      Facebook: r.facebook,
-      "Facebook Confidence": r.facebookConfidence,
-      Instagram: r.instagram,
-      "Instagram Confidence": r.instagramConfidence,
-      X: r.x,
-      "X Confidence": r.xConfidence,
-      TikTok: r.tiktok,
-      "TikTok Confidence": r.tiktokConfidence,
-      YouTube: r.youtube,
-      "YouTube Confidence": r.youtubeConfidence,
-      Confidence: r.confidence,
-      Source: r.source,
-    }));
+    const sheetRows = rows.map((r) => {
+      const row: Record<string, string | number> = {
+        "Talent Name": r.name,
+        "Wikipedia URL": r.wikipediaUrl,
+      };
+      for (const p of RESULT_PLATFORMS) {
+        const cell = r.platforms[p.key];
+        row[p.column] = cell.link;
+        row[`${p.column} Status`] = cell.status;
+        row[`${p.column} Confidence`] = toPercent(cell.confidence);
+        row[`${p.column} Reason`] = cell.reason;
+      }
+      row["Confidence"] = toPercent(r.confidence);
+      return row;
+    });
 
     const ws = XLSX.utils.json_to_sheet(sheetRows);
     const wb = XLSX.utils.book_new();
