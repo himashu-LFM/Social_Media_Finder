@@ -240,3 +240,53 @@ def discover_candidates(
 
     print(f"  [SERPER] {platform} | '{talent}' -> {len(candidates)} candidate(s)")
     return candidates
+
+
+def discover_by_site(talent: str, platform: str, top_n: int = 1) -> List[dict]:
+    """
+    Simplified discovery for entities with NO Wikipedia link in the input.
+
+    Runs a targeted ``"<name> site:<platform-domain>"`` search (e.g.
+    ``"Valentino Beauty site:instagram.com"``) and returns the TOP profile-URL
+    result(s) only, each shaped like :func:`discover_candidates` output
+    (``{url, source, meta{...}}``) with the full Serper metadata attached.
+    """
+    if not is_configured():
+        print("  [SERPER] Skipped site-search — SERPER_API_KEY not set.")
+        return []
+
+    domains = social_urls.PLATFORMS.get(platform, [])
+    domain = domains[0] if domains else ""
+    if not domain:
+        return []
+
+    query = f"{talent} site:{domain}"
+    try:
+        data = serper_search_raw(query, num_results=10)
+    except RuntimeError as exc:
+        print(f"  [SERPER] Fatal error on site-search '{query}': {exc}")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [SERPER] site-search failed '{query}': {exc}")
+        return []
+
+    candidates: List[dict] = []
+    seen: set = set()
+    for item in data.get("organic", []) or []:
+        link = item.get("link", "")
+        if social_urls.platform_from_url(link) != platform:
+            continue
+        if not social_urls.is_valid_profile_url(link, platform):
+            continue
+        norm = social_urls.normalize_profile_url(link, platform)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        meta = _organic_fields(item)
+        meta.update(_parse_counts(meta.get("title", "") + " " + meta.get("snippet", "")))
+        candidates.append({"url": norm, "source": "serper", "meta": meta})
+        if len(candidates) >= top_n:
+            break
+
+    print(f"  [SERPER] site-search {platform} | '{talent}' -> {len(candidates)} candidate(s)")
+    return candidates
