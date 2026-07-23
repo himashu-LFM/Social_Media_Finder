@@ -209,6 +209,66 @@ def _resolve_platform(
     return result
 
 
+def _resolve_platform_no_wiki(
+    talent: str,
+    platform: str,
+    wiki_meta: wikipedia_service.WikiMetadata,
+    apify_candidates: Dict[str, List[dict]],
+) -> VerificationResult:
+    """
+    Simplified resolution for rows with NO Wikipedia link in the input file.
+
+      • If Apify returned a link for this platform -> run a Serper search of that
+        link (context extraction) and hand that SINGLE enriched candidate to the
+        LLM for verification.
+      • Otherwise -> a Serper "<name> site:<platform-domain>" search, take the
+        TOP result only, and hand that single candidate to the LLM.
+
+    No Wikidata-declared candidate, no multi-candidate discovery, no backtracking
+    — exactly one candidate per platform is verified.
+    """
+    candidate: Optional[dict] = None
+
+    # 1) Prefer the Apify link for this platform, enriched with a Serper search.
+    working: List[dict] = []
+    seen: set = set()
+    for cand in apify_candidates.get(platform, []):
+        _add_candidate(working, seen, platform, cand.get("url", ""),
+                       cand.get("source", "apify"), cand.get("meta"))
+        if working:
+            break
+    if working:
+        candidate = working[0]
+        try:
+            ctx = serper_service.context_for_url(candidate["url"])
+        except RuntimeError as exc:
+            print(f"  [NO-WIKI] Serper context unavailable: {exc}")
+            ctx = {}
+        if ctx:
+            merged = dict(ctx)
+            merged.update({k: v for k, v in candidate["meta"].items() if v not in ("", None)})
+            candidate["meta"] = merged
+
+    # 2) No Apify link -> "<name> site:<domain>" search, top result only.
+    if candidate is None:
+        try:
+            top = serper_service.discover_by_site(talent, platform, top_n=1)
+        except RuntimeError as exc:
+            print(f"  [NO-WIKI] Serper site-search unavailable for {platform}/{talent}: {exc}")
+            top = []
+        candidate = top[0] if top else None
+
+    if candidate is None:
+        return VerificationResult(
+            platform=platform, status=STATUS_NOT_FOUND,
+            reason="No candidate link from Apify or Serper site-search.",
+        )
+
+    return verification_service.verify_platform(
+        platform, wiki_meta.to_prompt_dict(), [candidate], is_person=wiki_meta.is_person
+    )
+
+
 def _build_identifiers(wiki_meta: wikipedia_service.WikiMetadata) -> str:
     """Short distinguishing-facts string for Serper backup-discovery queries."""
     attrs = wiki_meta.attributes or {}
@@ -285,6 +345,10 @@ def _resolve_row_result(
 
     identifiers = _build_identifiers(wiki_meta)
 
+    # Rows with no Wikipedia link in the Excel take the simplified discovery path
+    # (Apify link -> Serper context, else "<name> site:domain" top result -> LLM).
+    has_wiki_link = bool((wiki_url or "").strip())
+
     if apify_candidates is None:
         try:
             apify_candidates = apify_service.find_social_links(talent, wiki_meta.official_website)
@@ -297,7 +361,10 @@ def _resolve_row_result(
         if platform_progress:
             platform_progress(platform, "start")
         try:
-            result = _resolve_platform(talent, platform, identifiers, wiki_meta, apify_candidates)
+            if has_wiki_link:
+                result = _resolve_platform(talent, platform, identifiers, wiki_meta, apify_candidates)
+            else:
+                result = _resolve_platform_no_wiki(talent, platform, wiki_meta, apify_candidates)
         except Exception as exc:  # noqa: BLE001 — isolate platform failures
             print(f"  [PIPELINE] {platform} verification error for '{talent}': {exc}")
             result = VerificationResult(
