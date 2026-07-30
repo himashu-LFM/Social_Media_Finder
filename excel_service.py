@@ -232,12 +232,16 @@ _STATUS_FILL = {
 }
 
 
-def save_results(df: pd.DataFrame, output_dir: Optional[Path] = None) -> Path:
+def save_results(
+    df: pd.DataFrame,
+    output_dir: Optional[Path] = None,
+    filename_prefix: str = "Talent_Social_Lookup",
+) -> Path:
     """Write the results workbook with header styling and status colour bands."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_dir = Path(output_dir) if output_dir is not None else Path(__file__).resolve().parent
     base_dir.mkdir(parents=True, exist_ok=True)
-    output_path = base_dir / f"Talent_Social_Lookup_{timestamp}.xlsx"
+    output_path = base_dir / f"{filename_prefix}_{timestamp}.xlsx"
 
     # Keep only known columns, in canonical order.
     export_df = df.reindex(columns=ordered_columns())
@@ -292,6 +296,10 @@ def save_results(df: pd.DataFrame, output_dir: Optional[Path] = None) -> Path:
     return output_path
 
 
-def save_output(df: pd.DataFrame, output_dir: Optional[Path] = None) -> str:
+def save_output(
+    df: pd.DataFrame,
+    output_dir: Optional[Path] = None,
+    filename_prefix: str = "Talent_Social_Lookup",
+) -> str:
     """API-compatible wrapper used by api_server.py."""
-    return str(save_results(df, output_dir=output_dir))
+    return str(save_results(df, output_dir=output_dir, filename_prefix=filename_prefix))

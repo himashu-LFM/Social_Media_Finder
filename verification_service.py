@@ -71,6 +71,20 @@ STATUS_NOT_FOUND = "Not Found"
 # A candidate may only be labelled Verified at or above this confidence.
 _VERIFIED_MIN_CONFIDENCE = 90
 
+# Identity fields that let the model tell the real person/entity apart from a
+# namesake. If NONE are present the ground truth is effectively name-only (e.g. a
+# Wikipedia 429 wiped the Wikidata lookup, or the entity has no Wikipedia page),
+# and a name match alone must NOT be allowed to Verify — it could be any namesake.
+_IDENTITY_SIGNALS = (
+    "professions", "nationalities", "birth_year", "known_works",
+    "summary", "reference_sources",
+)
+
+
+def _ground_truth_is_thin(ground_truth: Dict[str, Any]) -> bool:
+    """True when the ground truth carries no disambiguating identity facts."""
+    return not any(ground_truth.get(k) for k in _IDENTITY_SIGNALS)
+
 
 @dataclass
 class VerificationResult:
@@ -118,15 +132,48 @@ _SYSTEM_MSG = (
     "platforms.\n\n"
     "If the Wikipedia-derived fields are sparse, use 'provided_metadata' (from the "
     "input file) as the identity description. Treat 'reference_sources' "
-    "(IMDb/Spotify/TMDb) and 'known_official_profiles' as strong corroboration.\n\n"
+    "(IMDb/Spotify/TMDb) as corroboration.\n\n"
+    "CRITICAL — DECLARED HANDLES ARE ONLY HINTS, NOT PROOF: the handles in "
+    "'known_official_profiles' (Wikidata-declared) and any handle inside "
+    "'provided_metadata' (from the input file) can be STALE, REASSIGNED to someone "
+    "else, or simply WRONG. A candidate whose URL/handle merely MATCHES one of these "
+    "declared handles is NOT verified on that basis alone. You must ALSO confirm, from "
+    "the CANDIDATE'S OWN evidence (title, snippet, bio, knowledge_graph, content) that "
+    "it is the SAME specific person/entity — same occupation, domain/industry and "
+    "notable works — with no contradicting signal. If the candidate's own content does "
+    "not independently establish this, you have NOT verified it.\n\n"
+    "CROSS-PLATFORM CONFIRMATION: if 'verified_handles_on_other_platforms' is present, "
+    "those handles were ALREADY confirmed as this same entity's official profiles on "
+    "OTHER platforms during this very check. A candidate whose handle matches (or is a "
+    "clear variant of) one of them is strong corroboration — you may treat that "
+    "cross-platform consistency as supporting evidence toward 'verified', provided no "
+    "content contradicts the identity.\n\n"
+    "CROSS-SOURCE AGREEMENT: a candidate flagged 'cross_source_agreement' was returned "
+    "INDEPENDENTLY by two different discovery tools (a Serper web search AND Apify). "
+    "That agreement makes it more likely to be the real, active profile and should "
+    "RAISE your confidence that the link itself is genuine — but you MUST still confirm "
+    "from the content and ground truth that it is the SAME person/entity before "
+    "choosing 'verified'. Agreement supports the link; it does not by itself prove "
+    "identity.\n\n"
     "LABELS:\n"
-    "  • verified — high confidence this is the person's official profile; metadata "
-    "strongly matches; no contradictory evidence.\n"
-    "  • wrong — the candidate belongs to a different person, is a post/video rather "
-    "than a profile, is broken/redirected, or its metadata contradicts the "
-    "ground truth.\n"
-    "  • manual_review — evidence is mixed or partial, multiple people share the "
-    "identity, or confidence is insufficient to confirm or reject.\n\n"
+    "  • verified — use when the candidate's own content reasonably shows this is the "
+    "person/entity's official profile: the name PLUS at least one substantive identity "
+    "signal (occupation, domain/industry, or notable works) align, and NOTHING "
+    "contradicts it. You do NOT need every field confirmed — a clear, uncontradicted "
+    "identity match is enough, so do not withhold 'verified' merely because some "
+    "details are missing. (A declared-handle/URL match with NO such content signal is "
+    "still not enough on its own.)\n"
+    "  • wrong — the candidate belongs to a DIFFERENT person/entity (including a "
+    "same-name or same-handle namesake in a different field), is a post/video rather "
+    "than a profile, is broken/redirected, or its content contradicts the ground "
+    "truth. If the candidate's content points to a different domain than the ground "
+    "truth (e.g. an athlete/sports account for an actor, a different company for a "
+    "brand), label it wrong EVEN IF the handle matches a declared handle.\n"
+    "  • manual_review — use for GENUINE uncertainty only: the content is too thin to "
+    "tell who it is, several different people plausibly fit and you cannot distinguish "
+    "which, or there is partial conflicting evidence. Do NOT use manual_review for a "
+    "plausible, uncontradicted match a reasonable person would accept. A bare "
+    "handle/URL match with no corroborating content is manual_review (not verified).\n\n"
     "MINIMISE FALSE POSITIVES: when unsure, choose manual_review, not verified. A "
     "blank/uncertain result is better than a wrong confirmation.\n\n"
     "best_candidate: set it to the single MOST LIKELY official profile among the "
@@ -134,8 +181,12 @@ _SYSTEM_MSG = (
     "leave it empty when NONE of the candidates could plausibly be this person. "
     "Never invent URLs — it must be exactly one of the provided candidate URLs, or "
     "an empty string.\n\n"
-    "Confidence (0-100): 90-100 certain; 60-89 plausible but not certain; below 60 "
-    "unlikely/contradicted."
+    "Confidence (0-100): give 90-100 when the name and at least one substantive identity "
+    "signal (occupation/domain/works) align with no contradicting evidence — a clear, "
+    "uncontradicted match earns 90+ even if some details are missing; 60-89 when you are "
+    "genuinely torn between people or the evidence is too thin to tell; below 60 when "
+    "unlikely or contradicted. Only 90+ is accepted as Verified downstream — reserve it "
+    "for matches that are clear and uncontradicted, not merely a name/handle coincidence."
 )
 
 
@@ -159,9 +210,11 @@ def _flatten_candidate(i: int, cand: dict) -> dict:
         "serper_title": meta.get("serper_title", ""),
         "serper_snippet": meta.get("serper_snippet", ""),
         "knowledge_graph": meta.get("knowledge_graph", ""),
+        # True when Serper AND Apify independently returned this same link.
+        "cross_source_agreement": meta.get("found_by_serper_and_apify", ""),
     }
     # Fold in anything else observed (serper_results, dates, sitelinks, …).
-    handled = set(entry) | {"image"}
+    handled = set(entry) | {"image", "found_by_serper_and_apify"}
     extra = {k: v for k, v in meta.items() if k not in handled and v not in ("", None, [], {})}
     if extra:
         entry["other_metadata"] = extra
@@ -319,6 +372,15 @@ def verify_platform(
         reason = f"Model returned a URL not in the candidate set. {reason}".strip()
 
     status = status_from_decision(decision, confidence, bool(best))
+
+    # Name-only ground truth can't rule out a namesake — downgrade a Verified to
+    # Manual Review (better a human check than a confident wrong confirmation).
+    if status == STATUS_VERIFIED and _ground_truth_is_thin(wiki_meta):
+        status = STATUS_MANUAL
+        reason = (
+            "Ground-truth identity is too thin (name only) to safely confirm — "
+            "a namesake cannot be ruled out. " + (reason or "")
+        ).strip()
 
     result = VerificationResult(
         platform=platform,

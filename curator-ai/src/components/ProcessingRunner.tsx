@@ -4,6 +4,7 @@ import type { CSSProperties } from "react";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useToast } from "@/components/ToastProvider";
+import { ViewResultsLink } from "@/components/ViewResultsLink";
 import {
   getPythonApiUrl,
   markProcessingRunFinished,
@@ -516,14 +517,13 @@ export function ProcessingRunner() {
               )}
 
               {allDone && (
-                <Link
-                  href="/results"
+                <ViewResultsLink
                   className="proc-btn-glow mt-6 inline-flex items-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-bold text-slate-950 shadow-lg shadow-primary/30"
                 >
                   <span className="material-symbols-outlined text-lg">table_chart</span>
                   Open Results
                   <span className="material-symbols-outlined text-lg">arrow_forward</span>
-                </Link>
+                </ViewResultsLink>
               )}
             </div>
           </div>
@@ -584,13 +584,12 @@ export function ProcessingRunner() {
             </div>
             <div className="flex shrink-0 flex-col items-end gap-2">
               {allDone ? (
-                <Link
-                  href="/results"
+                <ViewResultsLink
                   className="proc-btn-glow inline-flex cursor-pointer items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-sm font-bold text-slate-950 shadow-lg shadow-primary/25"
                 >
                   View Results
                   <span className="material-symbols-outlined text-lg">table_chart</span>
-                </Link>
+                </ViewResultsLink>
               ) : (
                 <span className="inline-flex items-center gap-2 rounded-full border border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs font-semibold text-amber-200 shadow-lg shadow-amber-950/20">
                   <span className="material-symbols-outlined text-sm">hourglass_top</span>

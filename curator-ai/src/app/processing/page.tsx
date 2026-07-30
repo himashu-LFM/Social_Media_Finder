@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ProcessingRunner } from "@/components/ProcessingRunner";
+import { ViewResultsLink } from "@/components/ViewResultsLink";
 
 export const metadata: Metadata = {
   title: "Processing | ListenFirst",
@@ -35,8 +35,7 @@ export default function ProcessingPage() {
               <h1 className="text-lg font-bold text-slate-100">Processing</h1>
             </div>
           </div>
-          <Link
-            href="/results"
+          <ViewResultsLink
             className="proc-btn-glow group inline-flex cursor-pointer items-center gap-2 rounded-xl bg-slate-800/90 px-4 py-2.5 text-sm font-semibold text-slate-100 ring-1 ring-white/10"
           >
             <span className="material-symbols-outlined text-base text-primary transition-transform group-hover:scale-110">
@@ -46,7 +45,7 @@ export default function ProcessingPage() {
             <span className="material-symbols-outlined text-base opacity-60 transition-transform group-hover:translate-x-0.5">
               arrow_forward
             </span>
-          </Link>
+          </ViewResultsLink>
         </header>
 
         <div className="flex flex-1 flex-col">

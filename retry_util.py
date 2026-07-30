@@ -15,17 +15,27 @@ import time
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
 
 # Status codes worth retrying (transient / rate limit).
 _RETRY_STATUS = {429, 500, 502, 503, 504}
+
+# Shared pooled session so concurrent calls REUSE keep-alive connections instead
+# of opening a fresh TLS handshake each time. A burst of ~20 simultaneous new
+# handshakes is what triggered the SSL "UNEXPECTED_EOF" resets; pooling plus the
+# per-service concurrency caps (see serper_service / wikidata_lookup) prevents it.
+_SESSION = requests.Session()
+_adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
+_SESSION.mount("https://", _adapter)
+_SESSION.mount("http://", _adapter)
 
 
 def request_with_retry(
     method: str,
     url: str,
     *,
-    retries: int = 3,
-    backoff: float = 1.5,
+    retries: int = 4,
+    backoff: float = 2.0,
     timeout: float = 30,
     **kwargs: Any,
 ) -> requests.Response:
@@ -41,15 +51,16 @@ def request_with_retry(
 
     for attempt in range(retries + 1):
         try:
-            response = requests.request(method, url, timeout=timeout, **kwargs)
+            response = _SESSION.request(method, url, timeout=timeout, **kwargs)
             if response.status_code in _RETRY_STATUS and attempt < retries:
                 _sleep(response, attempt, backoff)
                 continue
             return response
         except (requests.Timeout, requests.ConnectionError) as exc:
+            # Includes SSLError / connection resets — retry with exponential backoff.
             last_exc = exc
             if attempt < retries:
-                time.sleep(backoff ** attempt)
+                time.sleep(min(backoff ** attempt, 30))
                 continue
             raise
 

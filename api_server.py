@@ -111,6 +111,25 @@ def _apply_platform_progress(
             completed.append(platform)
 
 
+def _persist_outputs(final_df: Any) -> tuple[str, Optional[str]]:
+    """Save the final workbook plus the companion Serper-only (Phase A) workbook.
+
+    Returns (final_output_path, serper_output_path). The Serper-only frame is
+    stashed on ``final_df.attrs['serper_df']`` by the pipeline.
+    """
+    out_path = testing.save_output(final_df, output_dir=ROOT)
+    serper_path: Optional[str] = None
+    serper_df = getattr(final_df, "attrs", {}).get("serper_df")
+    if serper_df is not None:
+        try:
+            serper_path = testing.save_output(
+                serper_df, output_dir=ROOT, filename_prefix="Talent_Social_Serper"
+            )
+        except Exception as exc:  # noqa: BLE001 — companion is best-effort
+            print(f"[api_server] Serper companion save failed: {exc}")
+    return out_path, serper_path
+
+
 def _run_job(job_id: str, names: List[str]) -> None:
     def row_status(row_index: int, status: str) -> None:
         with _jobs_lock:
@@ -136,13 +155,14 @@ def _run_job(job_id: str, names: List[str]) -> None:
             platform_progress=platform_progress,
         )
 
-        out_path = testing.save_output(final_df, output_dir=ROOT)
+        out_path, serper_path = _persist_outputs(final_df)
 
         with _jobs_lock:
             job = _jobs.get(job_id)
             if job:
                 job["status"] = "completed"
                 job["output_path"] = out_path
+                job["serper_output_path"] = serper_path
                 for entry in job["names"]:
                     entry["status"] = "done"
                     entry["current_platform"] = None
@@ -181,13 +201,14 @@ def _run_job_from_file(job_id: str, path: Path) -> None:
             platform_progress=platform_progress,
         )
 
-        out_path = testing.save_output(final_df, output_dir=ROOT)
+        out_path, serper_path = _persist_outputs(final_df)
 
         with _jobs_lock:
             job = _jobs.get(job_id)
             if job:
                 job["status"] = "completed"
                 job["output_path"] = out_path
+                job["serper_output_path"] = serper_path
                 for entry in job["names"]:
                     entry["status"] = "done"
                     entry["current_platform"] = None
@@ -327,19 +348,44 @@ def _cell_json(v: Any) -> Any:
     return str(v).strip()
 
 
-@app.get("/api/results/latest")
-def api_results_latest() -> dict[str, Any]:
+def _latest_serper_paths() -> List[Path]:
+    paths = sorted(
+        ROOT.glob("Talent_Social_Serper_*.xlsx"),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    return [p for p in paths if not p.name.startswith(".~")]
+
+
+def _resolve_result_paths(job_id: Optional[str], output_key: str, fallback):
     """
-    Read the newest Talent_Social_Lookup_*.xlsx as JSON (retries + older files if locked).
-    Next.js Results page calls this when NEXT_PUBLIC_PYTHON_API_URL is set.
+    Decide which workbook(s) to read.
+
+    If ``job_id`` is given, serve THAT job's specific output (so viewing results
+    right after a new upload can never show a previous run's file). Returns
+    ``(paths, pending)`` — ``pending`` is True when the job exists but its output
+    isn't written yet (so the UI shows "processing", not stale data). With no
+    ``job_id`` (or an unknown one), fall back to the newest file on disk.
     """
-    paths = _latest_lookup_paths()
+    if job_id:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            path_str = job.get(output_key) if job else None
+        if path_str:
+            p = Path(path_str)
+            return ([p] if p.is_file() else []), False
+        if job is not None:
+            return [], True  # job exists but this output isn't ready yet
+    return fallback(), False
+
+
+def _read_rows_response(paths: List[Path]) -> dict[str, Any]:
+    """Read the first readable workbook in ``paths`` to JSON rows (with retries)."""
     if not paths:
         return {"rows": [], "filename": None, "warning": None, "error": None}
 
     skipped: List[str] = []
     last_err: Optional[str] = None
-
     for p in paths:
         for _attempt in range(8):
             try:
@@ -353,12 +399,7 @@ def api_results_latest() -> dict[str, Any]:
                     if skipped
                     else None
                 )
-                return {
-                    "rows": records,
-                    "filename": p.name,
-                    "warning": warning,
-                    "error": None,
-                }
+                return {"rows": records, "filename": p.name, "warning": warning, "error": None}
             except Exception as exc:
                 last_err = str(exc)
                 time.sleep(0.35)
@@ -370,6 +411,30 @@ def api_results_latest() -> dict[str, Any]:
         "warning": None,
         "error": last_err or "Could not read any workbook.",
     }
+
+
+@app.get("/api/results/latest")
+def api_results_latest(job_id: Optional[str] = None) -> dict[str, Any]:
+    """
+    Final results as JSON. When ``job_id`` is supplied, serves that job's own
+    output (never an older run); otherwise the newest Talent_Social_Lookup_*.xlsx.
+    """
+    paths, pending = _resolve_result_paths(job_id, "output_path", _latest_lookup_paths)
+    if pending:
+        return {"rows": [], "filename": None, "warning": None, "error": None, "pending": True}
+    return _read_rows_response(paths)
+
+
+@app.get("/api/results/serper/latest")
+def api_results_serper_latest(job_id: Optional[str] = None) -> dict[str, Any]:
+    """
+    Serper-only (Phase A) results — what Serper + LLM produced BEFORE the Apify
+    backup / cross-platform corroboration. Same schema as /api/results/latest.
+    """
+    paths, pending = _resolve_result_paths(job_id, "serper_output_path", _latest_serper_paths)
+    if pending:
+        return {"rows": [], "filename": None, "warning": None, "error": None, "pending": True}
+    return _read_rows_response(paths)
 
 
 @app.get("/api/export/latest")

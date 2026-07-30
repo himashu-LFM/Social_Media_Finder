@@ -2,15 +2,20 @@
 verification_pipeline.py  —  Talent social-profile verification orchestrator
 =============================================================================
 
-Workflow per talent:
+Workflow per talent (Serper-primary, Apify-backup):
 
-    Excel row (Talent Name + Wikipedia URL + any extra metadata)
+    Excel row (Talent Name + optional Wikipedia URL + any extra metadata)
       1. Wikipedia/Wikidata -> rich ground-truth profile   (wikipedia_service)
-      2. Apify              -> candidate links (IG/FB/YT/TikTok)  (apify_service)
-      3a. Serper (Part A)   -> context for each Apify link   (serper_service)
-      3b. Serper (Part B)   -> backup discovery for missing / not-Verified
-      4. LLM                -> Verified / Wrong / Manual Review Needed
+      2. Serper (PRIMARY)   -> "<name> site:<domain>" search, TOP profile /
+                               YouTube-channel result per platform, with snippet
+      3. LLM                -> Verified / Wrong / Manual Review / Not Found
                                with confidence + reason        (verification_service)
+      4. Apify (BACKUP)     -> only for platforms that came back Wrong / Not Found
+                               / Manual Review. For Manual Review, if Apify returns
+                               the SAME url as Serper -> Verified (cross-source
+                               agreement); otherwise the Apify link is Serper-
+                               searched for context and re-verified by the LLM.
+                               The better of the two results is kept.
       5. results written to the row                            (excel_service schema)
 
 Exposes the interface the FastAPI layer consumes:
@@ -19,11 +24,12 @@ Exposes the interface the FastAPI layer consumes:
     run_pipeline_on_dataframe, save_output
 
 Design notes:
-  • Rows processed sequentially (exact per-row progress); the five platforms
-    within a row are resolved concurrently.
-  • Serper is used for BOTH context extraction (every Apify link) and backup
-    discovery (missing or not-Verified platforms). Backup discovery + a second
-    verification runs whenever the Apify result isn't Verified.
+  • Serper is the PRIMARY link source (one "site:" search per platform); Apify is
+    the BACKUP, batched across ONLY the talents that had a non-Verified platform,
+    so it scales to hundreds of rows without a per-row actor run.
+  • Two global phases keep Apify batched: Phase A verifies every row's Serper
+    links concurrently; Phase B runs one batched Apify pass for the failing
+    talents, then re-verifies just their failing platforms.
   • Per-talent and per-platform failures are isolated — the run always continues.
 """
 
@@ -32,6 +38,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import pandas as pd
 
@@ -54,7 +61,8 @@ from verification_service import (
 PLATFORMS: Dict[str, List[str]] = social_urls.PLATFORMS
 SERPER_API_KEY = serper_service.SERPER_API_KEY
 
-# Only a Verified result skips Serper backup discovery; anything else backtracks.
+# A Verified platform is final; anything else (Wrong / Manual / Not Found) is
+# eligible for the Apify backup pass.
 _GOOD_STATUSES = {STATUS_VERIFIED}
 
 # Ordering used to keep the better of two verification results.
@@ -102,48 +110,46 @@ def _add_candidate(candidates: List[dict], seen: set, platform: str, url: str,
     candidates.append({"url": norm, "source": source, "meta": dict(meta or {})})
 
 
-def _apify_candidates(
-    platform: str,
-    wiki_meta: wikipedia_service.WikiMetadata,
-    apify_candidates: Dict[str, List[dict]],
-) -> tuple[List[dict], set]:
-    """Wikidata-declared + Apify-discovered candidates (most trusted first)."""
+def _serper_primary_candidate(talent: str, platform: str) -> tuple[List[dict], bool]:
+    """
+    PRIMARY discovery: a Serper "<name> site:<platform-domain>" search, returning
+    the TOP valid profile (or YouTube channel) result only — with its snippet.
+
+    Returns ``(candidates, errored)``: ``errored`` is True when Serper itself
+    failed (quota/auth/connection) so the caller can distinguish a genuine
+    "no profile" from a failed search.
+    """
+    try:
+        return serper_service.discover_by_site(talent, platform, top_n=1), False
+    except RuntimeError as exc:
+        print(f"  [PIPELINE] Serper site-search unavailable for {platform}/{talent}: {exc}")
+        return [], True
+
+
+def _apify_only_candidates(
+    platform: str, apify_candidates: Dict[str, List[dict]],
+) -> List[dict]:
+    """BACKUP source: Apify-discovered candidates for one platform (validated)."""
     candidates: List[dict] = []
     seen: set = set()
-    wikidata_url = wiki_meta.social_links.get(platform, "")
-    if wikidata_url:
-        _add_candidate(candidates, seen, platform, wikidata_url, "wikidata",
-                       {"declared_on_wikidata": True})
     for cand in apify_candidates.get(platform, []):
         _add_candidate(candidates, seen, platform, cand.get("url", ""),
                        cand.get("source", "apify"), cand.get("meta"))
-    return candidates, seen
-
-
-def _add_serper_candidates(
-    talent: str, platform: str, identifiers: str, candidates: List[dict], seen: set,
-) -> None:
-    """Part B — append Serper backup-discovery candidates (in place)."""
-    try:
-        for cand in serper_service.discover_candidates(talent, platform, identifiers, top_n=3):
-            _add_candidate(candidates, seen, platform, cand.get("url", ""),
-                           "serper", cand.get("meta"))
-    except RuntimeError as exc:
-        # Fatal Serper error (quota/auth): skip, keep whatever we have.
-        print(f"  [PIPELINE] Serper unavailable for {platform}/{talent}: {exc}")
+    return candidates
 
 
 def _enrich_candidates(candidates: List[dict], platform: str) -> None:
     """
     Attach evidence to each candidate before verification:
-      • Serper context (Part A) for links that didn't come from a Serper search
-      • fetched public profile metadata (OG tags) as a supplement
+      • Serper context (search the link -> title/snippet) for links that did NOT
+        already come from a Serper search (i.e. Apify links)
+      • fetched public profile metadata (OG tags) as a supplement (FB/YouTube)
     Both merge into candidate['meta']; already-enriched candidates are skipped.
     """
     for cand in candidates:
         if cand.get("_enriched"):
             continue
-        # Part A: Serper context for existing (Apify/Wikidata) links.
+        # Serper context for links that didn't come from a Serper search (Apify).
         if cand.get("source") != "serper":
             try:
                 ctx = serper_service.context_for_url(cand.get("url", ""))
@@ -177,139 +183,226 @@ def _score(result: VerificationResult) -> tuple:
     return (_STATUS_RANK.get(result.status, 0), result.confidence)
 
 
-def _resolve_platform(
-    talent: str,
-    platform: str,
-    identifiers: str,
-    wiki_meta: wikipedia_service.WikiMetadata,
-    apify_candidates: Dict[str, List[dict]],
+# ────────────────────────────────────────────────────────────────────────────
+#  Per-platform resolution: Serper primary (Phase 1) + Apify backup (Phase 2)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _resolve_platform_serper(
+    talent: str, platform: str, wiki_meta: wikipedia_service.WikiMetadata,
 ) -> VerificationResult:
-    """
-    Resolve one platform:
-      Phase 1 — verify Wikidata/Apify candidates (with Serper context) if any.
-      Phase 2 — if not Verified (or no Apify link), run Serper backup discovery
-                and re-verify the combined set; keep whichever scores higher.
-    """
-    candidates, seen = _apify_candidates(platform, wiki_meta, apify_candidates)
-    result = _verify(platform, wiki_meta, candidates) if candidates else None
-
-    if result is None or result.status not in _GOOD_STATUSES:
-        before = len(candidates)
-        _add_serper_candidates(talent, platform, identifiers, candidates, seen)
-        if len(candidates) > before:
-            reason = "no Apify candidate" if before == 0 else f"'{result.status}' from Apify"
-            print(f"  [BACKTRACK] {platform} | {talent} -> Serper ({reason})")
-            serper_result = _verify(platform, wiki_meta, candidates)
-            if result is None or _score(serper_result) >= _score(result):
-                result = serper_result
-
-    if result is None:
-        result = VerificationResult(platform=platform, status=STATUS_NOT_FOUND,
-                                    reason="No candidate links found.")
-    return result
-
-
-def _resolve_platform_no_wiki(
-    talent: str,
-    platform: str,
-    wiki_meta: wikipedia_service.WikiMetadata,
-    apify_candidates: Dict[str, List[dict]],
-) -> VerificationResult:
-    """
-    Simplified resolution for rows with NO Wikipedia link in the input file.
-
-      • If Apify returned a link for this platform -> run a Serper search of that
-        link (context extraction) and hand that SINGLE enriched candidate to the
-        LLM for verification.
-      • Otherwise -> a Serper "<name> site:<platform-domain>" search, take the
-        TOP result only, and hand that single candidate to the LLM.
-
-    No Wikidata-declared candidate, no multi-candidate discovery, no backtracking
-    — exactly one candidate per platform is verified.
-    """
-    candidate: Optional[dict] = None
-
-    # 1) Prefer the Apify link for this platform, enriched with a Serper search.
-    working: List[dict] = []
-    seen: set = set()
-    for cand in apify_candidates.get(platform, []):
-        _add_candidate(working, seen, platform, cand.get("url", ""),
-                       cand.get("source", "apify"), cand.get("meta"))
-        if working:
-            break
-    if working:
-        candidate = working[0]
-        try:
-            ctx = serper_service.context_for_url(candidate["url"])
-        except RuntimeError as exc:
-            print(f"  [NO-WIKI] Serper context unavailable: {exc}")
-            ctx = {}
-        if ctx:
-            merged = dict(ctx)
-            merged.update({k: v for k, v in candidate["meta"].items() if v not in ("", None)})
-            candidate["meta"] = merged
-
-    # 2) No Apify link -> "<name> site:<domain>" search, top result only.
-    if candidate is None:
-        try:
-            top = serper_service.discover_by_site(talent, platform, top_n=1)
-        except RuntimeError as exc:
-            print(f"  [NO-WIKI] Serper site-search unavailable for {platform}/{talent}: {exc}")
-            top = []
-        candidate = top[0] if top else None
-
-    if candidate is None:
-        return VerificationResult(
-            platform=platform, status=STATUS_NOT_FOUND,
-            reason="No candidate link from Apify or Serper site-search.",
+    """Phase 1 — verify the Serper top-result candidate (primary discovery)."""
+    candidates, errored = _serper_primary_candidate(talent, platform)
+    if not candidates:
+        reason = (
+            "Serper search errored (connection/rate limit) — result unconfirmed, "
+            "not a definite absence; Apify backup will be tried."
+            if errored else "No profile found via Serper search."
         )
+        return VerificationResult(platform=platform, status=STATUS_NOT_FOUND, reason=reason)
+    return _verify(platform, wiki_meta, candidates)
 
-    return verification_service.verify_platform(
-        platform, wiki_meta.to_prompt_dict(), [candidate], is_person=wiki_meta.is_person
+
+def _apify_backup_platform(
+    talent: str,
+    platform: str,
+    wiki_meta: wikipedia_service.WikiMetadata,
+    phase1: VerificationResult,
+    apify_candidates: Dict[str, List[dict]],
+) -> VerificationResult:
+    """
+    Phase 2 (BACKUP) — runs only when Serper's result was NOT Verified.
+
+    Verifies the Apify candidate(s) via the same sub-pipeline (Serper-search the
+    link for its snippet -> hand it to the LLM against the ground truth) and keeps
+    whichever of {Serper result, Apify result} scores higher. Every verdict is the
+    LLM's — no result is hardcoded (a candidate is never auto-Verified just because
+    Serper and Apify happened to return the same link; the LLM still decides).
+    """
+    apify_cands = _apify_only_candidates(platform, apify_candidates)
+    if not apify_cands:
+        return phase1  # no Apify link to fall back on — keep Serper's result
+
+    # Cross-source agreement is EVIDENCE, not a verdict: if Apify independently
+    # returned the SAME link Serper already surfaced, flag it so the LLM can weigh
+    # the agreement (it raises confidence the link is genuine) — but the LLM still
+    # decides whether it's actually this person against the ground truth.
+    serper_url = phase1.best_candidate
+    if serper_url:
+        for cand in apify_cands:
+            if cand["url"] == serper_url:
+                cand["meta"]["found_by_serper_and_apify"] = True
+                print(f"  [AGREE] {platform} | {talent} -> Serper & Apify returned the same link")
+
+    print(f"  [BACKUP] {platform} | {talent} -> Apify ('{phase1.status}' from Serper)")
+    apify_result = _verify(platform, wiki_meta, apify_cands)
+    # Keep the better of the two LLM verdicts.
+    return apify_result if _score(apify_result) >= _score(phase1) else phase1
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Per-row phases
+# ────────────────────────────────────────────────────────────────────────────
+
+def _row_serper_phase(
+    talent: str,
+    wiki_meta: wikipedia_service.WikiMetadata,
+    platform_progress: Optional[Callable[[str, str], None]] = None,
+) -> Dict[str, VerificationResult]:
+    """Phase 1 for one row: Serper-primary verify across all platforms (concurrent)."""
+    def _task(platform: str) -> tuple:
+        if platform_progress:
+            platform_progress(platform, "start")
+        try:
+            result = _resolve_platform_serper(talent, platform, wiki_meta)
+        except Exception as exc:  # noqa: BLE001 — isolate platform failures
+            print(f"  [PIPELINE] {platform} Serper phase error for '{talent}': {exc}")
+            result = VerificationResult(
+                platform=platform, status=STATUS_MANUAL, confidence=0,
+                reason="Verification error; manual review required.",
+            )
+        finally:
+            if platform_progress:
+                platform_progress(platform, "done")
+        return platform, result
+
+    results: Dict[str, VerificationResult] = {}
+    workers = min(_MAX_PLATFORM_WORKERS, len(PLATFORMS))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for platform, result in executor.map(_task, list(PLATFORMS)):
+            results[platform] = result
+    return results
+
+
+def _row_apify_phase(
+    talent: str,
+    wiki_meta: wikipedia_service.WikiMetadata,
+    phase1: Dict[str, VerificationResult],
+    apify_candidates: Dict[str, List[dict]],
+) -> Dict[str, VerificationResult]:
+    """Phase 2 for one row: Apify backup for the platforms Serper didn't Verify."""
+    final = dict(phase1)
+    failing = [p for p, r in phase1.items() if r.status not in _GOOD_STATUSES]
+    if not failing:
+        return final
+
+    def _task(platform: str) -> tuple:
+        try:
+            result = _apify_backup_platform(
+                talent, platform, wiki_meta, phase1[platform], apify_candidates or {}
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [PIPELINE] {platform} Apify backup error for '{talent}': {exc}")
+            result = phase1[platform]
+        return platform, result
+
+    workers = min(_MAX_PLATFORM_WORKERS, len(failing))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        for platform, result in executor.map(_task, failing):
+            final[platform] = result
+    return final
+
+
+def _handle_from_url(url: str) -> str:
+    """Best-effort username/handle from a normalized profile URL, lowercased."""
+    if not url:
+        return ""
+    try:
+        path = urlparse(url).path.strip("/")
+    except Exception:  # noqa: BLE001
+        return ""
+    if not path:
+        return ""
+    # Strip YouTube path prefixes so channel/user/c handles compare cleanly.
+    for prefix in ("channel/", "user/", "c/"):
+        if path.lower().startswith(prefix):
+            path = path[len(prefix):]
+            break
+    return path.split("/")[0].lstrip("@").lower()
+
+
+def _corroborate_row(
+    talent: str,
+    wiki_meta: wikipedia_service.WikiMetadata,
+    results: Dict[str, VerificationResult],
+) -> Dict[str, VerificationResult]:
+    """
+    Cross-platform corroboration. Handles CONFIRMED (Verified) on strong platforms
+    this run are passed to the LLM as an extra evidence field when RE-checking the
+    platforms that only reached Manual Review — a handle already confirmed
+    elsewhere is strong support. The LLM still decides; we keep the better verdict.
+    Only runs when there's at least one Verified handle AND a Manual-Review platform.
+    """
+    verified_handles: Dict[str, str] = {}
+    for platform, result in results.items():
+        if result.status == STATUS_VERIFIED and result.best_candidate:
+            handle = _handle_from_url(result.best_candidate)
+            if handle:
+                verified_handles[platform] = handle
+
+    rescue = [p for p, r in results.items() if r.status == STATUS_MANUAL and r.best_candidate]
+    if not verified_handles or not rescue:
+        return results
+
+    # Ground truth + the cross-platform confirmed handles as an extra hint field.
+    gt = dict(wiki_meta.to_prompt_dict())
+    gt["verified_handles_on_other_platforms"] = verified_handles
+
+    final = dict(results)
+
+    def _task(platform: str) -> tuple:
+        cand = {"url": results[platform].best_candidate, "source": "apify", "meta": {}}
+        try:
+            _enrich_candidates([cand], platform)  # re-fetch snippet/kg/counts for the link
+            res = verification_service.verify_platform(
+                platform, gt, [cand], is_person=wiki_meta.is_person
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [CORROBORATE] {platform} | {talent} error: {exc.__class__.__name__}")
+            return platform, results[platform]
+        if _score(res) >= _score(results[platform]):
+            print(f"  [CORROBORATE] {platform} | {talent}: {results[platform].status} -> {res.status}")
+            return platform, res
+        return platform, results[platform]
+
+    with ThreadPoolExecutor(max_workers=min(_MAX_PLATFORM_WORKERS, len(rescue))) as executor:
+        for platform, result in executor.map(_task, rescue):
+            final[platform] = result
+    return final
+
+
+def _assemble_row_out(results: Dict[str, VerificationResult]) -> Dict[str, Any]:
+    """Turn per-platform results into the row's {column -> value} dict."""
+    out: Dict[str, Any] = {}
+    usable_confidences: List[int] = []
+    for platform in PLATFORMS:
+        result = results.get(platform) or VerificationResult(
+            platform=platform, status=STATUS_NOT_FOUND
+        )
+        has_link = bool(result.best_candidate)
+        out[excel_service.link_col(platform)] = result.best_candidate
+        out[excel_service.status_col(platform)] = result.status
+        out[excel_service.conf_col(platform)] = result.confidence if has_link else ""
+        out[excel_service.reason_col(platform)] = result.reason
+        if has_link and result.status in _USABLE_STATUSES:
+            usable_confidences.append(result.confidence)
+    out[excel_service.OVERALL_CONF_COL] = (
+        round(sum(usable_confidences) / len(usable_confidences)) if usable_confidences else ""
     )
+    return out
 
 
-def _build_identifiers(wiki_meta: wikipedia_service.WikiMetadata) -> str:
-    """Short distinguishing-facts string for Serper backup-discovery queries."""
-    attrs = wiki_meta.attributes or {}
-    parts: List[str] = []
-
-    def add_attr(*keys: str) -> None:
-        for key in keys:
-            value = attrs.get(key)
-            if isinstance(value, list) and value:
-                parts.append(str(value[0]))
-            elif isinstance(value, str) and value:
-                parts.append(value)
-
-    if wiki_meta.is_person:
-        # Person (talent) — unchanged behaviour.
-        if wiki_meta.professions:
-            parts.append(wiki_meta.professions[0])
-        add_attr("sports", "teams", "genres")
-        if wiki_meta.nationalities:
-            parts.append(wiki_meta.nationalities[0])
-    else:
-        # Works boost (films / TV shows / video games): these fields are present
-        # only for those entities, so brands / networks / franchises / universities
-        # fall straight through to the generic org signals below unchanged.
-        add_attr("series", "director", "network", "developers", "publishers")
-        # Organization / brand / TV network / franchise — generic org facts.
-        add_attr("industry", "genres")
-        if wiki_meta.known_works:
-            parts.append(wiki_meta.known_works[0])
-        add_attr("member_of", "employers")
-        if wiki_meta.nationalities:
-            parts.append(wiki_meta.nationalities[0])
-
-    out: List[str] = []
-    seen: set = set()
-    for part in parts:
-        key = part.lower()
-        if part and key not in seen:
-            seen.add(key)
-            out.append(part)
-    return " ".join(out[:4])
+def _ground_truth(talent: str, wiki_url: str, input_metadata: dict) -> wikipedia_service.WikiMetadata:
+    """Step 1 — rich Wikipedia/Wikidata ground-truth profile (unchanged)."""
+    try:
+        return wikipedia_service.fetch_wiki_metadata(
+            talent, wiki_url, input_metadata=input_metadata
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [PIPELINE] Wikipedia metadata failed for '{talent}': {exc}")
+        return wikipedia_service.WikiMetadata(
+            talent=talent, wikipedia_url=wiki_url, name=talent,
+            input_metadata=input_metadata,
+        )
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -324,79 +417,35 @@ def _resolve_row_result(
     platform_progress: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Run the full verification workflow for ONE talent and return a dict of
-    {column -> value}. Pure compute (no DataFrame writes), so it is safe to run
-    in a worker thread; the caller writes the returned dict into the frame.
+    Run the full verification workflow for ONE talent (both phases) and return a
+    dict of {column -> value}. Pure compute (no DataFrame writes).
 
-    ``apify_candidates`` is the pre-fetched batch slice for this talent; if None,
-    a per-talent Apify lookup is done (used by the single-row path).
+    ``apify_candidates`` is the pre-fetched Apify slice for this talent; if None,
+    a per-talent Apify lookup is done ONLY when Serper leaves a platform
+    non-Verified (used by the single-row / CLI path).
     """
-    # Step 1: rich Wikipedia/Wikidata ground-truth profile (no full page to LLM).
-    try:
-        wiki_meta = wikipedia_service.fetch_wiki_metadata(
-            talent, wiki_url, input_metadata=input_metadata
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [PIPELINE] Wikipedia metadata failed for '{talent}': {exc}")
-        wiki_meta = wikipedia_service.WikiMetadata(
-            talent=talent, wikipedia_url=wiki_url, name=talent,
-            input_metadata=input_metadata,
-        )
+    wiki_meta = _ground_truth(talent, wiki_url, input_metadata)
 
-    identifiers = _build_identifiers(wiki_meta)
+    # Phase 1 — Serper-primary discovery + verification.
+    phase1 = _row_serper_phase(talent, wiki_meta, platform_progress)
 
-    # Rows with no Wikipedia link in the Excel take the simplified discovery path
-    # (Apify link -> Serper context, else "<name> site:domain" top result -> LLM).
-    has_wiki_link = bool((wiki_url or "").strip())
+    # Phase 2 — Apify backup, only if some platform isn't Verified.
+    failing = [p for p, r in phase1.items() if r.status not in _GOOD_STATUSES]
+    if failing:
+        if apify_candidates is None:
+            try:
+                apify_candidates = apify_service.find_social_links(talent, wiki_meta.official_website)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [PIPELINE] Apify lookup failed for '{talent}': {exc}")
+                apify_candidates = {}
+        final = _row_apify_phase(talent, wiki_meta, phase1, apify_candidates)
+    else:
+        final = phase1
 
-    if apify_candidates is None:
-        try:
-            apify_candidates = apify_service.find_social_links(talent, wiki_meta.official_website)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [PIPELINE] Apify lookup failed for '{talent}': {exc}")
-            apify_candidates = {}
-
-    # Steps 3-4: per-platform context + verification (concurrent across platforms).
-    def _task(platform: str) -> VerificationResult:
-        if platform_progress:
-            platform_progress(platform, "start")
-        try:
-            if has_wiki_link:
-                result = _resolve_platform(talent, platform, identifiers, wiki_meta, apify_candidates)
-            else:
-                result = _resolve_platform_no_wiki(talent, platform, wiki_meta, apify_candidates)
-        except Exception as exc:  # noqa: BLE001 — isolate platform failures
-            print(f"  [PIPELINE] {platform} verification error for '{talent}': {exc}")
-            result = VerificationResult(
-                platform=platform, status=STATUS_MANUAL, confidence=0,
-                reason="Verification error; manual review required.",
-            )
-        finally:
-            if platform_progress:
-                platform_progress(platform, "done")
-        return result
-
-    results: List[VerificationResult] = []
-    workers = min(_MAX_PLATFORM_WORKERS, len(PLATFORMS))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for result in executor.map(_task, list(PLATFORMS)):
-            results.append(result)
-
-    # Assemble the row's column values + overall confidence.
-    out: Dict[str, Any] = {}
-    usable_confidences: List[int] = []
-    for result in results:
-        has_link = bool(result.best_candidate)
-        out[excel_service.link_col(result.platform)] = result.best_candidate
-        out[excel_service.status_col(result.platform)] = result.status
-        out[excel_service.conf_col(result.platform)] = result.confidence if has_link else ""
-        out[excel_service.reason_col(result.platform)] = result.reason
-        if has_link and result.status in _USABLE_STATUSES:
-            usable_confidences.append(result.confidence)
-    out[excel_service.OVERALL_CONF_COL] = (
-        round(sum(usable_confidences) / len(usable_confidences)) if usable_confidences else ""
-    )
-    return out
+    # Cross-platform corroboration: rescue Manual Reviews using handles confirmed
+    # (Verified) on other platforms this run.
+    final = _corroborate_row(talent, wiki_meta, final)
+    return _assemble_row_out(final)
 
 
 def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
@@ -433,13 +482,17 @@ def run_pipeline_on_dataframe(
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
 ) -> pd.DataFrame:
     """
-    Process every row and return the populated frame.
+    Process every row and return the populated frame — Serper primary, Apify backup.
 
-    Rows run concurrently (up to PIPELINE_ROW_WORKERS at once); Apify discovery
-    is batched once for all names up front. Each worker only computes results —
-    the DataFrame is written on the main thread as futures complete, so there
-    are no concurrent pandas writes. ``row_status(row_index, status)`` reports
-    per-row lifecycle ("processing"/"done").
+    Two global phases keep the run scalable to hundreds of rows:
+      Phase A — every row's Serper-primary discovery + verification, concurrently
+                (up to PIPELINE_ROW_WORKERS rows at once; platforms concurrent).
+      Phase B — ONE batched Apify pass for only the talents that had a
+                non-Verified platform, then re-verify just those platforms.
+
+    Workers only compute; the DataFrame is written on the main thread as Phase B
+    futures complete, so there are no concurrent pandas writes.
+    ``row_status(row_index, status)`` reports per-row lifecycle ("processing"/"done").
     """
     df = df.copy()
     for col in excel_service.ordered_columns():
@@ -460,16 +513,10 @@ def run_pipeline_on_dataframe(
 
     total = len(rows)
     print(f"[PIPELINE] Verification run started for {total} talent row(s) "
-          f"(row workers={PIPELINE_ROW_WORKERS}).")
+          f"(Serper primary, Apify backup; row workers={PIPELINE_ROW_WORKERS}).")
 
-    # Step 2 (batched): one Apify pass for ALL names, grouped per talent.
-    try:
-        apify_map = apify_service.find_social_links_batch([r[2] for r in rows])
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [PIPELINE] Batched Apify failed: {exc}")
-        apify_map = {}
-
-    def _row_task(entry: tuple) -> tuple:
+    # ── Phase A: Serper-primary discovery + verification for every row ──
+    def _phase_a(entry: tuple) -> dict:
         idx, row_label, talent, wiki_url, input_metadata = entry
         if row_status:
             row_status(idx, "processing")
@@ -478,29 +525,71 @@ def run_pipeline_on_dataframe(
             if platform_progress:
                 platform_progress(idx, platform, phase)
 
+        wiki_meta = _ground_truth(talent, wiki_url, input_metadata)
         try:
-            result = _resolve_row_result(
-                talent, wiki_url, input_metadata,
-                apify_candidates=apify_map.get(talent, {}),
-                platform_progress=_pp,
-            )
+            phase1 = _row_serper_phase(talent, wiki_meta, _pp)
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
-            print(f"  [PIPELINE] Row failed for '{talent}': {exc}")
-            result = {}
-        return row_label, idx, result
+            print(f"  [PIPELINE] Serper phase failed for '{talent}': {exc}")
+            phase1 = {
+                p: VerificationResult(platform=p, status=STATUS_MANUAL, confidence=0,
+                                      reason="Verification error; manual review required.")
+                for p in PLATFORMS
+            }
+        return {"idx": idx, "row_label": row_label, "talent": talent,
+                "wiki_meta": wiki_meta, "phase1": phase1}
 
     workers = max(1, min(PIPELINE_ROW_WORKERS, total or 1))
+    phase_a: List[dict] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for res in pool.map(_phase_a, rows):
+            phase_a.append(res)
+
+    # ── One batched Apify pass for ONLY the talents with a non-Verified platform ──
+    failing_talents = sorted({
+        r["talent"] for r in phase_a
+        if any(v.status not in _GOOD_STATUSES for v in r["phase1"].values())
+    })
+    print(f"[PIPELINE] Phase B (Apify backup): {len(failing_talents)} of {total} "
+          f"talent(s) have a non-Verified platform.")
+    try:
+        apify_map = apify_service.find_social_links_batch(failing_talents) if failing_talents else {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [PIPELINE] Batched Apify backup failed: {exc}")
+        apify_map = {}
+
+    # ── Phase B: Apify backup + assemble + write ──
+    def _phase_b(r: dict) -> tuple:
+        try:
+            final = _row_apify_phase(
+                r["talent"], r["wiki_meta"], r["phase1"], apify_map.get(r["talent"], {})
+            )
+            final = _corroborate_row(r["talent"], r["wiki_meta"], final)
+            out = _assemble_row_out(final)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [PIPELINE] Apify phase failed for '{r['talent']}': {exc}")
+            out = _assemble_row_out(r["phase1"])
+        return r["row_label"], r["idx"], out
+
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_row_task, entry) for entry in rows]
+        futures = [pool.submit(_phase_b, r) for r in phase_a]
         for future in as_completed(futures):
-            row_label, idx, result = future.result()
-            for col, val in result.items():  # main-thread write — no races
+            row_label, idx, out = future.result()
+            for col, val in out.items():  # main-thread write — no races
                 df.at[row_label, col] = val
             if row_status:
                 row_status(idx, "done")
             done += 1
             print(f"  [{done}/{total}] complete")
+
+    # Companion "Serper-only" view: the Phase A (Serper + LLM) results BEFORE any
+    # Apify backup or cross-platform corroboration, so the UI can show what Serper
+    # alone produced. Stashed on the frame so the caller can save it separately.
+    serper_df = df.copy()
+    for r in phase_a:
+        for col, val in _assemble_row_out(r["phase1"]).items():
+            serper_df.at[r["row_label"], col] = val
+    df.attrs["serper_df"] = serper_df
 
     return df
 

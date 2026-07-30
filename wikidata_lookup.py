@@ -32,7 +32,9 @@ Usage in testing.py:
     # Merge into resolved_links before running Serper
 """
 
+import os
 import re
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
@@ -40,16 +42,27 @@ from urllib.parse import urlparse, urljoin
 import requests
 
 # ── HTTP session with sensible headers ──────────────────────────────────────
+# Wikimedia asks bots to identify with a real contact; set WIKI_USER_AGENT in the
+# environment to your own. A descriptive/contactable UA is throttled less.
+_DEFAULT_UA = (
+    "SocialMediaFinder/1.0 (talent social-profile verification tool; "
+    "+https://github.com/) python-requests"
+)
 _SESSION = requests.Session()
 _SESSION.headers.update({
-    "User-Agent": (
-        "SocialMediaFinder/1.0 (talent research tool; "
-        "contact: research@example.com) python-requests/2.31"
-    ),
+    "User-Agent": os.environ.get("WIKI_USER_AGENT", "").strip() or _DEFAULT_UA,
     "Accept": "application/json, text/html, */*",
     "Accept-Language": "en-US,en;q=0.9",
 })
 TIMEOUT = 15  # seconds per request
+
+# Cap concurrent Wikipedia/Wikidata calls. Each row makes several (QID lookup,
+# entity fetch, label resolution, REST summary); 4 concurrent rows produced a
+# burst that Wikimedia rate-limited with HTTP 429. This bounds live calls so the
+# per-request retry/backoff below can actually succeed.
+_WIKI_MAX_CONCURRENCY = max(1, int(os.environ.get("WIKI_MAX_CONCURRENCY", "3")))
+_WIKI_SEM = threading.BoundedSemaphore(_WIKI_MAX_CONCURRENCY)
+_WIKI_RETRY_STATUS = {429, 500, 502, 503, 504}
 
 # ── Wikidata social property map ─────────────────────────────────────────────
 # property_id → (our_platform_key, url_template)
@@ -59,7 +72,6 @@ WIKIDATA_SOCIAL_PROPS: Dict[str, Tuple[str, str]] = {
     "P2397": ("YouTube",    "https://www.youtube.com/channel/{}"),
     "P7085": ("TikTok",     "https://www.tiktok.com/@{}"),
     "P2013": ("Facebook",   "https://www.facebook.com/{}"),
-    "P2397": ("YouTube",    "https://www.youtube.com/channel/{}"),
     "P4033": ("Mastodon",   "{}"),           # not a target platform but useful for cross-ref
     "P856":  ("_website",   "{}"),           # official website — used for Step 2
     "P18":   ("_image",     "{}"),           # image — skip
@@ -110,17 +122,54 @@ _IGNORE_HANDLES = frozenset({
 #  HELPER: safe HTTP GET
 # ────────────────────────────────────────────────────────────────────────────
 
-def _get(url: str, params: Optional[dict] = None, timeout: int = TIMEOUT) -> Optional[requests.Response]:
-    try:
-        resp = _SESSION.get(url, params=params, timeout=timeout, allow_redirects=True)
-        resp.raise_for_status()
+def _get(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: int = TIMEOUT,
+    retries: int = 4,
+    backoff: float = 2.0,
+) -> Optional[requests.Response]:
+    """
+    Rate-limit-aware GET for Wikipedia/Wikidata.
+
+    Retries on 429/5xx and connection errors with exponential backoff (honouring
+    a ``Retry-After`` header), and bounds concurrency via ``_WIKI_SEM`` so bursts
+    don't trip Wikimedia's rate limiter in the first place. Returns None only
+    after retries are exhausted, so a transient 429 no longer degrades a row to
+    name-only ground truth.
+    """
+    for attempt in range(retries + 1):
+        try:
+            with _WIKI_SEM:  # bound concurrent Wikimedia calls
+                resp = _SESSION.get(url, params=params, timeout=timeout, allow_redirects=True)
+        except requests.RequestException as exc:
+            if attempt < retries:
+                time.sleep(min(backoff ** attempt, 30))
+                continue
+            print(f"  [WIKI] Request failed {url[:80]}: {exc.__class__.__name__}")
+            return None
+
+        if resp.status_code in _WIKI_RETRY_STATUS:
+            if attempt < retries:
+                delay = backoff ** attempt
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = max(delay, float(retry_after))
+                    except ValueError:
+                        pass
+                time.sleep(min(delay, 30))  # released the semaphore before sleeping
+                continue
+            print(f"  [WIKI] HTTP {resp.status_code} (rate-limited; retries exhausted) {url[:80]}")
+            return None
+
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError:
+            print(f"  [WIKI] HTTP {resp.status_code} fetching {url[:80]}")
+            return None
         return resp
-    except requests.exceptions.HTTPError as e:
-        print(f"  [WIKI] HTTP {e.response.status_code} fetching {url[:80]}")
-        return None
-    except Exception as e:
-        print(f"  [WIKI] Request failed {url[:80]}: {e.__class__.__name__}: {e}")
-        return None
+    return None
 
 
 # ────────────────────────────────────────────────────────────────────────────
