@@ -80,6 +80,11 @@ _USABLE_STATUSES = {STATUS_VERIFIED, STATUS_MANUAL}
 # it, so we skip it there (Serper context is the evidence source for those).
 _OG_FETCH_PLATFORMS = {"Facebook", "YouTube"}
 
+# Thin-evidence platforms (no OG fetch): fetch extra Serper context for the exact
+# profile URL — even for Serper-found links — so the LLM gets the profile's own
+# description + follower counts instead of just the site: search snippet.
+_CONTEXT_FETCH_PLATFORMS = {"Instagram", "TikTok", "X"}
+
 # Max concurrent per-platform verifications within a single talent row.
 _MAX_PLATFORM_WORKERS = 5
 
@@ -149,8 +154,14 @@ def _enrich_candidates(candidates: List[dict], platform: str) -> None:
     for cand in candidates:
         if cand.get("_enriched"):
             continue
-        # Serper context for links that didn't come from a Serper search (Apify).
-        if cand.get("source") != "serper":
+        # Fetch Serper context for the exact profile URL when the link did NOT come
+        # from a Serper search (Apify links), OR for thin-evidence platforms
+        # (IG/TikTok/X) even for Serper links — the URL search returns the profile's
+        # own description + follower counts, far richer than the site: snippet alone.
+        needs_context = (
+            cand.get("source") != "serper" or platform in _CONTEXT_FETCH_PLATFORMS
+        )
+        if needs_context:
             try:
                 ctx = serper_service.context_for_url(cand.get("url", ""))
             except RuntimeError as exc:
