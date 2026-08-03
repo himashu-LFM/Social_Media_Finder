@@ -34,6 +34,36 @@ import verification_pipeline as testing  # noqa: E402  — after dotenv so keys 
 _jobs_lock = threading.Lock()
 _jobs: Dict[str, Dict[str, Any]] = {}
 
+# One stop-flag per job. The pipeline polls it between units of work, so a stop
+# drains queued rows/platforms without killing requests that are already in
+# flight — partial results are still assembled and saved.
+_cancel_events: Dict[str, threading.Event] = {}
+
+
+def _cancel_event(job_id: str) -> threading.Event:
+    with _jobs_lock:
+        event = _cancel_events.get(job_id)
+        if event is None:
+            event = threading.Event()
+            _cancel_events[job_id] = event
+        return event
+
+
+def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str]) -> None:
+    """Mark a finished run completed — or cancelled when a stop was requested."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        was_cancelled = job_id in _cancel_events and _cancel_events[job_id].is_set()
+        job["status"] = "cancelled" if was_cancelled else "completed"
+        job["output_path"] = out_path
+        job["serper_output_path"] = serper_path
+        for entry in job["names"]:
+            entry["status"] = "done"
+            entry["current_platform"] = None
+            entry["completed_platforms"] = list(testing.PLATFORMS.keys())
+
 UPLOAD_DIR = ROOT / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -153,20 +183,11 @@ def _run_job(job_id: str, names: List[str]) -> None:
             names,
             row_status=row_status,
             platform_progress=platform_progress,
+            should_cancel=_cancel_event(job_id).is_set,
         )
 
         out_path, serper_path = _persist_outputs(final_df)
-
-        with _jobs_lock:
-            job = _jobs.get(job_id)
-            if job:
-                job["status"] = "completed"
-                job["output_path"] = out_path
-                job["serper_output_path"] = serper_path
-                for entry in job["names"]:
-                    entry["status"] = "done"
-                    entry["current_platform"] = None
-                    entry["completed_platforms"] = list(testing.PLATFORMS.keys())
+        _finalize_job(job_id, out_path, serper_path)
     except Exception as exc:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -199,20 +220,11 @@ def _run_job_from_file(job_id: str, path: Path) -> None:
             df,
             row_status=row_status,
             platform_progress=platform_progress,
+            should_cancel=_cancel_event(job_id).is_set,
         )
 
         out_path, serper_path = _persist_outputs(final_df)
-
-        with _jobs_lock:
-            job = _jobs.get(job_id)
-            if job:
-                job["status"] = "completed"
-                job["output_path"] = out_path
-                job["serper_output_path"] = serper_path
-                for entry in job["names"]:
-                    entry["status"] = "done"
-                    entry["current_platform"] = None
-                    entry["completed_platforms"] = list(testing.PLATFORMS.keys())
+        _finalize_job(job_id, out_path, serper_path)
     except Exception as exc:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -461,6 +473,28 @@ def api_export_latest() -> FileResponse:
         status_code=503,
         detail=last_err or "Export file is locked or unreadable. Close it in Excel and try again.",
     )
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict[str, Any]:
+    """
+    Ask a running job to stop.
+
+    Cooperative, not a kill: queued rows/platforms are skipped, in-flight API
+    calls are allowed to finish, and whatever was already verified is assembled
+    and saved. The job then reports status "cancelled" with a usable workbook,
+    so a stopped run is never a wasted run.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Unknown job_id.")
+        terminal = job["status"] in ("completed", "failed", "cancelled")
+        if not terminal:
+            _cancel_events.setdefault(job_id, threading.Event()).set()
+            job["status"] = "cancelling"
+        status = job["status"]
+    return {"job_id": job_id, "status": status, "cancel_requested": not terminal}
 
 
 @app.get("/api/jobs/{job_id}")

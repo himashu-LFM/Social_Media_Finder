@@ -114,6 +114,10 @@ class WikiMetadata:
     # Extra identity columns provided in the input spreadsheet. Especially
     # important when no Wikipedia URL / Wikidata entity is available.
     input_metadata: Dict[str, str] = field(default_factory=dict)
+    # Profiles the CLIENT already has on file for this entity ({platform: url}).
+    # Operationally maintained and usually more current than Wikidata, so the
+    # verifier must weigh them as a strong prior rather than as a conflict.
+    client_recorded_profiles: Dict[str, str] = field(default_factory=dict)
     # Entity type. Defaults to person so name-only / unknown inputs keep the
     # exact current (talent) behaviour; set False for brands / networks / orgs.
     is_person: bool = True
@@ -142,6 +146,10 @@ class WikiMetadata:
         if self.social_links:
             # Wikidata-declared official handles — cross-reference across platforms.
             data["known_official_profiles"] = self.social_links
+        if self.client_recorded_profiles:
+            # The operator's own record. Where this disagrees with Wikidata it is
+            # usually the fresher of the two, not a red flag.
+            data["client_recorded_profiles"] = self.client_recorded_profiles
         if self.input_metadata:
             # Identity details supplied directly in the spreadsheet.
             data["provided_metadata"] = self.input_metadata
@@ -386,6 +394,28 @@ def _meta_get(input_metadata: Dict[str, str], *keys: str) -> str:
     return ""
 
 
+# Client taxonomy values in `title_category` that denote a PERSON. Anything else
+# ("TV Network", "Internet Services", "Publishers", …) is an organization/brand.
+_PERSON_CATEGORIES = frozenset({"talent", "person", "people", "individual", "celebrity"})
+
+
+def _infer_entity_type(input_metadata: Dict[str, str]) -> tuple:
+    """
+    (is_person, entity_type) from the client's own taxonomy.
+
+    Used when Wikidata can't tell us — the default of "person" would otherwise
+    mislabel every brand, and brand rows need different disambiguation rules
+    than people (a brand name is nearly unique; a personal name is not).
+    Returns (True, "") when the category is missing or unrecognised, preserving
+    the previous person-by-default behaviour.
+    """
+    category = _meta_get(input_metadata, "title_category", "category", "brand_type")
+    if not category:
+        return True, ""
+    return (True, "person") if category.strip().lower() in _PERSON_CATEGORIES \
+        else (False, category.strip())
+
+
 def fetch_wiki_metadata(
     talent: str,
     wikipedia_url: str = "",
@@ -424,12 +454,20 @@ def fetch_wiki_metadata(
         talent=talent, wikipedia_url=wikipedia_url, name=talent,
         input_metadata=input_metadata,
     )
+    # Seed the entity type from the client's taxonomy; a resolved Wikidata
+    # entity overrides this below with the authoritative P31 value.
+    meta.is_person, meta.entity_type = _infer_entity_type(input_metadata)
 
     # 1) Resolve the Wikidata QID (from URL if present, else best-effort search).
     qid: Optional[str] = None
     try:
         if wikipedia_url:
             qid = wd._wikipedia_url_to_qid(wikipedia_url)
+        if not qid:
+            # An IMDb id from the input file pins exactly one person, so prefer it
+            # over the name search — no namesake can slip through an exact
+            # property match. Falls through when the person has no entity.
+            qid = wd._imdb_to_qid(_meta_get(input_metadata, "imdb_id", "imdb", "imdb_url"))
         if not qid:
             qid = wd._name_to_qid(talent, title_category, title_sub_category)
     except Exception as exc:  # noqa: BLE001

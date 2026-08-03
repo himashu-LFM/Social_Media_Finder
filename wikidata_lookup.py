@@ -225,6 +225,39 @@ def _wikipedia_url_to_qid(wikipedia_url: str) -> Optional[str]:
     return None
 
 
+def _imdb_to_qid(imdb_id: str) -> Optional[str]:
+    """
+    Resolve a Wikidata QID from an IMDb id via an EXACT property match (P345).
+
+    Far safer than the name search: an IMDb id identifies exactly one person, so
+    there is no namesake risk and no need for the title-matching guard. Returns
+    None when the person simply has no Wikidata entity (common for minor talent),
+    which correctly leaves the ground truth thin rather than inventing one.
+    """
+    match = re.search(r"(nm\d{5,})", imdb_id or "", re.I)
+    if not match:
+        return None
+    resp = _get(
+        "https://www.wikidata.org/w/api.php",
+        params={
+            "action": "query", "list": "search",
+            "srsearch": f"haswbstatement:P345={match.group(1)}",
+            "format": "json", "srlimit": 1,
+        },
+    )
+    if not resp:
+        return None
+    try:
+        hits = resp.json().get("query", {}).get("search", [])
+        if hits:
+            qid = hits[0]["title"]
+            print(f"  [WIKI] QID from IMDb id {match.group(1)}: {qid}")
+            return qid
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [WIKI] IMDb-to-QID failed: {exc}")
+    return None
+
+
 def _name_to_qid(talent: str, title_category: str = "", title_sub_category: str = "") -> Optional[str]:
     """
     When no Wikipedia URL is provided, try to find the Wikidata entity via
@@ -265,12 +298,35 @@ def _name_to_qid(talent: str, title_category: str = "", title_sub_category: str 
         results = resp.json()["query"]["search"]
         if not results:
             return None
-        # Use the first result — re-run with its title to get QID
-        top_title = results[0]["title"]
-        return _wikipedia_url_to_qid(f"https://en.wikipedia.org/wiki/{top_title.replace(' ', '_')}")
+        # Wikipedia full-text search ALWAYS returns something for a plausible
+        # name, so adopting results[0] unchecked silently attaches a stranger's
+        # biography to the row. That is how the brand "NetBrain" acquired the
+        # ground truth of "Versata" and had four correct profiles suppressed.
+        # Require the article title to actually contain the entity's name.
+        match = next((r["title"] for r in results if _title_matches_name(r.get("title", ""), clean_name)), None)
+        if not match:
+            print(f"  [WIKI] Search hits for '{clean_name}' don't match the name "
+                  f"({[r.get('title') for r in results[:3]]}) — no QID adopted.")
+            return None
+        return _wikipedia_url_to_qid(f"https://en.wikipedia.org/wiki/{match.replace(' ', '_')}")
     except Exception as e:
         print(f"  [WIKI] Search-to-QID failed: {e}")
         return None
+
+
+def _title_matches_name(title: str, name: str) -> bool:
+    """
+    True when a Wikipedia article title plausibly names this entity.
+
+    Every significant token of the entity name must appear in the title, so
+    "NetBrain" accepts "NetBrain Technologies" and "Toby Kebbell" accepts
+    "Toby Kebbell (actor)", but neither accepts "Versata". Strict on purpose:
+    a missed QID degrades to thin ground truth (a Manual Review), while a wrong
+    QID produces a confident wrong answer.
+    """
+    tokens = lambda s: set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+    name_tokens = {t for t in tokens(name) if len(t) > 1}
+    return bool(name_tokens) and name_tokens.issubset(tokens(title))
 
 
 # ────────────────────────────────────────────────────────────────────────────

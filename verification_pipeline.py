@@ -36,7 +36,9 @@ Design notes:
 from __future__ import annotations
 
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -52,6 +54,7 @@ import wikipedia_service
 from verification_service import (
     STATUS_MANUAL,
     STATUS_NOT_FOUND,
+    STATUS_STOPPED,
     STATUS_VERIFIED,
     STATUS_WRONG,
     VerificationResult,
@@ -76,9 +79,23 @@ _STATUS_RANK = {
 # Statuses whose confidence counts toward the overall per-talent score.
 _USABLE_STATUSES = {STATUS_VERIFIED, STATUS_MANUAL}
 
-# Platforms where the direct OG-tag page fetch actually works. IG/TikTok/X block
-# it, so we skip it there (Serper context is the evidence source for those).
-_OG_FETCH_PLATFORMS = {"Facebook", "YouTube"}
+# Platforms where the direct OG-tag page fetch actually works. TikTok and X
+# return nothing, so they are skipped. Instagram is included because although it
+# withholds the bio, its og:description carries follower/following/post counts
+# and og:title carries the display name — which is exactly what separates a real
+# account from a fan page or an empty impostor with the same name.
+_OG_FETCH_PLATFORMS = {"Facebook", "YouTube", "Instagram"}
+
+# Candidates fetched per platform from Serper. Was 1, which made namesake
+# collisions invisible: the model could not weigh three same-named accounts
+# because it only ever saw one of them. Env-overridable.
+SERPER_CANDIDATES_PER_PLATFORM = max(
+    1, int(os.environ.get("SERPER_CANDIDATES_PER_PLATFORM", "4"))
+)
+
+# When several live accounts all claim the same identity, prefer surfacing the
+# choice to an analyst over silently picking one. Set to "0" to disable.
+AMBIGUITY_GUARD = os.environ.get("AMBIGUITY_GUARD", "1").strip() not in ("0", "false", "no")
 
 # Max concurrent per-platform verifications within a single talent row.
 _MAX_PLATFORM_WORKERS = 5
@@ -90,6 +107,21 @@ PIPELINE_ROW_WORKERS = max(1, int(os.environ.get("PIPELINE_ROW_WORKERS", "4")))
 # Delegated so callers can use the pipeline as a single import.
 load_talent_table_from_path = excel_service.load_talent_table_from_path
 save_output = excel_service.save_output
+
+# Reason written to any platform/row that was skipped because the operator
+# stopped the run. Kept inside the existing 4 statuses (Not Found) so the export
+# schema and the UI legend stay unchanged.
+CANCELLED_REASON = "Run stopped by user before this platform was searched."
+
+
+def _is_cancelled(should_cancel: Optional[Callable[[], bool]]) -> bool:
+    """True when the caller has asked the run to stop. Never raises."""
+    if should_cancel is None:
+        return False
+    try:
+        return bool(should_cancel())
+    except Exception:  # noqa: BLE001 — a broken callback must not abort the run
+        return False
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -120,7 +152,9 @@ def _serper_primary_candidate(talent: str, platform: str) -> tuple[List[dict], b
     "no profile" from a failed search.
     """
     try:
-        return serper_service.discover_by_site(talent, platform, top_n=1), False
+        return serper_service.discover_by_site(
+            talent, platform, top_n=SERPER_CANDIDATES_PER_PLATFORM
+        ), False
     except RuntimeError as exc:
         print(f"  [PIPELINE] Serper site-search unavailable for {platform}/{talent}: {exc}")
         return [], True
@@ -168,14 +202,42 @@ def _enrich_candidates(candidates: List[dict], platform: str) -> None:
         profile_metadata.enrich_candidates(candidates, platform)
 
 
+def _drop_missing_profiles(candidates: List[dict], platform: str) -> List[dict]:
+    """
+    Remove candidates the platform itself reports as non-existent (hard 404).
+
+    A guessed handle can otherwise pick up plausible-looking Serper context —
+    Google returns pages about the person for a URL that was never created — and
+    get Verified. Only YouTube and X give a trustworthy signal, so only they are
+    probed; everything else passes through untouched.
+    """
+    kept: List[dict] = []
+    for cand in candidates:
+        url = cand.get("url", "")
+        if profile_metadata.profile_is_missing(url, platform):
+            print(f"  [DEAD] {platform} candidate does not exist (404) — dropped: {url}")
+            continue
+        kept.append(cand)
+    return kept
+
+
 def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
             candidates: List[dict]) -> VerificationResult:
     if not candidates:
         return VerificationResult(platform=platform, status=STATUS_NOT_FOUND,
                                   reason="No candidate links to verify.")
+    candidates = _drop_missing_profiles(candidates, platform)
+    if not candidates:
+        return VerificationResult(
+            platform=platform, status=STATUS_NOT_FOUND,
+            reason="Candidate profile(s) returned HTTP 404 — the handle does not exist.",
+        )
     _enrich_candidates(candidates, platform)
-    return verification_service.verify_platform(
+    result = verification_service.verify_platform(
         platform, wiki_meta.to_prompt_dict(), candidates, is_person=wiki_meta.is_person
+    )
+    return _guard_ambiguous_identity(
+        result, candidates, wiki_meta.name or wiki_meta.talent, platform
     )
 
 
@@ -183,15 +245,134 @@ def _score(result: VerificationResult) -> tuple:
     return (_STATUS_RANK.get(result.status, 0), result.confidence)
 
 
+def _name_tokens(text: str) -> set:
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 1}
+
+
+def _claims_identity(cand: dict, talent: str) -> bool:
+    """
+    True when a candidate's own displayed identity carries the full talent name.
+
+    Reads the display name / page title, NOT the handle — a handle can be any
+    string, but an account presenting itself as "Toby Kebbell" is competing for
+    the same identity regardless of how its URL is spelled.
+    """
+    meta = cand.get("meta") or {}
+    shown = " ".join(str(meta.get(k, "")) for k in
+                     ("display_name", "serper_title", "title", "knowledge_graph"))
+    wanted = _name_tokens(talent)
+    return bool(wanted) and wanted.issubset(_name_tokens(shown))
+
+
+def _describe(cand: dict) -> str:
+    """One-line candidate summary for the analyst-facing Reason column."""
+    meta = cand.get("meta") or {}
+    bits = [str(meta[k]) for k in ("followers", "subscribers") if meta.get(k)]
+    if meta.get("posts"):
+        bits.append(f"{meta['posts']} posts")
+    stats = f" ({', '.join(bits)})" if bits else ""
+    return f"{cand.get('url', '')}{stats}"
+
+
+def _guard_ambiguous_identity(
+    result: VerificationResult, candidates: List[dict], talent: str, platform: str,
+) -> VerificationResult:
+    """
+    Refuse to silently pick between several live accounts of the same name.
+
+    Namesakes, fan pages and impostors are the dominant precision failure here:
+    "Toby Kebbell" has three live Instagram accounts all displaying that exact
+    name. Picking one and stamping it Verified hides a judgement an analyst
+    should make, so when two or more candidates claim the identity we downgrade
+    to Manual Review and list every contender WITH its follower counts — which
+    is usually enough for a human to decide in seconds.
+    """
+    if not AMBIGUITY_GUARD or result.status != STATUS_VERIFIED or not result.best_candidate:
+        return result
+    rivals = [c for c in candidates
+              if c.get("url") != result.best_candidate and _claims_identity(c, talent)]
+    if not rivals:
+        return result
+    chosen = next((c for c in candidates if c.get("url") == result.best_candidate), None)
+    options = " | ".join(_describe(c) for c in ([chosen] if chosen else []) + rivals)
+    print(f"  [AMBIGUOUS] {platform} | {talent}: {len(rivals) + 1} accounts claim this "
+          f"identity — routed to manual review")
+    return VerificationResult(
+        platform=platform,
+        best_candidate=result.best_candidate,
+        status=STATUS_MANUAL,
+        confidence=min(result.confidence, 75),
+        reason=(f"{len(rivals) + 1} live accounts present themselves as '{talent}' on "
+                f"{platform}; picking one automatically risks a fan page or namesake. "
+                f"Candidates: {options}. Model's preference: {result.best_candidate}. "
+                + (result.reason or "")).strip(),
+        evidence=result.evidence,
+        rejected=result.rejected,
+        decision=result.decision,
+    )
+
+
 # ────────────────────────────────────────────────────────────────────────────
 #  Per-platform resolution: Serper primary (Phase 1) + Apify backup (Phase 2)
 # ────────────────────────────────────────────────────────────────────────────
 
+# Minimum handle length before we will reuse it on another platform. Short
+# slugs ("nba", "abc") collide with unrelated accounts far too often.
+_MIN_FANOUT_SLUG_LEN = 5
+
+
+def _fanout_slugs(input_handles: Dict[str, str]) -> List[str]:
+    """
+    Distinct handle slugs taken from the client's own recorded profiles.
+
+    Actors and brands overwhelmingly reuse one handle across platforms, so a
+    handle the client already has on file for Instagram is a strong direct
+    candidate for X / TikTok / YouTube — no search required.
+    """
+    slugs: List[str] = []
+    for platform, url in (input_handles or {}).items():
+        slug = social_urls.handle_from_url(url, platform)
+        if len(slug) >= _MIN_FANOUT_SLUG_LEN and slug.lower() not in [s.lower() for s in slugs]:
+            slugs.append(slug)
+    return slugs
+
+
 def _resolve_platform_serper(
-    talent: str, platform: str, wiki_meta: wikipedia_service.WikiMetadata,
+    talent: str,
+    platform: str,
+    wiki_meta: wikipedia_service.WikiMetadata,
+    known_url: str = "",
+    fanout_slugs: Optional[List[str]] = None,
 ) -> VerificationResult:
-    """Phase 1 — verify the Serper top-result candidate (primary discovery)."""
-    candidates, errored = _serper_primary_candidate(talent, platform)
+    """
+    Phase 1 — assemble candidates for one platform and verify them together.
+
+    Candidate order (all are judged by the LLM; none is auto-accepted):
+      1. the profile the CLIENT already has on file for this platform
+      2. the top Serper "<name> site:<domain>" result
+      3. ONLY if 1 and 2 produced nothing: the client's handle from ANOTHER
+         platform, reused here — a cheap recall rescue that costs no search.
+    """
+    serper_candidates, errored = _serper_primary_candidate(talent, platform)
+
+    candidates: List[dict] = []
+    seen: set = set()
+    if known_url:
+        _add_candidate(candidates, seen, platform, known_url, "input",
+                       {"supplied_in_client_record": True})
+    for cand in serper_candidates:
+        _add_candidate(candidates, seen, platform, cand.get("url", ""),
+                       cand.get("source", "serper"), cand.get("meta"))
+
+    if not candidates:
+        for slug in (fanout_slugs or []):
+            url = social_urls.profile_url_from_handle(slug, platform)
+            _add_candidate(candidates, seen, platform, url, "handle_fanout",
+                           {"handle_reused_from_client_profile_on_another_platform": slug})
+        if candidates:
+            print(f"  [FANOUT] {platform} | {talent} -> trying known handle(s) "
+                  f"{fanout_slugs} (Serper found nothing)")
+
     if not candidates:
         reason = (
             "Serper search errored (connection/rate limit) — result unconfirmed, "
@@ -247,13 +428,27 @@ def _row_serper_phase(
     talent: str,
     wiki_meta: wikipedia_service.WikiMetadata,
     platform_progress: Optional[Callable[[str, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    input_handles: Optional[Dict[str, str]] = None,
 ) -> Dict[str, VerificationResult]:
     """Phase 1 for one row: Serper-primary verify across all platforms (concurrent)."""
+    input_handles = input_handles or {}
+    fanout = _fanout_slugs(input_handles)
+
     def _task(platform: str) -> tuple:
+        # Queued platform tasks drain as cheap no-ops once a stop is requested;
+        # already-running searches finish so we never abandon a paid API call.
+        if _is_cancelled(should_cancel):
+            return platform, VerificationResult(
+                platform=platform, status=STATUS_STOPPED, reason=CANCELLED_REASON
+            )
         if platform_progress:
             platform_progress(platform, "start")
         try:
-            result = _resolve_platform_serper(talent, platform, wiki_meta)
+            result = _resolve_platform_serper(
+                talent, platform, wiki_meta,
+                known_url=input_handles.get(platform, ""), fanout_slugs=fanout,
+            )
         except Exception as exc:  # noqa: BLE001 — isolate platform failures
             print(f"  [PIPELINE] {platform} Serper phase error for '{talent}': {exc}")
             result = VerificationResult(
@@ -351,6 +546,13 @@ def _corroborate_row(
 
     def _task(platform: str) -> tuple:
         cand = {"url": results[platform].best_candidate, "source": "apify", "meta": {}}
+        # Same 404 guard as _verify — cross-platform corroboration must never
+        # promote a handle that doesn't resolve.
+        if not _drop_missing_profiles([cand], platform):
+            return platform, VerificationResult(
+                platform=platform, status=STATUS_NOT_FOUND,
+                reason="Candidate profile returned HTTP 404 — the handle does not exist.",
+            )
         try:
             _enrich_candidates([cand], platform)  # re-fetch snippet/kg/counts for the link
             res = verification_service.verify_platform(
@@ -391,18 +593,27 @@ def _assemble_row_out(results: Dict[str, VerificationResult]) -> Dict[str, Any]:
     return out
 
 
-def _ground_truth(talent: str, wiki_url: str, input_metadata: dict) -> wikipedia_service.WikiMetadata:
-    """Step 1 — rich Wikipedia/Wikidata ground-truth profile (unchanged)."""
+def _ground_truth(talent: str, wiki_url: str, input_metadata: dict,
+                  input_handles: Optional[Dict[str, str]] = None
+                  ) -> wikipedia_service.WikiMetadata:
+    """Step 1 — rich Wikipedia/Wikidata ground-truth profile."""
     try:
-        return wikipedia_service.fetch_wiki_metadata(
+        meta = wikipedia_service.fetch_wiki_metadata(
             talent, wiki_url, input_metadata=input_metadata
         )
     except Exception as exc:  # noqa: BLE001
         print(f"  [PIPELINE] Wikipedia metadata failed for '{talent}': {exc}")
-        return wikipedia_service.WikiMetadata(
+        meta = wikipedia_service.WikiMetadata(
             talent=talent, wikipedia_url=wiki_url, name=talent,
             input_metadata=input_metadata,
         )
+    # Attach the client's own recorded profiles. Set on the metadata object so
+    # EVERY consumer sees it — Serper phase, Apify backup and corroboration —
+    # without threading an extra argument through each call site. The cache in
+    # wikipedia_service is keyed on name/URL, so copy before mutating.
+    if input_handles:
+        meta = replace(meta, client_recorded_profiles=dict(input_handles))
+    return meta
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -415,6 +626,7 @@ def _resolve_row_result(
     input_metadata: dict,
     apify_candidates: Optional[Dict[str, List[dict]]] = None,
     platform_progress: Optional[Callable[[str, str], None]] = None,
+    input_handles: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Run the full verification workflow for ONE talent (both phases) and return a
@@ -424,10 +636,11 @@ def _resolve_row_result(
     a per-talent Apify lookup is done ONLY when Serper leaves a platform
     non-Verified (used by the single-row / CLI path).
     """
-    wiki_meta = _ground_truth(talent, wiki_url, input_metadata)
+    wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
 
     # Phase 1 — Serper-primary discovery + verification.
-    phase1 = _row_serper_phase(talent, wiki_meta, platform_progress)
+    phase1 = _row_serper_phase(talent, wiki_meta, platform_progress,
+                               input_handles=input_handles)
 
     # Phase 2 — Apify backup, only if some platform isn't Verified.
     failing = [p for p, r in phase1.items() if r.status not in _GOOD_STATUSES]
@@ -449,7 +662,7 @@ def _resolve_row_result(
 
 
 def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
-    """Read (talent, wiki_url, input_metadata) for a row."""
+    """Read (talent, wiki_url, input_metadata, input_handles) for a row."""
     talent = str(df.at[row_label, excel_service.TALENT_COL] or "").strip()
     wiki_url = str(df.at[row_label, excel_service.WIKI_COL] or "").strip()
     input_metadata: dict = {}
@@ -457,7 +670,12 @@ def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
         raw_meta = df.at[row_label, excel_service.INPUT_META_COL]
         if isinstance(raw_meta, dict):
             input_metadata = raw_meta
-    return talent, wiki_url, input_metadata
+    input_handles: dict = {}
+    if excel_service.INPUT_HANDLES_COL in df.columns:
+        raw_handles = df.at[row_label, excel_service.INPUT_HANDLES_COL]
+        if isinstance(raw_handles, dict):
+            input_handles = raw_handles
+    return talent, wiki_url, input_metadata, input_handles
 
 
 def process_row(
@@ -466,12 +684,13 @@ def process_row(
     platform_progress: Optional[Callable[[str, str], None]] = None,
 ) -> None:
     """Single-row entry point (in place). Kept for the sequential / CLI path."""
-    talent, wiki_url, input_metadata = _row_inputs(df, row_label)
+    talent, wiki_url, input_metadata, input_handles = _row_inputs(df, row_label)
     if not talent:
         return
     print(f"\n{'=' * 65}\nProcessing: {talent}")
     result = _resolve_row_result(talent, wiki_url, input_metadata,
-                                 apify_candidates=None, platform_progress=platform_progress)
+                                 apify_candidates=None, platform_progress=platform_progress,
+                                 input_handles=input_handles)
     for col, val in result.items():
         df.at[row_label, col] = val
 
@@ -480,6 +699,7 @@ def run_pipeline_on_dataframe(
     df: pd.DataFrame,
     row_status: Optional[Callable[[int, str], None]] = None,
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> pd.DataFrame:
     """
     Process every row and return the populated frame — Serper primary, Apify backup.
@@ -507,9 +727,9 @@ def run_pipeline_on_dataframe(
     # Collect processable rows (skip blank names), preserving 0-based index.
     rows = []
     for idx, row_label in enumerate(df.index):
-        talent, wiki_url, input_metadata = _row_inputs(df, row_label)
+        talent, wiki_url, input_metadata, input_handles = _row_inputs(df, row_label)
         if talent:
-            rows.append((idx, row_label, talent, wiki_url, input_metadata))
+            rows.append((idx, row_label, talent, wiki_url, input_metadata, input_handles))
 
     total = len(rows)
     print(f"[PIPELINE] Verification run started for {total} talent row(s) "
@@ -517,7 +737,20 @@ def run_pipeline_on_dataframe(
 
     # ── Phase A: Serper-primary discovery + verification for every row ──
     def _phase_a(entry: tuple) -> dict:
-        idx, row_label, talent, wiki_url, input_metadata = entry
+        idx, row_label, talent, wiki_url, input_metadata, input_handles = entry
+        # Rows still queued when the operator stops are returned untouched, so no
+        # Wikipedia/Serper/LLM budget is spent on work nobody is waiting for.
+        if _is_cancelled(should_cancel):
+            return {
+                "idx": idx, "row_label": row_label, "talent": talent,
+                "wiki_meta": wikipedia_service.WikiMetadata(talent=talent, name=talent),
+                "phase1": {
+                    p: VerificationResult(platform=p, status=STATUS_STOPPED,
+                                          reason=CANCELLED_REASON)
+                    for p in PLATFORMS
+                },
+                "cancelled": True,
+            }
         if row_status:
             row_status(idx, "processing")
 
@@ -525,9 +758,10 @@ def run_pipeline_on_dataframe(
             if platform_progress:
                 platform_progress(idx, platform, phase)
 
-        wiki_meta = _ground_truth(talent, wiki_url, input_metadata)
+        wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
         try:
-            phase1 = _row_serper_phase(talent, wiki_meta, _pp)
+            phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
+                                       input_handles=input_handles)
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
             print(f"  [PIPELINE] Serper phase failed for '{talent}': {exc}")
             phase1 = {
@@ -536,7 +770,7 @@ def run_pipeline_on_dataframe(
                 for p in PLATFORMS
             }
         return {"idx": idx, "row_label": row_label, "talent": talent,
-                "wiki_meta": wiki_meta, "phase1": phase1}
+                "wiki_meta": wiki_meta, "phase1": phase1, "cancelled": False}
 
     workers = max(1, min(PIPELINE_ROW_WORKERS, total or 1))
     phase_a: List[dict] = []
@@ -545,20 +779,31 @@ def run_pipeline_on_dataframe(
             phase_a.append(res)
 
     # ── One batched Apify pass for ONLY the talents with a non-Verified platform ──
+    stopped = _is_cancelled(should_cancel)
     failing_talents = sorted({
         r["talent"] for r in phase_a
-        if any(v.status not in _GOOD_STATUSES for v in r["phase1"].values())
+        if not r.get("cancelled")
+        and any(v.status not in _GOOD_STATUSES for v in r["phase1"].values())
     })
-    print(f"[PIPELINE] Phase B (Apify backup): {len(failing_talents)} of {total} "
-          f"talent(s) have a non-Verified platform.")
-    try:
-        apify_map = apify_service.find_social_links_batch(failing_talents) if failing_talents else {}
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [PIPELINE] Batched Apify backup failed: {exc}")
+    if stopped:
+        print("[PIPELINE] Stop requested — skipping the Apify backup pass; "
+              "keeping whatever Phase A already verified.")
         apify_map = {}
+    else:
+        print(f"[PIPELINE] Phase B (Apify backup): {len(failing_talents)} of {total} "
+              f"talent(s) have a non-Verified platform.")
+        try:
+            apify_map = apify_service.find_social_links_batch(failing_talents) if failing_talents else {}
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [PIPELINE] Batched Apify backup failed: {exc}")
+            apify_map = {}
 
     # ── Phase B: Apify backup + assemble + write ──
     def _phase_b(r: dict) -> tuple:
+        # Once stopped, assemble what Phase A produced instead of spending more
+        # Apify/LLM calls — partial results are still saved and viewable.
+        if r.get("cancelled") or _is_cancelled(should_cancel):
+            return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
         try:
             final = _row_apify_phase(
                 r["talent"], r["wiki_meta"], r["phase1"], apify_map.get(r["talent"], {})
@@ -598,10 +843,14 @@ def run_pipeline_for_names(
     names: List[str],
     row_status: Optional[Callable[[int, str], None]] = None,
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> pd.DataFrame:
     """Names-only entry point (no Wikipedia URLs — metadata falls back to search)."""
     clean = [str(name).strip() for name in names if name and str(name).strip()]
     if not clean:
         raise ValueError("At least one non-empty name is required.")
     df = excel_service.build_talent_df(clean)
-    return run_pipeline_on_dataframe(df, row_status=row_status, platform_progress=platform_progress)
+    return run_pipeline_on_dataframe(
+        df, row_status=row_status, platform_progress=platform_progress,
+        should_cancel=should_cancel,
+    )

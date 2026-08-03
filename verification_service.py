@@ -67,6 +67,11 @@ STATUS_VERIFIED = "Verified"
 STATUS_WRONG = "Wrong"
 STATUS_MANUAL = "Manual Review Needed"
 STATUS_NOT_FOUND = "Not Found"
+# Never searched, because the operator stopped the run. Deliberately distinct
+# from "Not Found": that asserts an absence we actually looked for, and a
+# stopped cell asserts nothing at all. Keeping them separate stops a cancelled
+# run from being ingested downstream as "this profile does not exist".
+STATUS_STOPPED = "Not Checked"
 
 # A candidate may only be labelled Verified at or above this confidence.
 _VERIFIED_MIN_CONFIDENCE = 90
@@ -82,8 +87,39 @@ _IDENTITY_SIGNALS = (
 
 
 def _ground_truth_is_thin(ground_truth: Dict[str, Any]) -> bool:
-    """True when the ground truth carries no disambiguating identity facts."""
-    return not any(ground_truth.get(k) for k in _IDENTITY_SIGNALS)
+    """
+    True when the ground truth carries no facts that could rule out a namesake.
+
+    The bar differs by entity type, because the risk differs. Two people called
+    "Adam Grissom" is routine, so a person needs real identity facts. Two
+    unrelated companies both called "NetBrain" is not routine — a brand name
+    plus the client's recorded industry is already enough to disambiguate, so
+    organizations are not treated as thin when the input file describes them.
+    Persons are unchanged: this only ever loosens the gate for non-persons.
+    """
+    if any(ground_truth.get(k) for k in _IDENTITY_SIGNALS):
+        return False
+    entity_type = str(ground_truth.get("entity_type", "")).strip().lower()
+    is_org = entity_type not in ("", "person", "human")
+    if is_org and ground_truth.get("provided_metadata"):
+        return False
+    return True
+
+
+# Metadata that constitutes real evidence ABOUT the candidate profile. "username"
+# is excluded on purpose: it is derived from the URL string itself, so it proves
+# nothing. Everything here had to come back from a search or a page fetch.
+_EVIDENCE_META_KEYS = (
+    "serper_title", "serper_snippet", "serper_results", "knowledge_graph",
+    "bio", "display_name", "followers", "subscribers", "likes", "verified",
+    "website", "title", "snippet",
+)
+
+
+def _candidate_has_evidence(cand: Dict[str, Any]) -> bool:
+    """True when we actually retrieved something about this profile."""
+    meta = cand.get("meta") or {}
+    return any(meta.get(k) not in ("", None, [], {}) for k in _EVIDENCE_META_KEYS)
 
 
 @dataclass
@@ -372,6 +408,22 @@ def verify_platform(
         reason = f"Model returned a URL not in the candidate set. {reason}".strip()
 
     status = status_from_decision(decision, confidence, bool(best))
+
+    # EVIDENCE FLOOR. A candidate we retrieved NOTHING about cannot be Verified,
+    # however strong the ground truth is. Without this, a guessed or supplied
+    # handle plus a rich Wikipedia profile reads as a confident match — and a URL
+    # that 404s gets stamped Verified. Hit for real when Serper ran out of credits
+    # and enrichment silently returned {} for every candidate.
+    if status == STATUS_VERIFIED and best:
+        chosen = next((c for c in candidates if c.get("url") == best), None)
+        if chosen is not None and not _candidate_has_evidence(chosen):
+            status = STATUS_MANUAL
+            reason = (
+                "No profile content could be retrieved for this candidate (search "
+                "and profile lookup both returned nothing), so we cannot confirm it "
+                "exists or belongs to this person. " + (reason or "")
+            ).strip()
+            print(f"  [VERIFY] {platform} evidence floor -> downgraded to manual review")
 
     # Name-only ground truth can't rule out a namesake — downgrade a Verified to
     # Manual Review (better a human check than a confident wrong confirmation).

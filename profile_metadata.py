@@ -56,8 +56,46 @@ _HANDLE_IN_TEXT = re.compile(r"\(@([A-Za-z0-9_.]+)\)")
 _COUNT_RE = r"([\d][\d.,]*\s*[KMB]?)"
 
 
+# Platforms where a plain GET reliably separates a real profile from a missing
+# one. Calibrated against known-good and known-bad handles:
+#   YouTube / X                  -> 404 when missing, 200 when real  (reliable)
+#   Instagram / Facebook / TikTok -> 200 for everything, even nonsense (useless)
+# Only the reliable two are probed; the rest would produce false "exists".
+_EXISTENCE_CHECK_PLATFORMS = frozenset({"YouTube", "X"})
+
+_MISSING_CACHE: Dict[str, bool] = {}
+
+
 def clear_cache() -> None:
     _CACHE.clear()
+    _MISSING_CACHE.clear()
+
+
+def profile_is_missing(url: str, platform: str) -> bool:
+    """
+    True ONLY when the platform definitively reports the profile does not exist.
+
+    Deliberately conservative: an unreliable platform, a network error, a
+    timeout, or any non-404 response all return False ("not proven missing"),
+    so this can only ever drop a candidate we are certain about. It exists
+    because Serper context for a URL is NOT proof the URL resolves — searching
+    "youtube.com/@someone" happily returns pages about that person even when the
+    channel was never created, which previously produced Verified 404s.
+    """
+    if platform not in _EXISTENCE_CHECK_PLATFORMS or not url:
+        return False
+    if url in _MISSING_CACHE:
+        return _MISSING_CACHE[url]
+    missing = False
+    try:
+        resp = requests.get(url, headers={**_BASE_HEADERS, "User-Agent": _USER_AGENTS[0]},
+                            timeout=_TIMEOUT, allow_redirects=True)
+        missing = resp.status_code == 404
+    except Exception as exc:  # noqa: BLE001 — never let a probe fail a candidate
+        print(f"  [EXISTS] probe failed {url[:60]}… : {exc.__class__.__name__}")
+        missing = False
+    _MISSING_CACHE[url] = missing
+    return missing
 
 
 def _fetch_html(url: str) -> str:

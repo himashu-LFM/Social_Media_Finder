@@ -20,6 +20,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import threading
@@ -60,9 +61,20 @@ _COUNT_RE = re.compile(
 # Per-run cache so the same profile URL isn't looked up on Serper twice.
 _CONTEXT_CACHE: Dict[str, Dict[str, Any]] = {}
 
+# Per-run cache of site-search DISCOVERY results, keyed by (talent, platform).
+# Google does not return a stable result set for repeated identical queries, so
+# without this the same talent appearing twice in a file (different brand_id,
+# same person) gets different candidates and therefore different labels — one
+# row Verified, the other Manual Review. Caching makes a run reproducible and
+# halves the Serper spend on duplicate rows.
+_DISCOVERY_CACHE: Dict[tuple, List[dict]] = {}
+_DISCOVERY_LOCK = threading.Lock()
+
 
 def clear_cache() -> None:
     _CONTEXT_CACHE.clear()
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_CACHE.clear()
 
 
 def is_configured() -> bool:
@@ -268,6 +280,15 @@ def discover_by_site(talent: str, platform: str, top_n: int = 1) -> List[dict]:
     if not domain:
         return []
 
+    # Deep-copy on the way out: callers mutate candidate meta during enrichment,
+    # so handing out the cached objects would leak one row's evidence into another.
+    cache_key = (talent.strip().lower(), platform, top_n)
+    with _DISCOVERY_LOCK:
+        cached = _DISCOVERY_CACHE.get(cache_key)
+    if cached is not None:
+        print(f"  [SERPER] site-search {platform} | '{talent}' -> {len(cached)} candidate(s) (cached)")
+        return copy.deepcopy(cached)
+
     query = f"{talent} site:{domain}"
     try:
         data = serper_search_raw(query, num_results=10)
@@ -318,5 +339,7 @@ def discover_by_site(talent: str, platform: str, top_n: int = 1) -> List[dict]:
         if len(candidates) >= top_n:
             break
 
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_CACHE[cache_key] = copy.deepcopy(candidates)
     print(f"  [SERPER] site-search {platform} | '{talent}' -> {len(candidates)} candidate(s)")
     return candidates
