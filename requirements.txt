@@ -6,3 +6,5 @@ python-dotenv
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.9
+# Analyst decision storage (verified_url / rejected_url)
+psycopg[binary,pool]>=3.1

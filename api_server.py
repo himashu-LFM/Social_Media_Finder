@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
+import db_service  # noqa: E402  — after dotenv so DATABASE_URL loads
 import verification_pipeline as testing  # noqa: E402  — after dotenv so keys load
 
 _jobs_lock = threading.Lock()
@@ -473,6 +474,59 @@ def api_export_latest() -> FileResponse:
         status_code=503,
         detail=last_err or "Export file is locked or unreadable. Close it in Excel and try again.",
     )
+
+
+class DecisionBody(BaseModel):
+    """One analyst decision about one profile link."""
+    title: str = Field(..., min_length=1)
+    platform: str = Field(..., min_length=1)
+    url: str = Field(..., min_length=1)
+    title_category: str = ""
+    title_subcategory: str = ""
+
+
+class DecisionLookupBody(BaseModel):
+    titles: List[str] = Field(default_factory=list)
+
+
+@app.get("/api/db/health")
+def db_health() -> dict[str, Any]:
+    """Is the decision database reachable and are both tables present?"""
+    return {"configured": db_service.is_configured(), **db_service.ping()}
+
+
+def _record(save, body: DecisionBody, kind: str) -> dict[str, Any]:
+    if not db_service.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="DATABASE_URL is not set. Add it to .env and restart the API.",
+        )
+    if body.platform not in db_service.PLATFORM_COLUMNS:
+        raise HTTPException(status_code=400, detail=f"Unknown platform '{body.platform}'.")
+    try:
+        row = save(body.title, body.title_category, body.title_subcategory,
+                   body.platform, body.url)
+    except Exception as exc:  # noqa: BLE001 — surface the cause, don't 500 blindly
+        raise HTTPException(status_code=502, detail=f"{exc.__class__.__name__}: {exc}") from exc
+    return {"ok": True, "kind": kind, "row": row}
+
+
+@app.post("/api/decisions/verify")
+def decision_verify(body: DecisionBody) -> dict[str, Any]:
+    """Save a confirmed profile URL onto the title's single verified_url row."""
+    return _record(db_service.save_verified, body, "verified")
+
+
+@app.post("/api/decisions/reject")
+def decision_reject(body: DecisionBody) -> dict[str, Any]:
+    """Save a rejected profile URL onto the title's single rejected_url row."""
+    return _record(db_service.save_rejected, body, "rejected")
+
+
+@app.post("/api/decisions/lookup")
+def decision_lookup(body: DecisionLookupBody) -> dict[str, Any]:
+    """Existing decisions for these titles, so the UI can show saved state."""
+    return {"decisions": db_service.fetch_decisions(body.titles)}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
