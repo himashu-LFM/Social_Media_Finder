@@ -68,6 +68,11 @@ def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str]) -> Non
 UPLOAD_DIR = ROOT / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# Generated workbooks live in exports/ rather than the repo root, so a run never
+# litters the source tree. Override with EXPORT_DIR when deploying.
+EXPORT_DIR = Path(os.getenv("EXPORT_DIR", "")).resolve() if os.getenv("EXPORT_DIR") else ROOT / "exports"
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
@@ -148,13 +153,13 @@ def _persist_outputs(final_df: Any) -> tuple[str, Optional[str]]:
     Returns (final_output_path, serper_output_path). The Serper-only frame is
     stashed on ``final_df.attrs['serper_df']`` by the pipeline.
     """
-    out_path = testing.save_output(final_df, output_dir=ROOT)
+    out_path = testing.save_output(final_df, output_dir=EXPORT_DIR)
     serper_path: Optional[str] = None
     serper_df = getattr(final_df, "attrs", {}).get("serper_df")
     if serper_df is not None:
         try:
             serper_path = testing.save_output(
-                serper_df, output_dir=ROOT, filename_prefix="Talent_Social_Serper"
+                serper_df, output_dir=EXPORT_DIR, filename_prefix="Talent_Social_Serper"
             )
         except Exception as exc:  # noqa: BLE001 — companion is best-effort
             print(f"[api_server] Serper companion save failed: {exc}")
@@ -342,7 +347,7 @@ async def start_job_from_upload(file: UploadFile = File(...)) -> dict[str, Any]:
 
 def _latest_lookup_paths() -> List[Path]:
     paths = sorted(
-        ROOT.glob("Talent_Social_Lookup_*.xlsx"),
+        EXPORT_DIR.glob("Talent_Social_Lookup_*.xlsx"),
         key=lambda p: p.name,
         reverse=True,
     )
@@ -363,7 +368,7 @@ def _cell_json(v: Any) -> Any:
 
 def _latest_serper_paths() -> List[Path]:
     paths = sorted(
-        ROOT.glob("Talent_Social_Serper_*.xlsx"),
+        EXPORT_DIR.glob("Talent_Social_Serper_*.xlsx"),
         key=lambda p: p.name,
         reverse=True,
     )

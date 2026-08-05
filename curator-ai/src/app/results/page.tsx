@@ -99,7 +99,7 @@ async function loadLatestWorkbookRows(jobId?: string): Promise<{
     }
   }
 
-  const dataDir = path.resolve(process.cwd(), "..");
+  const dataDir = path.resolve(process.cwd(), "..", "exports");
   const files = await readdir(dataDir, { withFileTypes: true });
   const candidates = files
     .filter((f) => f.isFile())

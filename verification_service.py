@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -122,6 +123,156 @@ def _candidate_has_evidence(cand: Dict[str, Any]) -> bool:
     return any(meta.get(k) not in ("", None, [], {}) for k in _EVIDENCE_META_KEYS)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+#  Authenticity guards
+#
+#  A profile can describe the right person accurately and still not BE that
+#  person. Fan pages quote real credits; tribute accounts state real facts.
+#  Everything below separates "this content is ABOUT them" from "this account
+#  IS them" — the distinction the LLM alone was not reliably making.
+#
+#  All guards are one-directional: they can only downgrade Verified to Manual
+#  Review, never promote. A false trigger costs coverage, never precision.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Phrases where an account DECLARES ITSELF to be about someone rather than
+# authored by them. Deliberately narrow: plain third person is not enough,
+# because genuine official pages are routinely written in third person
+# ("Guy Branum is a comedian best known for…" is his real page).
+_THIRD_PARTY_PATTERNS = (
+    r"\bthis (?:page|account|profile) is about\b",
+    r"\b(?:page|account) (?:is )?dedicated to\b",
+    r"\bfan[ _-]?(?:page|account|club|site)\b",
+    r"\bunofficial\b",
+    r"\bnot affiliated\b",
+    r"\bnot (?:the )?official\b",
+    r"\bparody\b",
+    r"\btribute (?:page|account)\b",
+    r"\bwe are not\b",
+    # Same self-declaration in the languages these pages most often use.
+    r"\b(?:essa|esta) p[áa]gina é sobre\b",
+    r"\besta p[áa]gina es sobre\b",
+    r"\bp[áa]gina de fãs\b",
+)
+_THIRD_PARTY_RE = re.compile("|".join(_THIRD_PARTY_PATTERNS), re.I)
+
+# Metadata fields that carry the profile's own words.
+_SELF_DESCRIPTION_KEYS = (
+    "bio", "serper_snippet", "serper_title", "display_name", "title", "snippet",
+)
+
+
+def _candidate_text(cand: Dict[str, Any]) -> str:
+    meta = cand.get("meta") or {}
+    parts = [str(meta.get(k, "")) for k in _SELF_DESCRIPTION_KEYS]
+    kg = meta.get("knowledge_graph")
+    if isinstance(kg, dict):
+        parts += [str(kg.get("description", "")), str(kg.get("title", ""))]
+    return " ".join(p for p in parts if p)
+
+
+def _third_party_framing(cand: Dict[str, Any]) -> str:
+    """The self-declaration phrase found, or "" when the account speaks as itself."""
+    m = _THIRD_PARTY_RE.search(_candidate_text(cand))
+    return m.group(0) if m else ""
+
+
+def _tokens(text: str) -> List[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 1]
+
+
+def _is_ordered_subsequence(needle: List[str], haystack: List[str]) -> bool:
+    it = iter(haystack)
+    return all(tok in it for tok in needle)
+
+
+def _name_order_mismatch(talent: str, cand: Dict[str, Any]) -> str:
+    """
+    Flag a displayed name that contains the talent's words in the WRONG ORDER.
+
+    "Scully N James" carries both tokens of "James Scully", so a set-based match
+    accepts it — but it is a different person. Reordering is flagged; INSERTION
+    is not, so "Anthony Charles Edwards" and "Toby Kebbell (actor)" still pass.
+    """
+    meta = cand.get("meta") or {}
+    shown = str(meta.get("display_name") or meta.get("serper_title") or meta.get("title") or "")
+    if not shown:
+        return ""
+    want, have = _tokens(talent), _tokens(shown)
+    if len(want) < 2 or not set(want).issubset(set(have)):
+        return ""  # not a full name match at all — a different guard's problem
+    if _is_ordered_subsequence(want, have):
+        return ""  # correct order, possibly with middle names — fine
+    return shown.strip()[:60]
+
+
+# Handle shapes that fan and impostor accounts favour. A penalty signal, not a
+# rejection: plenty of real people have a digit in their handle.
+_FAN_HANDLE_RE = re.compile(
+    r"(?:^|[._-])(?:fan|fans|fanpage|official_?page|tribute|updates?|daily|source|news)"
+    r"(?:[._-]|\d|$)|[._-]?\d{1,3}$",
+    re.I,
+)
+
+# Evidence that is genuinely about the account holder rather than a search blurb.
+_STRONG_EVIDENCE_KEYS = ("bio", "knowledge_graph", "verified", "followers", "subscribers")
+
+
+def _has_strong_evidence(cand: Dict[str, Any]) -> bool:
+    meta = cand.get("meta") or {}
+    return any(meta.get(k) not in ("", None, [], {}) for k in _STRONG_EVIDENCE_KEYS)
+
+
+def _implausible_following(ground_truth: Dict[str, Any], cand: Dict[str, Any]) -> str:
+    """
+    A notable subject with a three-figure following is almost never the real
+    account. Only applied when the ground truth shows genuine notability, so
+    unknown people are unaffected.
+    """
+    notable = bool(ground_truth.get("known_works") or ground_truth.get("reference_sources")
+                   or ground_truth.get("summary"))
+    if not notable:
+        return ""
+    raw = str((cand.get("meta") or {}).get("followers", "")).strip()
+    if not raw or re.search(r"[kmb]", raw, re.I):
+        return ""  # K/M/B suffix means it is comfortably above the floor
+    try:
+        count = int(re.sub(r"[^\d]", "", raw) or 0)
+    except ValueError:
+        return ""
+    return raw if 0 < count < 1000 else ""
+
+
+def _authenticity_block(talent: str, ground_truth: Dict[str, Any],
+                        cand: Dict[str, Any]) -> str:
+    """Return a human-readable reason to withhold Verified, or "" to allow it."""
+    phrase = _third_party_framing(cand)
+    if phrase:
+        return (f"The profile describes itself in the third party (\"{phrase}\"), which "
+                f"indicates a fan, tribute or unofficial page rather than the person's own account.")
+
+    shown = _name_order_mismatch(talent, cand)
+    if shown:
+        return (f"The displayed name \"{shown}\" uses the subject's words in a different order, "
+                f"which commonly indicates a different person rather than a name variant.")
+
+    followers = _implausible_following(ground_truth, cand)
+    if followers:
+        return (f"A follower count of {followers} is implausible for this subject, "
+                f"suggesting an impostor or inactive duplicate account.")
+
+    handle = str((cand.get("meta") or {}).get("username", "")) or _handle_from(cand.get("url", ""))
+    if handle and _FAN_HANDLE_RE.search(handle) and not _has_strong_evidence(cand):
+        return (f"The handle \"{handle}\" follows a fan/duplicate account pattern and no "
+                f"profile content was retrieved to rule that out.")
+    return ""
+
+
+def _handle_from(url: str) -> str:
+    m = re.search(r"(?:https?://)?[^/]+/(?:@|c/|channel/|user/)?([^/?#]+)", url or "")
+    return m.group(1) if m else ""
+
+
 @dataclass
 class VerificationResult:
     platform: str
@@ -191,6 +342,23 @@ _SYSTEM_MSG = (
     "from the content and ground truth that it is the SAME person/entity before "
     "choosing 'verified'. Agreement supports the link; it does not by itself prove "
     "identity.\n\n"
+    "FIRST-PARTY TEST — THE MOST COMMON FAILURE: an account can describe the person "
+    "completely accurately and still not belong to them. Fan pages, tribute pages and "
+    "news accounts quote real credits, real biographies and real roles — that is what "
+    "they exist to do. So matching content proves the account is ABOUT the person; it "
+    "does NOT prove the account IS the person. Ask specifically: does this profile speak "
+    "AS the subject (first-person bio, their own links, their own promotional posts, a "
+    "platform verification badge), or ABOUT the subject (describing them in the third "
+    "party, 'this page is about…', 'unofficial', 'fan page', collecting their news)? "
+    "Only the former supports 'verified'. Listing one's own projects or employers counts "
+    "as speaking AS the subject; describing the person to an audience does not.\n\n"
+    "ABSENCE OF CONTRADICTION IS NOT EVIDENCE: on platforms that expose little data "
+    "(X, TikTok) you will often see only a handle and a name. 'Nothing contradicts this' "
+    "is the default state of an empty profile, not a reason to verify. Verification "
+    "requires a POSITIVE identity signal, never merely the lack of a negative one.\n\n"
+    "NAME ORDER MATTERS: a displayed name containing the subject's words in a different "
+    "order ('Scully N James' for 'James Scully') usually indicates a different person, "
+    "not a stylisation. Extra middle names or suffixes are fine; reordering is not.\n\n"
     "LABELS:\n"
     "  • verified — use when the candidate's own content reasonably shows this is the "
     "person/entity's official profile: the name PLUS at least one substantive identity "
@@ -424,6 +592,22 @@ def verify_platform(
                 "exists or belongs to this person. " + (reason or "")
             ).strip()
             print(f"  [VERIFY] {platform} evidence floor -> downgraded to manual review")
+
+    # AUTHENTICITY GUARDS. An accurate description of the subject is not proof of
+    # authorship — fan pages quote real credits. These catch the cases the model
+    # read as confirmation: self-declared "about" pages, reordered names, and
+    # impossible follower counts.
+    if status == STATUS_VERIFIED and best:
+        chosen = next((c for c in candidates if c.get("url") == best), None)
+        if chosen is not None:
+            block = _authenticity_block(
+                str(wiki_meta.get("name") or ""), wiki_meta, chosen
+            )
+            if block:
+                status = STATUS_MANUAL
+                confidence = min(confidence, 70)
+                reason = f"{block} {reason}".strip()
+                print(f"  [VERIFY] {platform} authenticity guard -> manual review")
 
     # Name-only ground truth can't rule out a namesake — downgrade a Verified to
     # Manual Review (better a human check than a confident wrong confirmation).

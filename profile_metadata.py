@@ -205,8 +205,13 @@ def enrich_candidates(candidates: List[dict], platform: str) -> None:
     Existing metadata (e.g. from Apify) is preserved; fetched fields only fill
     gaps. Candidates already enriched this run are skipped.
     """
+    # NOTE: this uses its own flag. It previously shared `_enriched` with the
+    # pipeline's Serper-context pass, which sets that flag on every candidate
+    # before calling this function — so every candidate was skipped and the OG
+    # fetch never ran at all. Follower counts, bios and verified badges were
+    # silently absent from every verification.
     for cand in candidates:
-        if cand.get("_enriched"):
+        if cand.get("_og_enriched"):
             continue
         url = cand.get("url", "")
         if not url:
@@ -215,4 +220,4 @@ def enrich_candidates(candidates: List[dict], platform: str) -> None:
         merged = dict(fetched)
         merged.update({k: v for k, v in (cand.get("meta") or {}).items() if v not in ("", None)})
         cand["meta"] = merged
-        cand["_enriched"] = True
+        cand["_og_enriched"] = True
