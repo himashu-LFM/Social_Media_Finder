@@ -8,15 +8,27 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Runtime directories.
+# uploads/ holds uploaded inputs (deleted after each job);
+# exports/ holds generated workbooks — reproduce them by running the pipeline.
 uploads/
+exports/
+!exports/.gitkeep
 
 # Node / Next.js (curator-ai)
 curator-ai/node_modules/
 curator-ai/.next/
 curator-ai/out/
 
-# Generated exports (keep Demo_Social.xlsx if present as sample)
-Talent_Social_Lookup_*.xlsx
+# Editor-local config
+.claude/
+
+# Scratch files — a leading underscore means temporary by convention
+_*.py
+_*.log
+_*.txt
+_*.xlsx
 
 # OS / IDE
 .DS_Store

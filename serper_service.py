@@ -20,8 +20,10 @@ Environment variables:
 
 from __future__ import annotations
 
+import copy
 import os
 import re
+import threading
 import time
 from typing import Any, Dict, List
 from urllib.parse import urlparse
@@ -34,6 +36,12 @@ from retry_util import request_with_retry
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "").strip()
 
 _SERPER_URL = "https://google.serper.dev/search"
+
+# Cap concurrent Serper calls. The pipeline can launch ~20 at once (rows ×
+# platforms); that burst of simultaneous TLS handshakes caused SSL connection
+# resets. This bounds live Serper connections regardless of row/platform workers.
+_SERPER_MAX_CONCURRENCY = max(1, int(os.environ.get("SERPER_MAX_CONCURRENCY", "6")))
+_SERPER_SEM = threading.BoundedSemaphore(_SERPER_MAX_CONCURRENCY)
 
 # Natural-language platform term used when building discovery queries.
 _PLATFORM_TERM: Dict[str, str] = {
@@ -53,9 +61,20 @@ _COUNT_RE = re.compile(
 # Per-run cache so the same profile URL isn't looked up on Serper twice.
 _CONTEXT_CACHE: Dict[str, Dict[str, Any]] = {}
 
+# Per-run cache of site-search DISCOVERY results, keyed by (talent, platform).
+# Google does not return a stable result set for repeated identical queries, so
+# without this the same talent appearing twice in a file (different brand_id,
+# same person) gets different candidates and therefore different labels — one
+# row Verified, the other Manual Review. Caching makes a run reproducible and
+# halves the Serper spend on duplicate rows.
+_DISCOVERY_CACHE: Dict[tuple, List[dict]] = {}
+_DISCOVERY_LOCK = threading.Lock()
+
 
 def clear_cache() -> None:
     _CONTEXT_CACHE.clear()
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_CACHE.clear()
 
 
 def is_configured() -> bool:
@@ -70,7 +89,8 @@ def serper_search_raw(query: str, num_results: int = 10) -> dict:
     """Full Serper JSON (organic + knowledgeGraph + …). Raises on fatal errors."""
     headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
     payload = {"q": query, "num": max(1, min(num_results, 10))}
-    response = request_with_retry("POST", _SERPER_URL, headers=headers, json=payload, timeout=30)
+    with _SERPER_SEM:  # bound concurrent Serper connections (avoids TLS-burst resets)
+        response = request_with_retry("POST", _SERPER_URL, headers=headers, json=payload, timeout=30)
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -260,19 +280,44 @@ def discover_by_site(talent: str, platform: str, top_n: int = 1) -> List[dict]:
     if not domain:
         return []
 
+    # Deep-copy on the way out: callers mutate candidate meta during enrichment,
+    # so handing out the cached objects would leak one row's evidence into another.
+    cache_key = (talent.strip().lower(), platform, top_n)
+    with _DISCOVERY_LOCK:
+        cached = _DISCOVERY_CACHE.get(cache_key)
+    if cached is not None:
+        print(f"  [SERPER] site-search {platform} | '{talent}' -> {len(cached)} candidate(s) (cached)")
+        return copy.deepcopy(cached)
+
     query = f"{talent} site:{domain}"
     try:
         data = serper_search_raw(query, num_results=10)
     except RuntimeError as exc:
         print(f"  [SERPER] Fatal error on site-search '{query}': {exc}")
         raise
+    except requests.RequestException as exc:
+        # Connection/SSL/timeout after retries — surface as an error, NOT an
+        # empty result, so the pipeline records "errored" rather than "not found".
+        print(f"  [SERPER] site-search connection error '{query}': {exc.__class__.__name__}")
+        raise RuntimeError(f"Serper connection error: {exc.__class__.__name__}") from exc
     except Exception as exc:  # noqa: BLE001
         print(f"  [SERPER] site-search failed '{query}': {exc}")
         return []
 
+    # The knowledge-graph panel + follower/subscriber counts are ALREADY in this
+    # same response — attach them to the chosen candidate (no extra API call) so
+    # the LLM gets real identity evidence instead of just a one-line snippet.
+    organic = data.get("organic", []) or []
+    kg = _knowledge_graph(data)
+    blob = " ".join(
+        [(it.get("title", "") + " " + it.get("snippet", "")) for it in organic[:5]]
+        + [str(kg.get("attributes", "")), kg.get("description", "")]
+    )
+    broad_counts = _parse_counts(blob)
+
     candidates: List[dict] = []
     seen: set = set()
-    for item in data.get("organic", []) or []:
+    for item in organic:
         link = item.get("link", "")
         if social_urls.platform_from_url(link) != platform:
             continue
@@ -283,10 +328,18 @@ def discover_by_site(talent: str, platform: str, top_n: int = 1) -> List[dict]:
             continue
         seen.add(norm)
         meta = _organic_fields(item)
-        meta.update(_parse_counts(meta.get("title", "") + " " + meta.get("snippet", "")))
+        # Counts from this result's own text win; fill the rest from the wider
+        # response, and attach the knowledge graph so the LLM can confirm identity.
+        counts = dict(broad_counts)
+        counts.update(_parse_counts(meta.get("title", "") + " " + meta.get("snippet", "")))
+        meta.update(counts)
+        if kg:
+            meta["knowledge_graph"] = kg
         candidates.append({"url": norm, "source": "serper", "meta": meta})
         if len(candidates) >= top_n:
             break
 
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_CACHE[cache_key] = copy.deepcopy(candidates)
     print(f"  [SERPER] site-search {platform} | '{talent}' -> {len(candidates)} candidate(s)")
     return candidates

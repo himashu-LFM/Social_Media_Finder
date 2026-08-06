@@ -32,7 +32,9 @@ Usage in testing.py:
     # Merge into resolved_links before running Serper
 """
 
+import os
 import re
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
@@ -40,16 +42,27 @@ from urllib.parse import urlparse, urljoin
 import requests
 
 # ── HTTP session with sensible headers ──────────────────────────────────────
+# Wikimedia asks bots to identify with a real contact; set WIKI_USER_AGENT in the
+# environment to your own. A descriptive/contactable UA is throttled less.
+_DEFAULT_UA = (
+    "SocialMediaFinder/1.0 (talent social-profile verification tool; "
+    "+https://github.com/) python-requests"
+)
 _SESSION = requests.Session()
 _SESSION.headers.update({
-    "User-Agent": (
-        "SocialMediaFinder/1.0 (talent research tool; "
-        "contact: research@example.com) python-requests/2.31"
-    ),
+    "User-Agent": os.environ.get("WIKI_USER_AGENT", "").strip() or _DEFAULT_UA,
     "Accept": "application/json, text/html, */*",
     "Accept-Language": "en-US,en;q=0.9",
 })
 TIMEOUT = 15  # seconds per request
+
+# Cap concurrent Wikipedia/Wikidata calls. Each row makes several (QID lookup,
+# entity fetch, label resolution, REST summary); 4 concurrent rows produced a
+# burst that Wikimedia rate-limited with HTTP 429. This bounds live calls so the
+# per-request retry/backoff below can actually succeed.
+_WIKI_MAX_CONCURRENCY = max(1, int(os.environ.get("WIKI_MAX_CONCURRENCY", "3")))
+_WIKI_SEM = threading.BoundedSemaphore(_WIKI_MAX_CONCURRENCY)
+_WIKI_RETRY_STATUS = {429, 500, 502, 503, 504}
 
 # ── Wikidata social property map ─────────────────────────────────────────────
 # property_id → (our_platform_key, url_template)
@@ -59,7 +72,6 @@ WIKIDATA_SOCIAL_PROPS: Dict[str, Tuple[str, str]] = {
     "P2397": ("YouTube",    "https://www.youtube.com/channel/{}"),
     "P7085": ("TikTok",     "https://www.tiktok.com/@{}"),
     "P2013": ("Facebook",   "https://www.facebook.com/{}"),
-    "P2397": ("YouTube",    "https://www.youtube.com/channel/{}"),
     "P4033": ("Mastodon",   "{}"),           # not a target platform but useful for cross-ref
     "P856":  ("_website",   "{}"),           # official website — used for Step 2
     "P18":   ("_image",     "{}"),           # image — skip
@@ -110,17 +122,54 @@ _IGNORE_HANDLES = frozenset({
 #  HELPER: safe HTTP GET
 # ────────────────────────────────────────────────────────────────────────────
 
-def _get(url: str, params: Optional[dict] = None, timeout: int = TIMEOUT) -> Optional[requests.Response]:
-    try:
-        resp = _SESSION.get(url, params=params, timeout=timeout, allow_redirects=True)
-        resp.raise_for_status()
+def _get(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: int = TIMEOUT,
+    retries: int = 4,
+    backoff: float = 2.0,
+) -> Optional[requests.Response]:
+    """
+    Rate-limit-aware GET for Wikipedia/Wikidata.
+
+    Retries on 429/5xx and connection errors with exponential backoff (honouring
+    a ``Retry-After`` header), and bounds concurrency via ``_WIKI_SEM`` so bursts
+    don't trip Wikimedia's rate limiter in the first place. Returns None only
+    after retries are exhausted, so a transient 429 no longer degrades a row to
+    name-only ground truth.
+    """
+    for attempt in range(retries + 1):
+        try:
+            with _WIKI_SEM:  # bound concurrent Wikimedia calls
+                resp = _SESSION.get(url, params=params, timeout=timeout, allow_redirects=True)
+        except requests.RequestException as exc:
+            if attempt < retries:
+                time.sleep(min(backoff ** attempt, 30))
+                continue
+            print(f"  [WIKI] Request failed {url[:80]}: {exc.__class__.__name__}")
+            return None
+
+        if resp.status_code in _WIKI_RETRY_STATUS:
+            if attempt < retries:
+                delay = backoff ** attempt
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = max(delay, float(retry_after))
+                    except ValueError:
+                        pass
+                time.sleep(min(delay, 30))  # released the semaphore before sleeping
+                continue
+            print(f"  [WIKI] HTTP {resp.status_code} (rate-limited; retries exhausted) {url[:80]}")
+            return None
+
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError:
+            print(f"  [WIKI] HTTP {resp.status_code} fetching {url[:80]}")
+            return None
         return resp
-    except requests.exceptions.HTTPError as e:
-        print(f"  [WIKI] HTTP {e.response.status_code} fetching {url[:80]}")
-        return None
-    except Exception as e:
-        print(f"  [WIKI] Request failed {url[:80]}: {e.__class__.__name__}: {e}")
-        return None
+    return None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -176,6 +225,39 @@ def _wikipedia_url_to_qid(wikipedia_url: str) -> Optional[str]:
     return None
 
 
+def _imdb_to_qid(imdb_id: str) -> Optional[str]:
+    """
+    Resolve a Wikidata QID from an IMDb id via an EXACT property match (P345).
+
+    Far safer than the name search: an IMDb id identifies exactly one person, so
+    there is no namesake risk and no need for the title-matching guard. Returns
+    None when the person simply has no Wikidata entity (common for minor talent),
+    which correctly leaves the ground truth thin rather than inventing one.
+    """
+    match = re.search(r"(nm\d{5,})", imdb_id or "", re.I)
+    if not match:
+        return None
+    resp = _get(
+        "https://www.wikidata.org/w/api.php",
+        params={
+            "action": "query", "list": "search",
+            "srsearch": f"haswbstatement:P345={match.group(1)}",
+            "format": "json", "srlimit": 1,
+        },
+    )
+    if not resp:
+        return None
+    try:
+        hits = resp.json().get("query", {}).get("search", [])
+        if hits:
+            qid = hits[0]["title"]
+            print(f"  [WIKI] QID from IMDb id {match.group(1)}: {qid}")
+            return qid
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [WIKI] IMDb-to-QID failed: {exc}")
+    return None
+
+
 def _name_to_qid(talent: str, title_category: str = "", title_sub_category: str = "") -> Optional[str]:
     """
     When no Wikipedia URL is provided, try to find the Wikidata entity via
@@ -216,12 +298,35 @@ def _name_to_qid(talent: str, title_category: str = "", title_sub_category: str 
         results = resp.json()["query"]["search"]
         if not results:
             return None
-        # Use the first result — re-run with its title to get QID
-        top_title = results[0]["title"]
-        return _wikipedia_url_to_qid(f"https://en.wikipedia.org/wiki/{top_title.replace(' ', '_')}")
+        # Wikipedia full-text search ALWAYS returns something for a plausible
+        # name, so adopting results[0] unchecked silently attaches a stranger's
+        # biography to the row. That is how the brand "NetBrain" acquired the
+        # ground truth of "Versata" and had four correct profiles suppressed.
+        # Require the article title to actually contain the entity's name.
+        match = next((r["title"] for r in results if _title_matches_name(r.get("title", ""), clean_name)), None)
+        if not match:
+            print(f"  [WIKI] Search hits for '{clean_name}' don't match the name "
+                  f"({[r.get('title') for r in results[:3]]}) — no QID adopted.")
+            return None
+        return _wikipedia_url_to_qid(f"https://en.wikipedia.org/wiki/{match.replace(' ', '_')}")
     except Exception as e:
         print(f"  [WIKI] Search-to-QID failed: {e}")
         return None
+
+
+def _title_matches_name(title: str, name: str) -> bool:
+    """
+    True when a Wikipedia article title plausibly names this entity.
+
+    Every significant token of the entity name must appear in the title, so
+    "NetBrain" accepts "NetBrain Technologies" and "Toby Kebbell" accepts
+    "Toby Kebbell (actor)", but neither accepts "Versata". Strict on purpose:
+    a missed QID degrades to thin ground truth (a Manual Review), while a wrong
+    QID produces a confident wrong answer.
+    """
+    tokens = lambda s: set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+    name_tokens = {t for t in tokens(name) if len(t) > 1}
+    return bool(name_tokens) and name_tokens.issubset(tokens(title))
 
 
 # ────────────────────────────────────────────────────────────────────────────

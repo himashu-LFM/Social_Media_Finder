@@ -151,6 +151,12 @@ def normalize_profile_url(url: str, platform: str) -> str:
     if not url or not isinstance(url, str):
         return ""
     u = url.strip()
+    if platform == "X":
+        # twitter.com and x.com are the same account. Without this the same
+        # profile from two sources never dedupes, and a link that matches the
+        # client's record reads as a mismatch.
+        u = re.sub(r"^(https?://)(www\.|mobile\.)?twitter\.com", r"\1x.com", u, flags=re.I)
+        u = re.sub(r"^(https?://)(www\.|mobile\.)?x\.com", r"\1x.com", u, flags=re.I)
     if platform == "YouTube":
         u = u.replace("://m.youtube.com", "://www.youtube.com")
         u = u.replace("://music.youtube.com", "://www.youtube.com")
@@ -158,6 +164,71 @@ def normalize_profile_url(url: str, platform: str) -> str:
         if "youtube.com" in u and "www." not in netloc and "m." not in netloc:
             u = u.replace("://youtube.com", "://www.youtube.com")
     return u.rstrip("/")
+
+
+# Templates for rebuilding a canonical profile URL from a bare handle.
+_HANDLE_URL_TEMPLATES: Dict[str, str] = {
+    "Instagram": "https://www.instagram.com/{}",
+    "Facebook":  "https://www.facebook.com/{}",
+    "X":         "https://x.com/{}",
+    "TikTok":    "https://www.tiktok.com/@{}",
+    "YouTube":   "https://www.youtube.com/@{}",
+}
+
+# A raw YouTube channel id (UC + 22 chars) needs the /channel/ form, not /@.
+_YT_CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+
+
+def profile_url_from_handle(handle: str, platform: str) -> str:
+    """Build a canonical profile URL from a bare handle ('trevorstj' -> full URL)."""
+    h = (handle or "").strip().lstrip("@").strip("/")
+    if not h or platform not in _HANDLE_URL_TEMPLATES:
+        return ""
+    if platform == "YouTube" and _YT_CHANNEL_ID_RE.match(h):
+        return f"https://www.youtube.com/channel/{h}"
+    return _HANDLE_URL_TEMPLATES[platform].format(h)
+
+
+def coerce_profile_url(value: object, platform: str) -> str:
+    """
+    Turn a spreadsheet cell into a canonical profile URL for ``platform``.
+
+    Input columns are inconsistent in the wild, so this accepts all the shapes
+    seen in the brand-definition export:
+      • a full URL           "http://twitter.com/trevorstjohn"
+      • a bare handle        "trevorstj"
+      • an @handle           "@scotteller21"
+      • a flag/URL pair      "FALSE|http://www.facebook.com/actortrevorstjohn"
+
+    Returns "" when the value can't be resolved to a VALID profile URL for that
+    platform, so a junk cell can never enter the candidate set.
+    """
+    raw = str(value or "").strip()
+    # Guard the null-ish spellings that reach here from spreadsheets: a pandas
+    # NaN stringifies to "nan" and would otherwise become the handle "nan".
+    if not raw or raw.lower() in ("nan", "none", "null", "n/a", "-", "#n/a"):
+        return ""
+    # "TRUE|http://twitter.com/ScotTeller21" -> prefer the URL half.
+    if "|" in raw:
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        if not parts:
+            return ""
+        raw = next((p for p in parts if p.lower().startswith("http")), parts[0])
+    tokens = raw.split()
+    if not tokens:
+        return ""
+    raw = tokens[0].strip()
+
+    if raw.lower().startswith(("http://", "https://")):
+        url = "https://" + raw.split("://", 1)[1]  # normalise the scheme
+        if platform_from_url(url) != platform:
+            return ""  # column says one platform, value points at another
+    else:
+        url = profile_url_from_handle(raw, platform)
+
+    if not url or not is_valid_profile_url(url, platform):
+        return ""
+    return normalize_profile_url(url, platform)
 
 
 def handle_from_url(url: str, platform: str) -> str:

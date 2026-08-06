@@ -9,6 +9,8 @@ export const STATUS_VERIFIED = "Verified";
 export const STATUS_WRONG = "Wrong";
 export const STATUS_MANUAL = "Manual Review Needed";
 export const STATUS_NOT_FOUND = "Not Found";
+/** Never searched because the run was stopped — asserts nothing, unlike Not Found. */
+export const STATUS_STOPPED = "Not Checked";
 
 /** Platform metadata driving column order, labels, and workbook keys. */
 export const RESULT_PLATFORMS: {
@@ -70,6 +72,8 @@ export function statusTone(status: string): string {
       return "bg-amber-500/10 text-amber-300 ring-amber-500/30";
     case STATUS_WRONG:
       return "bg-rose-500/10 text-rose-300 ring-rose-500/30";
+    case STATUS_STOPPED:
+      return "bg-sky-500/10 text-sky-300 ring-sky-500/30";
     default:
       return "bg-slate-500/10 text-slate-400 ring-slate-500/20";
   }

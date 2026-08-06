@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, Manrope } from "next/font/google";
+import { AppChrome } from "@/components/AppChrome";
 import { BackgroundScene } from "@/components/three/BackgroundScene";
 import { ToastProvider } from "@/components/ToastProvider";
 import "./globals.css";
@@ -40,7 +41,9 @@ export default function RootLayout({
         {/* Animated gradient + lazy Three.js scene, behind all page content. */}
         <div className="lf-aurora" aria-hidden />
         <BackgroundScene />
-        <ToastProvider>{children}</ToastProvider>
+        <ToastProvider>
+          <AppChrome>{children}</AppChrome>
+        </ToastProvider>
       </body>
     </html>
   );

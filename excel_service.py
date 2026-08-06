@@ -32,6 +32,7 @@ import social_urls
 from verification_service import (
     STATUS_MANUAL,
     STATUS_NOT_FOUND,
+    STATUS_STOPPED,
     STATUS_VERIFIED,
     STATUS_WRONG,
 )
@@ -44,6 +45,28 @@ OVERALL_CONF_COL = "Confidence"
 # Used as identity context by the verifier (especially when no Wikipedia URL is
 # given). It is NOT part of ``ordered_columns`` so it is dropped before export.
 INPUT_META_COL = "_input_metadata"
+
+# Working-only column holding {platform: profile_url} for handles the CLIENT
+# already recorded in the input file. These are by far the strongest candidates
+# available — the brand-definition export ships instagram_user / twitter_handle
+# / facebook_page / tiktok_user / youtube_channel_username on many rows, and
+# re-discovering them from scratch is both wasteful and less accurate.
+# Not part of ``ordered_columns`` so it is dropped before export.
+INPUT_HANDLES_COL = "_input_handles"
+
+# Input column aliases that carry an existing handle/URL per platform. Matched
+# case-insensitively against the header. Order matters: first hit wins.
+_PLATFORM_HANDLE_COLUMNS: Dict[str, List[str]] = {
+    "Instagram": ["instagram_user", "instagram_username", "instagram_handle",
+                  "instagram_url", "instagram", "ig_handle"],
+    "Facebook":  ["facebook_page", "facebook_url", "facebook_username",
+                  "facebook", "fb_page"],
+    "X":         ["twitter_handle", "twitter_url", "twitter_username",
+                  "x_handle", "x_url", "twitter"],
+    "YouTube":   ["youtube_channel_username", "youtube_channel_id",
+                  "youtube_channel", "youtube_url", "youtube"],
+    "TikTok":    ["tiktok_user", "tiktok_handle", "tiktok_url", "tiktok"],
+}
 
 # Output platform order (also the processing/UI order).
 PLATFORM_ORDER: List[str] = list(social_urls.PLATFORMS.keys())
@@ -147,9 +170,10 @@ def _new_frame(rows: List[Dict[str, str]]) -> pd.DataFrame:
     for col in ordered_columns():
         if col not in df.columns:
             df[col] = ""
-    if INPUT_META_COL not in df.columns:
-        df[INPUT_META_COL] = ""
-    df = df[ordered_columns() + [INPUT_META_COL]]
+    for working_col in (INPUT_META_COL, INPUT_HANDLES_COL):
+        if working_col not in df.columns:
+            df[working_col] = ""
+    df = df[ordered_columns() + [INPUT_META_COL, INPUT_HANDLES_COL]]
     # Force object dtype so numeric confidences (and the metadata dict) can share
     # columns with strings — some pandas versions infer a strict `str` dtype for
     # all-string columns, which then rejects int/dict assignment.
@@ -189,11 +213,19 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
         or _detect_wiki_column(raw, exclude={name_col})
     )
 
+    # Columns that already carry a known profile handle/URL per platform.
+    handle_cols: Dict[str, str] = {}
+    for platform, aliases in _PLATFORM_HANDLE_COLUMNS.items():
+        col = _find_column(raw, *aliases)
+        if col is not None:
+            handle_cols[platform] = col
+
     # Every column that is neither the name nor the Wikipedia URL becomes
     # per-row identity metadata (used by the verifier, e.g. when no wiki link).
     meta_cols = [c for c in raw.columns if c not in (name_col, wiki_col)]
 
     rows: List[Dict[str, object]] = []
+    handle_hits = 0
     for i in range(len(raw)):
         name = _clean_talent_name(_clean_str(raw.iloc[i][name_col]))
         if not name:
@@ -204,10 +236,26 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
             for c in meta_cols
             if _clean_str(raw.iloc[i][c])
         }
-        rows.append({TALENT_COL: name, WIKI_COL: wiki, INPUT_META_COL: metadata})
+        known: Dict[str, str] = {}
+        for platform, col in handle_cols.items():
+            # _clean_str first: a bare pandas NaN stringifies to "nan", which
+            # would otherwise be accepted as the handle "nan".
+            url = social_urls.coerce_profile_url(_clean_str(raw.iloc[i][col]), platform)
+            if url:
+                known[platform] = url
+        handle_hits += len(known)
+        rows.append({
+            TALENT_COL: name, WIKI_COL: wiki,
+            INPUT_META_COL: metadata, INPUT_HANDLES_COL: known,
+        })
 
     if not rows:
         raise ValueError("No valid talent names found.")
+    if handle_cols:
+        print(f"[INPUT] Handle columns detected: "
+              f"{ {p: str(c) for p, c in handle_cols.items()} }")
+        print(f"[INPUT] {handle_hits} known profile URL(s) supplied across "
+              f"{len(rows)} row(s) — these are verified, not re-discovered.")
     return _new_frame(rows)
 
 
@@ -229,15 +277,20 @@ _STATUS_FILL = {
     STATUS_MANUAL: "FFF2CC",     # amber
     STATUS_WRONG: "FCE4D6",      # red
     STATUS_NOT_FOUND: "F2F2F2",  # grey
+    STATUS_STOPPED: "DDEBF7",    # blue — never searched, not an absence
 }
 
 
-def save_results(df: pd.DataFrame, output_dir: Optional[Path] = None) -> Path:
+def save_results(
+    df: pd.DataFrame,
+    output_dir: Optional[Path] = None,
+    filename_prefix: str = "Talent_Social_Lookup",
+) -> Path:
     """Write the results workbook with header styling and status colour bands."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_dir = Path(output_dir) if output_dir is not None else Path(__file__).resolve().parent
     base_dir.mkdir(parents=True, exist_ok=True)
-    output_path = base_dir / f"Talent_Social_Lookup_{timestamp}.xlsx"
+    output_path = base_dir / f"{filename_prefix}_{timestamp}.xlsx"
 
     # Keep only known columns, in canonical order.
     export_df = df.reindex(columns=ordered_columns())
@@ -292,6 +345,10 @@ def save_results(df: pd.DataFrame, output_dir: Optional[Path] = None) -> Path:
     return output_path
 
 
-def save_output(df: pd.DataFrame, output_dir: Optional[Path] = None) -> str:
+def save_output(
+    df: pd.DataFrame,
+    output_dir: Optional[Path] = None,
+    filename_prefix: str = "Talent_Social_Lookup",
+) -> str:
     """API-compatible wrapper used by api_server.py."""
-    return str(save_results(df, output_dir=output_dir))
+    return str(save_results(df, output_dir=output_dir, filename_prefix=filename_prefix))

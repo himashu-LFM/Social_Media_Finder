@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -67,9 +68,209 @@ STATUS_VERIFIED = "Verified"
 STATUS_WRONG = "Wrong"
 STATUS_MANUAL = "Manual Review Needed"
 STATUS_NOT_FOUND = "Not Found"
+# Never searched, because the operator stopped the run. Deliberately distinct
+# from "Not Found": that asserts an absence we actually looked for, and a
+# stopped cell asserts nothing at all. Keeping them separate stops a cancelled
+# run from being ingested downstream as "this profile does not exist".
+STATUS_STOPPED = "Not Checked"
 
 # A candidate may only be labelled Verified at or above this confidence.
 _VERIFIED_MIN_CONFIDENCE = 90
+
+# Identity fields that let the model tell the real person/entity apart from a
+# namesake. If NONE are present the ground truth is effectively name-only (e.g. a
+# Wikipedia 429 wiped the Wikidata lookup, or the entity has no Wikipedia page),
+# and a name match alone must NOT be allowed to Verify — it could be any namesake.
+_IDENTITY_SIGNALS = (
+    "professions", "nationalities", "birth_year", "known_works",
+    "summary", "reference_sources",
+)
+
+
+def _ground_truth_is_thin(ground_truth: Dict[str, Any]) -> bool:
+    """
+    True when the ground truth carries no facts that could rule out a namesake.
+
+    The bar differs by entity type, because the risk differs. Two people called
+    "Adam Grissom" is routine, so a person needs real identity facts. Two
+    unrelated companies both called "NetBrain" is not routine — a brand name
+    plus the client's recorded industry is already enough to disambiguate, so
+    organizations are not treated as thin when the input file describes them.
+    Persons are unchanged: this only ever loosens the gate for non-persons.
+    """
+    if any(ground_truth.get(k) for k in _IDENTITY_SIGNALS):
+        return False
+    entity_type = str(ground_truth.get("entity_type", "")).strip().lower()
+    is_org = entity_type not in ("", "person", "human")
+    if is_org and ground_truth.get("provided_metadata"):
+        return False
+    return True
+
+
+# Metadata that constitutes real evidence ABOUT the candidate profile. "username"
+# is excluded on purpose: it is derived from the URL string itself, so it proves
+# nothing. Everything here had to come back from a search or a page fetch.
+_EVIDENCE_META_KEYS = (
+    "serper_title", "serper_snippet", "serper_results", "knowledge_graph",
+    "bio", "display_name", "followers", "subscribers", "likes", "verified",
+    "website", "title", "snippet",
+)
+
+
+def _candidate_has_evidence(cand: Dict[str, Any]) -> bool:
+    """True when we actually retrieved something about this profile."""
+    meta = cand.get("meta") or {}
+    return any(meta.get(k) not in ("", None, [], {}) for k in _EVIDENCE_META_KEYS)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Authenticity guards
+#
+#  A profile can describe the right person accurately and still not BE that
+#  person. Fan pages quote real credits; tribute accounts state real facts.
+#  Everything below separates "this content is ABOUT them" from "this account
+#  IS them" — the distinction the LLM alone was not reliably making.
+#
+#  All guards are one-directional: they can only downgrade Verified to Manual
+#  Review, never promote. A false trigger costs coverage, never precision.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Phrases where an account DECLARES ITSELF to be about someone rather than
+# authored by them. Deliberately narrow: plain third person is not enough,
+# because genuine official pages are routinely written in third person
+# ("Guy Branum is a comedian best known for…" is his real page).
+_THIRD_PARTY_PATTERNS = (
+    r"\bthis (?:page|account|profile) is about\b",
+    r"\b(?:page|account) (?:is )?dedicated to\b",
+    r"\bfan[ _-]?(?:page|account|club|site)\b",
+    r"\bunofficial\b",
+    r"\bnot affiliated\b",
+    r"\bnot (?:the )?official\b",
+    r"\bparody\b",
+    r"\btribute (?:page|account)\b",
+    r"\bwe are not\b",
+    # Same self-declaration in the languages these pages most often use.
+    r"\b(?:essa|esta) p[áa]gina é sobre\b",
+    r"\besta p[áa]gina es sobre\b",
+    r"\bp[áa]gina de fãs\b",
+)
+_THIRD_PARTY_RE = re.compile("|".join(_THIRD_PARTY_PATTERNS), re.I)
+
+# Metadata fields that carry the profile's own words.
+_SELF_DESCRIPTION_KEYS = (
+    "bio", "serper_snippet", "serper_title", "display_name", "title", "snippet",
+)
+
+
+def _candidate_text(cand: Dict[str, Any]) -> str:
+    meta = cand.get("meta") or {}
+    parts = [str(meta.get(k, "")) for k in _SELF_DESCRIPTION_KEYS]
+    kg = meta.get("knowledge_graph")
+    if isinstance(kg, dict):
+        parts += [str(kg.get("description", "")), str(kg.get("title", ""))]
+    return " ".join(p for p in parts if p)
+
+
+def _third_party_framing(cand: Dict[str, Any]) -> str:
+    """The self-declaration phrase found, or "" when the account speaks as itself."""
+    m = _THIRD_PARTY_RE.search(_candidate_text(cand))
+    return m.group(0) if m else ""
+
+
+def _tokens(text: str) -> List[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 1]
+
+
+def _is_ordered_subsequence(needle: List[str], haystack: List[str]) -> bool:
+    it = iter(haystack)
+    return all(tok in it for tok in needle)
+
+
+def _name_order_mismatch(talent: str, cand: Dict[str, Any]) -> str:
+    """
+    Flag a displayed name that contains the talent's words in the WRONG ORDER.
+
+    "Scully N James" carries both tokens of "James Scully", so a set-based match
+    accepts it — but it is a different person. Reordering is flagged; INSERTION
+    is not, so "Anthony Charles Edwards" and "Toby Kebbell (actor)" still pass.
+    """
+    meta = cand.get("meta") or {}
+    shown = str(meta.get("display_name") or meta.get("serper_title") or meta.get("title") or "")
+    if not shown:
+        return ""
+    want, have = _tokens(talent), _tokens(shown)
+    if len(want) < 2 or not set(want).issubset(set(have)):
+        return ""  # not a full name match at all — a different guard's problem
+    if _is_ordered_subsequence(want, have):
+        return ""  # correct order, possibly with middle names — fine
+    return shown.strip()[:60]
+
+
+# Handle shapes that fan and impostor accounts favour. A penalty signal, not a
+# rejection: plenty of real people have a digit in their handle.
+_FAN_HANDLE_RE = re.compile(
+    r"(?:^|[._-])(?:fan|fans|fanpage|official_?page|tribute|updates?|daily|source|news)"
+    r"(?:[._-]|\d|$)|[._-]?\d{1,3}$",
+    re.I,
+)
+
+# Evidence that is genuinely about the account holder rather than a search blurb.
+_STRONG_EVIDENCE_KEYS = ("bio", "knowledge_graph", "verified", "followers", "subscribers")
+
+
+def _has_strong_evidence(cand: Dict[str, Any]) -> bool:
+    meta = cand.get("meta") or {}
+    return any(meta.get(k) not in ("", None, [], {}) for k in _STRONG_EVIDENCE_KEYS)
+
+
+def _implausible_following(ground_truth: Dict[str, Any], cand: Dict[str, Any]) -> str:
+    """
+    A notable subject with a three-figure following is almost never the real
+    account. Only applied when the ground truth shows genuine notability, so
+    unknown people are unaffected.
+    """
+    notable = bool(ground_truth.get("known_works") or ground_truth.get("reference_sources")
+                   or ground_truth.get("summary"))
+    if not notable:
+        return ""
+    raw = str((cand.get("meta") or {}).get("followers", "")).strip()
+    if not raw or re.search(r"[kmb]", raw, re.I):
+        return ""  # K/M/B suffix means it is comfortably above the floor
+    try:
+        count = int(re.sub(r"[^\d]", "", raw) or 0)
+    except ValueError:
+        return ""
+    return raw if 0 < count < 1000 else ""
+
+
+def _authenticity_block(talent: str, ground_truth: Dict[str, Any],
+                        cand: Dict[str, Any]) -> str:
+    """Return a human-readable reason to withhold Verified, or "" to allow it."""
+    phrase = _third_party_framing(cand)
+    if phrase:
+        return (f"The profile describes itself in the third party (\"{phrase}\"), which "
+                f"indicates a fan, tribute or unofficial page rather than the person's own account.")
+
+    shown = _name_order_mismatch(talent, cand)
+    if shown:
+        return (f"The displayed name \"{shown}\" uses the subject's words in a different order, "
+                f"which commonly indicates a different person rather than a name variant.")
+
+    followers = _implausible_following(ground_truth, cand)
+    if followers:
+        return (f"A follower count of {followers} is implausible for this subject, "
+                f"suggesting an impostor or inactive duplicate account.")
+
+    handle = str((cand.get("meta") or {}).get("username", "")) or _handle_from(cand.get("url", ""))
+    if handle and _FAN_HANDLE_RE.search(handle) and not _has_strong_evidence(cand):
+        return (f"The handle \"{handle}\" follows a fan/duplicate account pattern and no "
+                f"profile content was retrieved to rule that out.")
+    return ""
+
+
+def _handle_from(url: str) -> str:
+    m = re.search(r"(?:https?://)?[^/]+/(?:@|c/|channel/|user/)?([^/?#]+)", url or "")
+    return m.group(1) if m else ""
 
 
 @dataclass
@@ -118,15 +319,65 @@ _SYSTEM_MSG = (
     "platforms.\n\n"
     "If the Wikipedia-derived fields are sparse, use 'provided_metadata' (from the "
     "input file) as the identity description. Treat 'reference_sources' "
-    "(IMDb/Spotify/TMDb) and 'known_official_profiles' as strong corroboration.\n\n"
+    "(IMDb/Spotify/TMDb) as corroboration.\n\n"
+    "CRITICAL — DECLARED HANDLES ARE ONLY HINTS, NOT PROOF: the handles in "
+    "'known_official_profiles' (Wikidata-declared) and any handle inside "
+    "'provided_metadata' (from the input file) can be STALE, REASSIGNED to someone "
+    "else, or simply WRONG. A candidate whose URL/handle merely MATCHES one of these "
+    "declared handles is NOT verified on that basis alone. You must ALSO confirm, from "
+    "the CANDIDATE'S OWN evidence (title, snippet, bio, knowledge_graph, content) that "
+    "it is the SAME specific person/entity — same occupation, domain/industry and "
+    "notable works — with no contradicting signal. If the candidate's own content does "
+    "not independently establish this, you have NOT verified it.\n\n"
+    "CROSS-PLATFORM CONFIRMATION: if 'verified_handles_on_other_platforms' is present, "
+    "those handles were ALREADY confirmed as this same entity's official profiles on "
+    "OTHER platforms during this very check. A candidate whose handle matches (or is a "
+    "clear variant of) one of them is strong corroboration — you may treat that "
+    "cross-platform consistency as supporting evidence toward 'verified', provided no "
+    "content contradicts the identity.\n\n"
+    "CROSS-SOURCE AGREEMENT: a candidate flagged 'cross_source_agreement' was returned "
+    "INDEPENDENTLY by two different discovery tools (a Serper web search AND Apify). "
+    "That agreement makes it more likely to be the real, active profile and should "
+    "RAISE your confidence that the link itself is genuine — but you MUST still confirm "
+    "from the content and ground truth that it is the SAME person/entity before "
+    "choosing 'verified'. Agreement supports the link; it does not by itself prove "
+    "identity.\n\n"
+    "FIRST-PARTY TEST — THE MOST COMMON FAILURE: an account can describe the person "
+    "completely accurately and still not belong to them. Fan pages, tribute pages and "
+    "news accounts quote real credits, real biographies and real roles — that is what "
+    "they exist to do. So matching content proves the account is ABOUT the person; it "
+    "does NOT prove the account IS the person. Ask specifically: does this profile speak "
+    "AS the subject (first-person bio, their own links, their own promotional posts, a "
+    "platform verification badge), or ABOUT the subject (describing them in the third "
+    "party, 'this page is about…', 'unofficial', 'fan page', collecting their news)? "
+    "Only the former supports 'verified'. Listing one's own projects or employers counts "
+    "as speaking AS the subject; describing the person to an audience does not.\n\n"
+    "ABSENCE OF CONTRADICTION IS NOT EVIDENCE: on platforms that expose little data "
+    "(X, TikTok) you will often see only a handle and a name. 'Nothing contradicts this' "
+    "is the default state of an empty profile, not a reason to verify. Verification "
+    "requires a POSITIVE identity signal, never merely the lack of a negative one.\n\n"
+    "NAME ORDER MATTERS: a displayed name containing the subject's words in a different "
+    "order ('Scully N James' for 'James Scully') usually indicates a different person, "
+    "not a stylisation. Extra middle names or suffixes are fine; reordering is not.\n\n"
     "LABELS:\n"
-    "  • verified — high confidence this is the person's official profile; metadata "
-    "strongly matches; no contradictory evidence.\n"
-    "  • wrong — the candidate belongs to a different person, is a post/video rather "
-    "than a profile, is broken/redirected, or its metadata contradicts the "
-    "ground truth.\n"
-    "  • manual_review — evidence is mixed or partial, multiple people share the "
-    "identity, or confidence is insufficient to confirm or reject.\n\n"
+    "  • verified — use when the candidate's own content reasonably shows this is the "
+    "person/entity's official profile: the name PLUS at least one substantive identity "
+    "signal (occupation, domain/industry, or notable works) align, and NOTHING "
+    "contradicts it. You do NOT need every field confirmed — a clear, uncontradicted "
+    "identity match is enough, so do not withhold 'verified' merely because some "
+    "details are missing. (A declared-handle/URL match with NO such content signal is "
+    "still not enough on its own.)\n"
+    "  • wrong — the candidate belongs to a DIFFERENT person/entity (including a "
+    "same-name or same-handle namesake in a different field), is a post/video rather "
+    "than a profile, is broken/redirected, or its content contradicts the ground "
+    "truth. If the candidate's content points to a different domain than the ground "
+    "truth (e.g. an athlete/sports account for an actor, a different company for a "
+    "brand), label it wrong EVEN IF the handle matches a declared handle.\n"
+    "  • manual_review — use for GENUINE uncertainty only: the content is too thin to "
+    "tell who it is, several different people plausibly fit and you cannot distinguish "
+    "which, or there is partial conflicting evidence. Do NOT use manual_review for a "
+    "plausible, uncontradicted match a reasonable person would accept. A bare "
+    "handle/URL match with no corroborating content is manual_review (not verified).\n\n"
     "MINIMISE FALSE POSITIVES: when unsure, choose manual_review, not verified. A "
     "blank/uncertain result is better than a wrong confirmation.\n\n"
     "best_candidate: set it to the single MOST LIKELY official profile among the "
@@ -134,8 +385,12 @@ _SYSTEM_MSG = (
     "leave it empty when NONE of the candidates could plausibly be this person. "
     "Never invent URLs — it must be exactly one of the provided candidate URLs, or "
     "an empty string.\n\n"
-    "Confidence (0-100): 90-100 certain; 60-89 plausible but not certain; below 60 "
-    "unlikely/contradicted."
+    "Confidence (0-100): give 90-100 when the name and at least one substantive identity "
+    "signal (occupation/domain/works) align with no contradicting evidence — a clear, "
+    "uncontradicted match earns 90+ even if some details are missing; 60-89 when you are "
+    "genuinely torn between people or the evidence is too thin to tell; below 60 when "
+    "unlikely or contradicted. Only 90+ is accepted as Verified downstream — reserve it "
+    "for matches that are clear and uncontradicted, not merely a name/handle coincidence."
 )
 
 
@@ -159,9 +414,11 @@ def _flatten_candidate(i: int, cand: dict) -> dict:
         "serper_title": meta.get("serper_title", ""),
         "serper_snippet": meta.get("serper_snippet", ""),
         "knowledge_graph": meta.get("knowledge_graph", ""),
+        # True when Serper AND Apify independently returned this same link.
+        "cross_source_agreement": meta.get("found_by_serper_and_apify", ""),
     }
     # Fold in anything else observed (serper_results, dates, sitelinks, …).
-    handled = set(entry) | {"image"}
+    handled = set(entry) | {"image", "found_by_serper_and_apify"}
     extra = {k: v for k, v in meta.items() if k not in handled and v not in ("", None, [], {})}
     if extra:
         entry["other_metadata"] = extra
@@ -319,6 +576,47 @@ def verify_platform(
         reason = f"Model returned a URL not in the candidate set. {reason}".strip()
 
     status = status_from_decision(decision, confidence, bool(best))
+
+    # EVIDENCE FLOOR. A candidate we retrieved NOTHING about cannot be Verified,
+    # however strong the ground truth is. Without this, a guessed or supplied
+    # handle plus a rich Wikipedia profile reads as a confident match — and a URL
+    # that 404s gets stamped Verified. Hit for real when Serper ran out of credits
+    # and enrichment silently returned {} for every candidate.
+    if status == STATUS_VERIFIED and best:
+        chosen = next((c for c in candidates if c.get("url") == best), None)
+        if chosen is not None and not _candidate_has_evidence(chosen):
+            status = STATUS_MANUAL
+            reason = (
+                "No profile content could be retrieved for this candidate (search "
+                "and profile lookup both returned nothing), so we cannot confirm it "
+                "exists or belongs to this person. " + (reason or "")
+            ).strip()
+            print(f"  [VERIFY] {platform} evidence floor -> downgraded to manual review")
+
+    # AUTHENTICITY GUARDS. An accurate description of the subject is not proof of
+    # authorship — fan pages quote real credits. These catch the cases the model
+    # read as confirmation: self-declared "about" pages, reordered names, and
+    # impossible follower counts.
+    if status == STATUS_VERIFIED and best:
+        chosen = next((c for c in candidates if c.get("url") == best), None)
+        if chosen is not None:
+            block = _authenticity_block(
+                str(wiki_meta.get("name") or ""), wiki_meta, chosen
+            )
+            if block:
+                status = STATUS_MANUAL
+                confidence = min(confidence, 70)
+                reason = f"{block} {reason}".strip()
+                print(f"  [VERIFY] {platform} authenticity guard -> manual review")
+
+    # Name-only ground truth can't rule out a namesake — downgrade a Verified to
+    # Manual Review (better a human check than a confident wrong confirmation).
+    if status == STATUS_VERIFIED and _ground_truth_is_thin(wiki_meta):
+        status = STATUS_MANUAL
+        reason = (
+            "Ground-truth identity is too thin (name only) to safely confirm — "
+            "a namesake cannot be ruled out. " + (reason or "")
+        ).strip()
 
     result = VerificationResult(
         platform=platform,

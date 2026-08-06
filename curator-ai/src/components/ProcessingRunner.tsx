@@ -4,6 +4,7 @@ import type { CSSProperties } from "react";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useToast } from "@/components/ToastProvider";
+import { ViewResultsLink } from "@/components/ViewResultsLink";
 import {
   getPythonApiUrl,
   markProcessingRunFinished,
@@ -104,6 +105,8 @@ export function ProcessingRunner() {
   const [source, setSource] = useState<RunSource>("idle");
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [backendError, setBackendError] = useState<string | null>(null);
+  const [stopRequested, setStopRequested] = useState(false);
+  const [runCancelled, setRunCancelled] = useState(false);
   const cancelledRef = useRef(false);
   const completionMarkedRef = useRef(false);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -269,6 +272,24 @@ export function ProcessingRunner() {
             pollTimerRef.current = null;
           }
         }
+        if (data.status === "cancelling") {
+          setStopRequested(true);
+        }
+        if (data.status === "cancelled") {
+          setRunCancelled(true);
+          setStopRequested(false);
+          if (!completionMarkedRef.current) {
+            completionMarkedRef.current = true;
+            // Partial results ARE saved, so treat a stop as a finished run —
+            // the operator can still open and export what completed.
+            markProcessingRunFinished();
+            pushToast("Run stopped. Partial results were saved.", "success");
+          }
+          if (pollTimerRef.current) {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+          }
+        }
         if (data.status === "failed") {
           setBackendError(data.error || "Pipeline failed.");
           pushToast("Pipeline failed.", "error");
@@ -305,6 +326,32 @@ export function ProcessingRunner() {
     }, 500);
     return () => clearInterval(id);
   }, [allDone, total]);
+
+  async function handleStop() {
+    if (stopRequested || runCancelled) return;
+    setStopRequested(true);
+
+    // Preview mode has no backend job — just halt the local simulation.
+    if (source !== "python") {
+      cancelledRef.current = true;
+      setRunCancelled(true);
+      pushToast("Preview run stopped.", "success");
+      return;
+    }
+
+    const api = getPythonApiUrl();
+    const jid = readPythonJobId();
+    if (!api || !jid) return;
+
+    try {
+      const res = await fetch(`${api}/api/jobs/${jid}/cancel`, { method: "POST" });
+      if (!res.ok) throw new Error(String(res.status));
+      pushToast("Stopping — finishing the checks already in flight…", "success");
+    } catch {
+      setStopRequested(false);
+      pushToast("Could not reach the API to stop the run.", "error");
+    }
+  }
 
   if (!mounted) {
     return (
@@ -361,13 +408,31 @@ export function ProcessingRunner() {
     currentNameIndex >= 0 ? names[currentNameIndex] : names[names.length - 1];
   const liveMessage = LIVE_MESSAGES[currentStepIndex % LIVE_MESSAGES.length];
   const isWaitingForFirstRow = !allDone && doneCount === 0 && currentNameIndex < 0;
-  const statusLabel = allDone ? "Completed" : backendError ? "Needs attention" : "Live processing";
+  const statusLabel = runCancelled
+    ? "Stopped"
+    : stopRequested
+      ? "Stopping…"
+      : allDone
+        ? "Completed"
+        : backendError
+          ? "Needs attention"
+          : "Live processing";
   const statusTone = backendError
     ? "border-rose-400/30 bg-rose-500/10 text-rose-200"
-    : allDone
-      ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
-      : "border-primary/30 bg-primary/10 text-primary";
-  const statusDot = backendError ? "bg-rose-300" : allDone ? "bg-emerald-300" : "bg-primary";
+    : runCancelled || stopRequested
+      ? "border-sky-400/30 bg-sky-500/10 text-sky-200"
+      : allDone
+        ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
+        : "border-primary/30 bg-primary/10 text-primary";
+  const statusDot = backendError
+    ? "bg-rose-300"
+    : runCancelled || stopRequested
+      ? "bg-sky-300"
+      : allDone
+        ? "bg-emerald-300"
+        : "bg-primary";
+  // Stop is offered while a run is genuinely in progress.
+  const canStop = !allDone && !runCancelled && !backendError && total > 0;
   const activeStep = currentStepIndex % PIPELINE_STEPS.length;
 
   return (
@@ -476,17 +541,23 @@ export function ProcessingRunner() {
               <h2
                 className={`max-w-xl text-3xl font-extrabold tracking-tight text-slate-50 sm:text-4xl ${allDone ? "proc-celebrate" : ""}`}
               >
-                {allDone
-                  ? "Your export is ready"
-                  : backendError
-                    ? "Processing is paused"
-                    : "We are still searching"}
+                {runCancelled
+                  ? "Run stopped"
+                  : allDone
+                    ? "Your export is ready"
+                    : backendError
+                      ? "Processing is paused"
+                      : "We are still searching"}
               </h2>
               <p
                 key={liveMessage}
                 className="proc-message-swap mt-3 max-w-2xl text-sm leading-6 text-slate-300 sm:text-base"
               >
-                {allDone
+                {runCancelled
+                  ? "Everything checked before you stopped has been saved and is ready to open. Platforms that were never reached are marked “Not Checked” — that is not the same as “no profile”."
+                  : stopRequested
+                    ? "Finishing the checks already in flight, then saving what completed. Nothing verified so far will be lost."
+                    : allDone
                   ? "All names have been processed. Open Results to review confidence scores and social links."
                   : backendError
                     ? "The job status could not be found. If the Python server restarted, start Discovery again to create a fresh job."
@@ -515,15 +586,39 @@ export function ProcessingRunner() {
                 </div>
               )}
 
-              {allDone && (
-                <Link
-                  href="/results"
-                  className="proc-btn-glow mt-6 inline-flex items-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-bold text-slate-950 shadow-lg shadow-primary/30"
-                >
-                  <span className="material-symbols-outlined text-lg">table_chart</span>
-                  Open Results
-                  <span className="material-symbols-outlined text-lg">arrow_forward</span>
-                </Link>
+              <div className="mt-6 flex flex-wrap items-center gap-3">
+                {(allDone || runCancelled) && (
+                  <ViewResultsLink
+                    className="proc-btn-glow inline-flex items-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-bold text-slate-950 shadow-lg shadow-primary/30"
+                  >
+                    <span className="material-symbols-outlined text-lg">table_chart</span>
+                    {runCancelled ? "Open partial results" : "Open Results"}
+                    <span className="material-symbols-outlined text-lg">arrow_forward</span>
+                  </ViewResultsLink>
+                )}
+
+                {canStop && (
+                  <button
+                    type="button"
+                    onClick={() => void handleStop()}
+                    disabled={stopRequested}
+                    aria-label="Stop this run and keep whatever has been verified so far"
+                    className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-rose-400/40 bg-rose-500/10 px-5 py-3 text-sm font-bold text-rose-200 shadow-lg shadow-rose-950/20 transition hover:bg-rose-500/20 hover:text-rose-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <span
+                      className={`material-symbols-outlined text-lg ${stopRequested ? "animate-spin" : ""}`}
+                    >
+                      {stopRequested ? "progress_activity" : "stop_circle"}
+                    </span>
+                    {stopRequested ? "Stopping…" : "Stop run"}
+                  </button>
+                )}
+              </div>
+
+              {canStop && !stopRequested && (
+                <p className="mt-2 text-xs text-slate-500">
+                  Stopping keeps every profile verified so far and saves the export.
+                </p>
               )}
             </div>
           </div>
@@ -584,13 +679,12 @@ export function ProcessingRunner() {
             </div>
             <div className="flex shrink-0 flex-col items-end gap-2">
               {allDone ? (
-                <Link
-                  href="/results"
+                <ViewResultsLink
                   className="proc-btn-glow inline-flex cursor-pointer items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-sm font-bold text-slate-950 shadow-lg shadow-primary/25"
                 >
                   View Results
                   <span className="material-symbols-outlined text-lg">table_chart</span>
-                </Link>
+                </ViewResultsLink>
               ) : (
                 <span className="inline-flex items-center gap-2 rounded-full border border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs font-semibold text-amber-200 shadow-lg shadow-amber-950/20">
                   <span className="material-symbols-outlined text-sm">hourglass_top</span>

@@ -7,12 +7,9 @@ import { AppPageHeader } from "@/components/AppPageHeader";
 import { ResultsAnalysisButton } from "@/components/ResultsAnalysisButton";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ResultsExportButton } from "@/components/ResultsExportButton";
-import {
-  mapRecordToRow,
-  RESULT_PLATFORMS,
-  statusTone,
-} from "@/lib/results-mapper";
-import type { PlatformResult, ResultRow } from "@/types/results";
+import { ResultsTable } from "@/components/ResultsTable";
+import { mapRecordToRow } from "@/lib/results-mapper";
+import type { ResultRow } from "@/types/results";
 
 const REQUIRED_PREFIX = "Talent_Social_Lookup_";
 const REQUIRED_SUFFIX = ".xlsx";
@@ -56,7 +53,7 @@ async function readRowsFromPathWithRetry(fullPath: string): Promise<ResultRow[]>
   throw new Error(lastErr || "Unknown read error");
 }
 
-async function loadLatestWorkbookRows(): Promise<{
+async function loadLatestWorkbookRows(jobId?: string): Promise<{
   rows: ResultRow[];
   latestFileName: string | null;
   loadError: string | null;
@@ -65,7 +62,10 @@ async function loadLatestWorkbookRows(): Promise<{
   const api = getPythonApiUrl();
   if (api) {
     try {
-      const res = await fetch(`${api}/api/results/latest`, {
+      const url = jobId
+        ? `${api}/api/results/latest?job_id=${encodeURIComponent(jobId)}`
+        : `${api}/api/results/latest`;
+      const res = await fetch(url, {
         cache: "no-store",
       });
       if (res.ok) {
@@ -74,7 +74,17 @@ async function loadLatestWorkbookRows(): Promise<{
           filename?: string | null;
           warning?: string | null;
           error?: string | null;
+          pending?: boolean;
         };
+        if (data.pending) {
+          return {
+            rows: [],
+            latestFileName: null,
+            loadError: null,
+            loadWarning:
+              "This run is still processing — results will appear here once it finishes.",
+          };
+        }
         if (data.rows && data.rows.length > 0) {
           return {
             rows: data.rows.map((r) => mapRecordToRow(r)),
@@ -89,7 +99,7 @@ async function loadLatestWorkbookRows(): Promise<{
     }
   }
 
-  const dataDir = path.resolve(process.cwd(), "..");
+  const dataDir = path.resolve(process.cwd(), "..", "exports");
   const files = await readdir(dataDir, { withFileTypes: true });
   const candidates = files
     .filter((f) => f.isFile())
@@ -134,48 +144,13 @@ async function loadLatestWorkbookRows(): Promise<{
   };
 }
 
-function ConfBadge({ value }: { value: number }) {
-  const pct = Math.round(value * 100);
-  let cls = "bg-rose-500/10 text-rose-400 ring-rose-500/20";
-  if (value > 0.8) cls = "bg-emerald-500/10 text-emerald-400 ring-emerald-500/20";
-  else if (value >= 0.5) cls = "bg-amber-500/10 text-amber-400 ring-amber-500/20";
-  return <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-bold ring-1 ${cls}`}>{pct}%</span>;
-}
-
-function PlatformCell({ result }: { result: PlatformResult }) {
-  const pct = Math.round(result.confidence * 100);
-  const tone = statusTone(result.status);
-  return (
-    <div className="min-w-[160px] space-y-1.5">
-      <div className="flex items-center gap-2">
-        <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ring-1 ${tone}`}>
-          {result.status || "—"}
-        </span>
-        {result.link && <span className="text-[10px] font-semibold text-slate-400">{pct}%</span>}
-      </div>
-      {result.link ? (
-        <a
-          href={result.link}
-          target="_blank"
-          rel="noreferrer"
-          className="block cursor-pointer text-xs break-all text-slate-300 underline-offset-2 transition hover:text-primary hover:underline"
-        >
-          {result.link}
-        </a>
-      ) : (
-        <span className="text-xs text-slate-600">No profile</span>
-      )}
-      {result.reason && (
-        <p className="text-[10px] leading-snug text-slate-500" title={result.reason}>
-          {result.reason.length > 140 ? `${result.reason.slice(0, 140)}…` : result.reason}
-        </p>
-      )}
-    </div>
-  );
-}
-
-export default async function ResultsPage() {
-  const { rows, latestFileName, loadError, loadWarning } = await loadLatestWorkbookRows();
+export default async function ResultsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ job?: string }>;
+}) {
+  const sp = await searchParams;
+  const { rows, latestFileName, loadError, loadWarning } = await loadLatestWorkbookRows(sp?.job);
   const totalRows = rows.length;
   const highCount = rows.filter((r) => r.confidence > 0.8).length;
   const ambiguousCount = rows.filter(
@@ -234,6 +209,12 @@ export default async function ResultsPage() {
                   <span className="rounded-full border border-slate-500/30 bg-slate-500/10 px-2 py-0.5 font-semibold text-slate-400">
                     Not Found
                   </span>
+                  <span
+                    className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 font-semibold text-sky-300"
+                    title="The run was stopped before this platform was searched — this is not a verified absence."
+                  >
+                    Not Checked
+                  </span>
                 </div>
                 <p className="mt-2 text-xs text-slate-500">
                   Latest file: {latestFileName ?? "No Talent_Social_Lookup_*.xlsx found yet"}
@@ -249,67 +230,8 @@ export default async function ResultsPage() {
             </div>
           </div>
 
-          <div className="lf-enter lf-enter-delay-1 lf-card overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[1400px] border-collapse text-left">
-                <thead>
-                  <tr className="border-b border-white/10 bg-slate-950/70">
-                    {["Talent Name", "Wikipedia URL", ...RESULT_PLATFORMS.map((p) => p.label), "Confidence"].map(
-                      (h) => (
-                        <th
-                          key={h}
-                          className="px-4 py-4 text-xs font-bold uppercase tracking-wider text-slate-500"
-                        >
-                          {h}
-                        </th>
-                      ),
-                    )}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/8">
-                  {rows.map((r, i) => (
-                    <tr
-                      key={`${r.name}-${i}`}
-                      className="align-top transition-colors hover:bg-primary/[0.03]"
-                    >
-                      <td className="px-4 py-4 font-semibold text-slate-100">{r.name}</td>
-                      <td className="px-4 py-4 text-sm">
-                        {r.wikipediaUrl ? (
-                          <a
-                            href={r.wikipediaUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="cursor-pointer break-all text-xs text-slate-400 underline-offset-2 hover:text-primary hover:underline"
-                          >
-                            {r.wikipediaUrl}
-                          </a>
-                        ) : (
-                          <span className="text-slate-600">-</span>
-                        )}
-                      </td>
-                      {RESULT_PLATFORMS.map((p) => (
-                        <td key={p.key} className="px-4 py-4">
-                          <PlatformCell result={r.platforms[p.key]} />
-                        </td>
-                      ))}
-                      <td className="px-4 py-4"><ConfBadge value={r.confidence} /></td>
-                    </tr>
-                  ))}
-                  {rows.length === 0 && (
-                    <tr>
-                      <td
-                        colSpan={RESULT_PLATFORMS.length + 3}
-                        className="px-6 py-10 text-center text-sm text-slate-500"
-                      >
-                        No output rows found yet. Run the pipeline first to generate a
-                        `Talent_Social_Lookup_*.xlsx` file, or ensure
-                        `NEXT_PUBLIC_PYTHON_API_URL` points at your running FastAPI server.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
+          <div className="lf-enter lf-enter-delay-1">
+            <ResultsTable rows={rows} />
           </div>
 
           <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
