@@ -918,3 +918,59 @@ h4 {
     scroll-behavior: auto !important;
   }
 }
+
+/* ── Sign-in page ─────────────────────────────────────────────────────────
+   A single deliberate flourish: two slow-drifting brand orbs behind a glass
+   card. Respects prefers-reduced-motion. */
+.lf-login-card {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 1.5rem;
+  background: linear-gradient(160deg, rgba(24, 26, 31, 0.92), rgba(15, 16, 18, 0.96));
+  padding: 2.5rem 2rem;
+  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(16px);
+  animation: lf-login-in 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes lf-login-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+.lf-field {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(2, 6, 23, 0.6);
+  padding: 0.7rem 0.85rem;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.lf-field:focus-within {
+  border-color: rgba(242, 209, 0, 0.45);
+  box-shadow: 0 0 0 3px rgba(242, 209, 0, 0.12);
+}
+.lf-login-btn { box-shadow: 0 8px 24px -8px rgba(242, 209, 0, 0.5); }
+.lf-login-btn:hover:not(:disabled) { filter: brightness(1.05); transform: translateY(-1px); }
+.lf-login-orb {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(80px);
+  opacity: 0.5;
+  pointer-events: none;
+}
+.lf-login-orb-a {
+  width: 460px; height: 460px; top: -140px; right: -120px;
+  background: radial-gradient(circle, rgba(242, 209, 0, 0.35), transparent 70%);
+  animation: lf-drift-a 18s ease-in-out infinite;
+}
+.lf-login-orb-b {
+  width: 420px; height: 420px; bottom: -160px; left: -120px;
+  background: radial-gradient(circle, rgba(125, 211, 252, 0.22), transparent 70%);
+  animation: lf-drift-b 22s ease-in-out infinite;
+}
+@keyframes lf-drift-a { 50% { transform: translate(-40px, 40px) scale(1.1); } }
+@keyframes lf-drift-b { 50% { transform: translate(40px, -30px) scale(1.08); } }
+@media (prefers-reduced-motion: reduce) {
+  .lf-login-card { animation: none; }
+  .lf-login-orb-a, .lf-login-orb-b { animation: none; }
+}

@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
+import auth_service  # noqa: E402  — after dotenv so DATABASE_URL loads
 import db_service  # noqa: E402  — after dotenv so DATABASE_URL loads
 import verification_pipeline as testing  # noqa: E402  — after dotenv so keys load
 
@@ -50,7 +51,26 @@ def _cancel_event(job_id: str) -> threading.Event:
         return event
 
 
-def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str]) -> None:
+def _persist(job_id: str, rows: Optional[List[dict]] = None,
+             snapshot: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Mirror a job's lifecycle state to Postgres. Progress ticks are NOT persisted.
+
+    Pass ``snapshot`` when the caller already holds the state. Re-reading
+    ``_jobs`` here would silently write nothing if the entry were evicted between
+    the status change and this call — the terminal write is exactly the one that
+    must not be lost.
+    """
+    job = snapshot if snapshot is not None else None
+    if job is None:
+        with _jobs_lock:
+            job = dict(_jobs.get(job_id) or {})
+    if job:
+        db_service.save_job(job_id, job, rows)
+
+
+def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
+                  rows: Optional[List[dict]] = None) -> None:
     """Mark a finished run completed — or cancelled when a stop was requested."""
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -64,6 +84,8 @@ def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str]) -> Non
             entry["status"] = "done"
             entry["current_platform"] = None
             entry["completed_platforms"] = list(testing.PLATFORMS.keys())
+        snapshot = dict(job)          # taken under the lock, immune to eviction
+    _persist(job_id, rows, snapshot=snapshot)
 
 UPLOAD_DIR = ROOT / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -81,6 +103,16 @@ async def _lifespan(app: FastAPI):
     paths = sorted(
         {getattr(r, "path", "") for r in app.routes if getattr(r, "path", "").startswith("/api")}
     )
+    purged = auth_service.purge_expired_sessions()
+    if purged:
+        print(f"[api_server] Purged {purged} expired session(s).")
+    if auth_service.enforced():
+        print(f"[api_server] Authentication ENFORCED ({auth_service.user_count()} account(s)).")
+    else:
+        print("[api_server] Authentication is OFF — set DATABASE_URL and create a user to enable it.")
+    reaped = db_service.reap_orphaned_jobs()
+    if reaped:
+        print(f"[api_server] Marked {reaped} job(s) failed — orphaned by a previous restart.")
     print(f"[api_server] Registered API paths: {paths}")
     print("[api_server] Tip: use --reload so route changes apply without manual restarts.")
     yield
@@ -166,6 +198,17 @@ def _persist_outputs(final_df: Any) -> tuple[str, Optional[str]]:
     return out_path, serper_path
 
 
+def _frame_to_rows(df: Any) -> List[dict]:
+    """Result frame -> JSON-safe rows, so results survive without the .xlsx."""
+    try:
+        export = df.reindex(columns=testing.excel_service.ordered_columns())
+        return [{str(c): _cell_json(row[c]) for c in export.columns}
+                for _, row in export.iterrows()]
+    except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+        print(f"[api_server] could not serialise rows: {exc.__class__.__name__}")
+        return []
+
+
 def _run_job(job_id: str, names: List[str]) -> None:
     def row_status(row_index: int, status: str) -> None:
         with _jobs_lock:
@@ -184,6 +227,7 @@ def _run_job(job_id: str, names: List[str]) -> None:
     try:
         with _jobs_lock:
             _jobs[job_id]["status"] = "running"
+        _persist(job_id)
 
         final_df = testing.run_pipeline_for_names(
             names,
@@ -193,13 +237,14 @@ def _run_job(job_id: str, names: List[str]) -> None:
         )
 
         out_path, serper_path = _persist_outputs(final_df)
-        _finalize_job(job_id, out_path, serper_path)
+        _finalize_job(job_id, out_path, serper_path, _frame_to_rows(final_df))
     except Exception as exc:
         with _jobs_lock:
             job = _jobs.get(job_id)
             if job:
                 job["status"] = "failed"
                 job["error"] = str(exc)
+        _persist(job_id)
 
 
 def _run_job_from_file(job_id: str, path: Path) -> None:
@@ -220,6 +265,7 @@ def _run_job_from_file(job_id: str, path: Path) -> None:
     try:
         with _jobs_lock:
             _jobs[job_id]["status"] = "running"
+        _persist(job_id)
 
         df = testing.load_talent_table_from_path(path)
         final_df = testing.run_pipeline_on_dataframe(
@@ -230,18 +276,99 @@ def _run_job_from_file(job_id: str, path: Path) -> None:
         )
 
         out_path, serper_path = _persist_outputs(final_df)
-        _finalize_job(job_id, out_path, serper_path)
+        _finalize_job(job_id, out_path, serper_path, _frame_to_rows(final_df))
     except Exception as exc:
         with _jobs_lock:
             job = _jobs.get(job_id)
             if job:
                 job["status"] = "failed"
                 job["error"] = str(exc)
+        _persist(job_id)
     finally:
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# ── authentication ──────────────────────────────────────────────────────────
+# A rejected upload costs nothing; an unbounded one can burn the whole API
+# budget in a single request. Both ceilings are env-tunable.
+MAX_ROWS_PER_JOB = max(1, int(os.getenv("MAX_ROWS_PER_JOB", "5000")))
+
+
+def _bearer(authorization: Optional[str]) -> str:
+    if not authorization:
+        return ""
+    parts = authorization.split(None, 1)
+    return parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" else ""
+
+
+def current_user(authorization: Optional[str] = Header(default=None)) -> Optional[Dict[str, Any]]:
+    """Resolve the caller. Returns None when auth is not enforced."""
+    if not auth_service.enforced():
+        return None
+    user = auth_service.user_for_token(_bearer(authorization))
+    if not user:
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
+    return user
+
+
+def _uid(user: Optional[Dict[str, Any]]) -> Optional[int]:
+    return user.get("id") if user else None
+
+
+class LoginBody(BaseModel):
+    email: str = Field(..., min_length=3)
+    password: str = Field(..., min_length=1)
+
+
+@app.get("/api/auth/status")
+def auth_status() -> dict[str, Any]:
+    """Lets the UI decide whether to show a sign-in wall — no auth required."""
+    return {
+        "auth_available": auth_service.is_available(),
+        "auth_required": auth_service.enforced(),
+        "has_accounts": auth_service.user_count() > 0,
+    }
+
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginBody, request: Request) -> dict[str, Any]:
+    if not auth_service.is_available():
+        raise HTTPException(status_code=503,
+                            detail="Accounts are unavailable — DATABASE_URL is not configured.")
+    user = auth_service.authenticate(body.email, body.password)
+    if not user:
+        # Deliberately identical for unknown email and wrong password.
+        raise HTTPException(status_code=401, detail="Incorrect email or password.")
+    session = auth_service.start_session(user["id"], request.headers.get("user-agent", ""))
+    return {"user": user, **session}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(authorization: Optional[str] = Header(default=None)) -> dict[str, str]:
+    auth_service.end_session(_bearer(authorization))
+    return {"status": "signed out"}
+
+
+@app.get("/api/auth/me")
+def auth_me(user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
+    return {"user": user}
+
+
+# ── history ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/history/uploads")
+def history_uploads(limit: int = 100,
+                    user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
+    return {"uploads": db_service.list_uploads(min(limit, 500))}
+
+
+@app.get("/api/history/runs")
+def history_runs(limit: int = 100,
+                 user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
+    return {"runs": db_service.list_runs(min(limit, 500))}
 
 
 @app.get("/api/health")
@@ -250,10 +377,16 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/jobs")
-def start_job(body: StartJobBody) -> dict[str, str]:
+def start_job(body: StartJobBody,
+               user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, str]:
     names = [n.strip() for n in body.names if n and str(n).strip()]
     if not names:
         raise HTTPException(status_code=400, detail="Provide at least one non-empty name.")
+    if len(names) > MAX_ROWS_PER_JOB:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{len(names)} names exceeds the {MAX_ROWS_PER_JOB}-row limit for a single run. "
+                   f"Split the list, or raise MAX_ROWS_PER_JOB.")
 
     job_id = str(uuid.uuid4())
     with _jobs_lock:
@@ -270,7 +403,9 @@ def start_job(body: StartJobBody) -> dict[str, str]:
             ],
             "output_path": None,
             "error": None,
+            "started_by": _uid(user),
         }
+    _persist(job_id)
 
     thread = threading.Thread(target=_run_job, args=(job_id, names), daemon=True)
     thread.start()
@@ -279,7 +414,8 @@ def start_job(body: StartJobBody) -> dict[str, str]:
 
 @app.post("/api/upload")
 @app.post("/api/jobs/upload")
-async def start_job_from_upload(file: UploadFile = File(...)) -> dict[str, Any]:
+async def start_job_from_upload(file: UploadFile = File(...),
+                                user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """
     Upload an .xlsx / .xls / .csv from the UI. Rows are parsed like Demo_Social.xlsx
     (Talent Name + optional category columns). No need to copy the file into the repo folder.
@@ -316,6 +452,12 @@ async def start_job_from_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     if not names:
         dest.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="No talent names found in file.")
+    if len(names) > MAX_ROWS_PER_JOB:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=413,
+            detail=f"{len(names)} rows exceeds the {MAX_ROWS_PER_JOB}-row limit for a single run. "
+                   f"Split the file, or raise MAX_ROWS_PER_JOB.")
 
     with _jobs_lock:
         _jobs[job_id] = {
@@ -332,7 +474,10 @@ async def start_job_from_upload(file: UploadFile = File(...)) -> dict[str, Any]:
             "output_path": None,
             "error": None,
             "source_filename": raw_name,
+            "started_by": _uid(user),
         }
+    _persist(job_id)
+    db_service.record_upload(job_id, raw_name, len(body), len(names), _uid(user))
 
     thread = threading.Thread(target=_run_job_from_file, args=(job_id, dest), daemon=True)
     thread.start()
@@ -432,11 +577,16 @@ def _read_rows_response(paths: List[Path]) -> dict[str, Any]:
 
 
 @app.get("/api/results/latest")
-def api_results_latest(job_id: Optional[str] = None) -> dict[str, Any]:
+def api_results_latest(job_id: Optional[str] = None,
+                       user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """
     Final results as JSON. When ``job_id`` is supplied, serves that job's own
     output (never an older run); otherwise the newest Talent_Social_Lookup_*.xlsx.
     """
+    stored = db_service.load_job_rows(job_id) if job_id else None
+    if stored:
+        return {"rows": stored, "filename": None, "warning": None,
+                "error": None, "source": "database"}
     paths, pending = _resolve_result_paths(job_id, "output_path", _latest_lookup_paths)
     if pending:
         return {"rows": [], "filename": None, "warning": None, "error": None, "pending": True}
@@ -444,7 +594,8 @@ def api_results_latest(job_id: Optional[str] = None) -> dict[str, Any]:
 
 
 @app.get("/api/results/serper/latest")
-def api_results_serper_latest(job_id: Optional[str] = None) -> dict[str, Any]:
+def api_results_serper_latest(job_id: Optional[str] = None,
+                              user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """
     Serper-only (Phase A) results — what Serper + LLM produced BEFORE the Apify
     backup / cross-platform corroboration. Same schema as /api/results/latest.
@@ -456,11 +607,14 @@ def api_results_serper_latest(job_id: Optional[str] = None) -> dict[str, Any]:
 
 
 @app.get("/api/export/latest")
-def api_export_latest() -> FileResponse:
+def api_export_latest(job_id: Optional[str] = None,
+                      user: Optional[Dict[str, Any]] = Depends(current_user)) -> FileResponse:
     """Download the newest export file (for Open in browser / save as)."""
-    paths = _latest_lookup_paths()
+    paths, pending = _resolve_result_paths(job_id, "output_path", _latest_lookup_paths)
+    if pending:
+        raise HTTPException(status_code=409, detail="That run is still processing.")
     if not paths:
-        raise HTTPException(status_code=404, detail="No Talent_Social_Lookup_*.xlsx in export folder.")
+        raise HTTPException(status_code=404, detail="No export available for that request.")
     last_err: Optional[str] = None
     for p in paths:
         for _attempt in range(5):
@@ -517,25 +671,29 @@ def _record(save, body: DecisionBody, kind: str) -> dict[str, Any]:
 
 
 @app.post("/api/decisions/verify")
-def decision_verify(body: DecisionBody) -> dict[str, Any]:
+def decision_verify(body: DecisionBody,
+                    user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """Save a confirmed profile URL onto the title's single verified_url row."""
     return _record(db_service.save_verified, body, "verified")
 
 
 @app.post("/api/decisions/reject")
-def decision_reject(body: DecisionBody) -> dict[str, Any]:
+def decision_reject(body: DecisionBody,
+                    user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """Save a rejected profile URL onto the title's single rejected_url row."""
     return _record(db_service.save_rejected, body, "rejected")
 
 
 @app.post("/api/decisions/lookup")
-def decision_lookup(body: DecisionLookupBody) -> dict[str, Any]:
+def decision_lookup(body: DecisionLookupBody,
+                    user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """Existing decisions for these titles, so the UI can show saved state."""
     return {"decisions": db_service.fetch_decisions(body.titles)}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: str) -> dict[str, Any]:
+def cancel_job(job_id: str,
+               user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """
     Ask a running job to stop.
 
@@ -557,9 +715,15 @@ def cancel_job(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str) -> dict[str, Any]:
+def get_job(job_id: str,
+            user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job:
+        # Not in memory: either this process restarted, or another instance owns
+        # it. Postgres is the durable record, so try there before 404-ing.
+        job = db_service.load_job(job_id)
+        if job:
+            return {"job_id": job_id, "restored_from_db": True, **job}
         raise HTTPException(status_code=404, detail="Unknown job_id.")
     return {"job_id": job_id, **job}

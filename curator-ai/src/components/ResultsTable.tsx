@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { useToast } from "@/components/ToastProvider";
 import {
   checkDbHealth,
@@ -34,6 +34,11 @@ type PlatformScope = "any" | PlatformKey;
 type DecisionState = Record<string, DecisionKind>;
 type PendingState = Record<string, boolean>;
 
+/** Rows rendered at once. 234 rows x 5 platforms is ~1,200 cells — enough DOM to
+ *  make filtering and scrolling visibly stutter. Analysts work a screen at a
+ *  time, so a page is both faster and easier to work through. */
+const PAGE_SIZE = 50;
+
 const cellKey = (title: string, platform: string) => `${title.toLowerCase()}|${platform}`;
 
 /* ── small presentational pieces ─────────────────────────────────────────── */
@@ -51,15 +56,16 @@ function ConfBar({ value }: { value: number }) {
   );
 }
 
-function PlatformCell({
-  result, platform, dimmed, decision, pending, onDecide,
+const PlatformCell = memo(function PlatformCell({
+  rowName, result, platform, dimmed, decision, pending, onDecide,
 }: {
+  rowName: string;
   result: PlatformResult;
   platform: string;
   dimmed: boolean;
   decision?: DecisionKind;
   pending: boolean;
-  onDecide: (kind: DecisionKind) => void;
+  onDecide: (rowName: string, platform: string, kind: DecisionKind) => void;
 }) {
   const pct = Math.round(result.confidence * 100);
   const saved = decision === "verified";
@@ -114,7 +120,7 @@ function PlatformCell({
             type="button"
             disabled={pending}
             aria-pressed={saved}
-            onClick={() => onDecide("verified")}
+            onClick={() => onDecide(rowName, platform, "verified")}
             title={`Save this ${platform} URL to verified_url`}
             className={`inline-flex flex-1 cursor-pointer items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-bold uppercase tracking-wide ring-1 transition disabled:cursor-wait disabled:opacity-50 ${
               saved
@@ -131,7 +137,7 @@ function PlatformCell({
             type="button"
             disabled={pending}
             aria-pressed={rejected}
-            onClick={() => onDecide("rejected")}
+            onClick={() => onDecide(rowName, platform, "rejected")}
             title={`Record this ${platform} URL in rejected_url`}
             className={`inline-flex flex-1 cursor-pointer items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-bold uppercase tracking-wide ring-1 transition disabled:cursor-wait disabled:opacity-50 ${
               rejected
@@ -148,7 +154,7 @@ function PlatformCell({
       )}
     </div>
   );
-}
+});
 
 /* ── main table ──────────────────────────────────────────────────────────── */
 
@@ -161,6 +167,7 @@ export function ResultsTable({ rows }: { rows: ResultRow[] }) {
   const [decisions, setDecisions] = useState<DecisionState>({});
   const [pending, setPending] = useState<PendingState>({});
   const [db, setDb] = useState<DbHealth | null>(null);
+  const [page, setPage] = useState(0);
 
   /* Load DB health + any decisions already recorded for these titles. */
   useEffect(() => {
@@ -213,8 +220,9 @@ export function ResultsTable({ rows }: { rows: ResultRow[] }) {
     [statuses],
   );
 
+  const deferredQuery = useDeferredValue(query);
   const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = deferredQuery.trim().toLowerCase();
     const filtered = rows.filter((r) => {
       if (q && !r.name.toLowerCase().includes(q)) return false;
       if (statuses.size === 0) return true;
@@ -224,9 +232,24 @@ export function ResultsTable({ rows }: { rows: ResultRow[] }) {
     const needsWork = (r: ResultRow) =>
       RESULT_PLATFORMS.filter((p) => r.platforms[p.key].status === STATUS_MANUAL).length;
     return [...filtered].sort((a, b) => needsWork(b) - needsWork(a));
-  }, [rows, query, statuses, platformsInScope, triage]);
+  }, [rows, deferredQuery, statuses, platformsInScope, triage]);
 
-  async function decide(row: ResultRow, platform: string, kind: DecisionKind) {
+  const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pageRows = useMemo(
+    () => visible.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE),
+    [visible, safePage],
+  );
+
+  // Filters change the result set, so jump back to the first page — otherwise a
+  // narrow filter can land on an empty page and look like "no results".
+  useEffect(() => {
+    setPage(0);
+  }, [deferredQuery, statuses, scope, triage]);
+
+  const decide = useCallback(async (rowName: string, platform: string, kind: DecisionKind) => {
+    const row = rows.find((r) => r.name === rowName);
+    if (!row) return;
     const result = row.platforms[
       RESULT_PLATFORMS.find((p) => p.label === platform)!.key
     ];
@@ -245,7 +268,7 @@ export function ResultsTable({ rows }: { rows: ResultRow[] }) {
     } finally {
       setPending((p) => ({ ...p, [key]: false }));
     }
-  }
+  }, [rows, pushToast]);
 
   const toggleStatus = (v: string) =>
     setStatuses((prev) => {
@@ -366,7 +389,7 @@ export function ResultsTable({ rows }: { rows: ResultRow[] }) {
 
         <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-slate-500">
           <span>
-            Showing <strong className="text-slate-300">{visible.length}</strong> of {rows.length} row
+            Showing <strong className="text-slate-300">{pageRows.length}</strong> of {visible.length} matching row
             {rows.length === 1 ? "" : "s"}
           </span>
           {(decidedCounts.verified > 0 || decidedCounts.rejected > 0) && (
@@ -407,7 +430,7 @@ export function ResultsTable({ rows }: { rows: ResultRow[] }) {
               </tr>
             </thead>
             <tbody className="divide-y divide-white/[0.06]">
-              {visible.map((r, i) => (
+              {pageRows.map((r, i) => (
                 <tr key={`${r.name}-${i}`} className="align-top transition-colors hover:bg-white/[0.015]">
                   <td className="sticky left-0 z-10 min-w-[190px] bg-slate-950/95 px-4 py-4 backdrop-blur">
                     <div className="font-semibold leading-snug text-slate-100">{r.name}</div>
@@ -429,12 +452,13 @@ export function ResultsTable({ rows }: { rows: ResultRow[] }) {
                     return (
                       <td key={p.key} className="px-3 py-4">
                         <PlatformCell
+                          rowName={r.name}
                           result={r.platforms[p.key]}
                           platform={p.label}
                           dimmed={statuses.size > 0 && !(inScope && cellMatches(r, p.key))}
                           decision={decisions[key]}
                           pending={!!pending[key]}
-                          onDecide={(kind) => void decide(r, p.label, kind)}
+                          onDecide={decide}
                         />
                       </td>
                     );
@@ -459,6 +483,41 @@ export function ResultsTable({ rows }: { rows: ResultRow[] }) {
             </tbody>
           </table>
         </div>
+
+        {pageCount > 1 && (
+          <div className="flex items-center justify-between gap-3 border-t border-white/10 px-4 py-3">
+            <span className="text-xs text-slate-500">
+              Rows{" "}
+              <strong className="tabular-nums text-slate-300">
+                {safePage * PAGE_SIZE + 1}–{safePage * PAGE_SIZE + pageRows.length}
+              </strong>{" "}
+              of <strong className="tabular-nums text-slate-300">{visible.length}</strong>
+            </span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setPage((n) => Math.max(0, n - 1))}
+                disabled={safePage === 0}
+                className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-bold text-slate-300 ring-1 ring-white/10 transition hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-30"
+              >
+                <span className="material-symbols-outlined text-sm">chevron_left</span>
+                Previous
+              </button>
+              <span className="px-2 text-xs font-bold tabular-nums text-slate-400">
+                {safePage + 1} / {pageCount}
+              </span>
+              <button
+                type="button"
+                onClick={() => setPage((n) => Math.min(pageCount - 1, n + 1))}
+                disabled={safePage >= pageCount - 1}
+                className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-bold text-slate-300 ring-1 ring-white/10 transition hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-30"
+              >
+                Next
+                <span className="material-symbols-outlined text-sm">chevron_right</span>
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
