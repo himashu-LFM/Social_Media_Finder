@@ -9,14 +9,19 @@ import { fetchAuthStatus, fetchMe, getToken, type AuthUser } from "@/lib/auth";
  * (no DATABASE_URL, or AUTH_REQUIRED=0), it renders children unchanged — local
  * development needs no login. The check is cheap: one /api/auth/status call,
  * then /api/auth/me only when a token is present.
+ *
+ * /login is exempt — gating the sign-in page behind sign-in would loop forever.
  */
+const PUBLIC_ROUTES = ["/login"];
 export function AuthGuard({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
   const [allowed, setAllowed] = useState(false);
   const router = useRouter();
   const pathname = usePathname();
+  const isPublic = PUBLIC_ROUTES.some((r) => (pathname ?? "").startsWith(r));
 
   useEffect(() => {
+    if (isPublic) return;   // /login gates nothing; see the render below
     let alive = true;
     void (async () => {
       const status = await fetchAuthStatus();
@@ -41,9 +46,10 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     return () => {
       alive = false;
     };
-  }, [router, pathname]);
+  }, [router, pathname, isPublic]);
 
-  if (!ready || !allowed) {
+  // Public routes render immediately — no session check, no spinner.
+  if (!isPublic && (!ready || !allowed)) {
     return (
       <div className="flex min-h-screen items-center justify-center">
         <div className="flex flex-col items-center gap-4">

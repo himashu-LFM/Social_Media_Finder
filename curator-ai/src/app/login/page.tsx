@@ -2,6 +2,7 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
+import { GoogleSignInButton } from "@/components/GoogleSignInButton";
 import { fetchAuthStatus, getToken, login } from "@/lib/auth";
 
 function LoginForm() {
@@ -15,6 +16,7 @@ function LoginForm() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [googleClientId, setGoogleClientId] = useState("");
 
   // Already signed in, or auth is off → skip the form entirely.
   useEffect(() => {
@@ -26,8 +28,13 @@ function LoginForm() {
         router.replace(next);
       } else if (getToken()) {
         router.replace(next);
-      } else if (!status.has_accounts) {
-        setNotice("No accounts exist yet. Ask an administrator to run create_user.py.");
+      } else {
+        if (status.google_enabled && status.google_client_id) {
+          setGoogleClientId(status.google_client_id);
+        }
+        if (!status.has_accounts) {
+          setNotice("No accounts exist yet. Ask an administrator to run create_user.py.");
+        }
       }
     })();
     return () => {
@@ -66,6 +73,23 @@ function LoginForm() {
         {notice && (
           <div className="mb-5 rounded-xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-xs text-sky-200">
             {notice}
+          </div>
+        )}
+
+        {googleClientId && (
+          <div className="mb-6 space-y-5">
+            <GoogleSignInButton
+              clientId={googleClientId}
+              onSignedIn={() => router.replace(next)}
+              onError={(message) => setError(message)}
+            />
+            <div className="flex items-center gap-3" aria-hidden>
+              <span className="h-px flex-1 bg-slate-800" />
+              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-600">
+                or with a password
+              </span>
+              <span className="h-px flex-1 bg-slate-800" />
+            </div>
           </div>
         )}
 

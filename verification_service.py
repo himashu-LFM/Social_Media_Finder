@@ -40,7 +40,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -85,6 +85,16 @@ _IDENTITY_SIGNALS = (
     "professions", "nationalities", "birth_year", "known_works",
     "summary", "reference_sources",
 )
+
+
+# Thin-ground-truth gate modes. Mirrors search_options.GATE_*; duplicated as
+# plain strings so this module stays importable without the pipeline's config.
+GATE_STRICT = "strict"
+GATE_EVIDENCE = "evidence"
+
+# In evidence mode, "probably" is not enough to stand in for a Wikipedia page.
+_THIN_EVIDENCE_MIN_CONFIDENCE = max(
+    0, min(100, int(os.environ.get("THIN_EVIDENCE_MIN_CONFIDENCE", "85"))))
 
 
 def _ground_truth_is_thin(ground_truth: Dict[str, Any]) -> bool:
@@ -221,6 +231,44 @@ _STRONG_EVIDENCE_KEYS = ("bio", "knowledge_graph", "verified", "followers", "sub
 def _has_strong_evidence(cand: Dict[str, Any]) -> bool:
     meta = cand.get("meta") or {}
     return any(meta.get(k) not in ("", None, [], {}) for k in _STRONG_EVIDENCE_KEYS)
+
+
+_THIN_STRICT_REASON = (
+    "Ground-truth identity is too thin (name only) to safely confirm — "
+    "a namesake cannot be ruled out."
+)
+
+
+def _thin_gate_block(thin_gate: str, chosen: Optional[Dict[str, Any]],
+                     confidence: int) -> str:
+    """
+    Decide what a thin ground truth costs. Returns a downgrade reason, or "".
+
+    ``"strict"`` is Wikipedia mode and refuses every thin Verify, which is the
+    behaviour that produced the measured precision — it must not change.
+
+    ``"evidence"`` is custom (non-Wikipedia) mode. Those subjects have no
+    Wikipedia page *by definition*, so the strict gate would send 100% of the
+    run to Manual Review and the mode would be pointless. Instead of dropping
+    the gate, the burden of proof moves onto the candidate itself: the profile
+    must carry real fetched evidence (a bio, a follower count, a knowledge
+    panel — not just a URL that parsed), and the model must be clearly, not
+    marginally, confident. A weak or bare candidate still goes to a human.
+
+    This is a deliberate precision trade: custom mode will confirm some profiles
+    Wikipedia mode would have escalated. Every other guard still applies.
+    """
+    if thin_gate != GATE_EVIDENCE:
+        return _THIN_STRICT_REASON
+    if chosen is None or not _has_strong_evidence(chosen):
+        return ("No Wikipedia ground truth, and the profile returned no "
+                "substantive evidence (bio, following, knowledge panel) to "
+                "confirm identity on.")
+    if confidence < _THIN_EVIDENCE_MIN_CONFIDENCE:
+        return (f"No Wikipedia ground truth, and confidence ({confidence}) is "
+                f"below the {_THIN_EVIDENCE_MIN_CONFIDENCE} required to confirm "
+                f"without one.")
+    return ""
 
 
 def _implausible_following(ground_truth: Dict[str, Any], cand: Dict[str, Any]) -> str:
@@ -521,6 +569,7 @@ def verify_platform(
     wiki_meta: Dict[str, Any],
     candidates: List[dict],
     is_person: bool = True,
+    thin_gate: str = GATE_STRICT,
 ) -> VerificationResult:
     """
     Verify candidate profiles for one platform in a single LLM request.
@@ -612,11 +661,11 @@ def verify_platform(
     # Name-only ground truth can't rule out a namesake — downgrade a Verified to
     # Manual Review (better a human check than a confident wrong confirmation).
     if status == STATUS_VERIFIED and _ground_truth_is_thin(wiki_meta):
-        status = STATUS_MANUAL
-        reason = (
-            "Ground-truth identity is too thin (name only) to safely confirm — "
-            "a namesake cannot be ruled out. " + (reason or "")
-        ).strip()
+        chosen = next((c for c in candidates if c.get("url") == best), None)
+        block = _thin_gate_block(thin_gate, chosen, confidence)
+        if block:
+            status = STATUS_MANUAL
+            reason = f"{block} {reason or ''}".strip()
 
     result = VerificationResult(
         platform=platform,

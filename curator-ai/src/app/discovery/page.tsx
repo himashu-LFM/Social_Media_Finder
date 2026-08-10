@@ -2,6 +2,7 @@ import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppPageHeader } from "@/components/AppPageHeader";
 import { AppSidebar } from "@/components/AppSidebar";
 import { DiscoveryWorkspace } from "@/components/DiscoveryWorkspace";
+import { SearchModeCard } from "@/components/SearchModeCard";
 
 const outputColumns = [
   { label: "Talent Name", icon: "person" },
@@ -65,6 +66,8 @@ export default function DiscoveryPage() {
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
             <div className="space-y-6 lg:col-span-2">
+              <SearchModeCard />
+
               <DiscoveryWorkspace />
 
               <div className="lf-enter lf-enter-delay-1 lf-card lf-card-hover p-6">

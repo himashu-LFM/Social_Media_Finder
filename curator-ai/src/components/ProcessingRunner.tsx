@@ -1,6 +1,7 @@
 "use client";
 
 import type { CSSProperties } from "react";
+import { authedFetch } from "@/lib/auth";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useToast } from "@/components/ToastProvider";
@@ -231,7 +232,7 @@ export function ProcessingRunner() {
 
     async function pollOnce() {
       try {
-        const res = await fetch(`${api}/api/jobs/${jid}`);
+        const res = await authedFetch(`/api/jobs/${jid}`);
         if (res.status === 404) {
           setBackendError(
             "Job not found (Python API may have restarted). Run Discovery again.",
@@ -344,7 +345,7 @@ export function ProcessingRunner() {
     if (!api || !jid) return;
 
     try {
-      const res = await fetch(`${api}/api/jobs/${jid}/cancel`, { method: "POST" });
+      const res = await authedFetch(`/api/jobs/${jid}/cancel`, { method: "POST" });
       if (!res.ok) throw new Error(String(res.status));
       pushToast("Stopping — finishing the checks already in flight…", "success");
     } catch {

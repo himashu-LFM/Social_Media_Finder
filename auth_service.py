@@ -189,6 +189,116 @@ def purge_expired_sessions() -> int:
         return 0
 
 
+# ── Google sign-in ──────────────────────────────────────────────────────────
+#
+# The browser runs Google Identity Services and hands us an ID token. We verify
+# that token against Google's public keys server-side — never trust the email a
+# client claims — then issue our own session. Google authenticates the person;
+# this application still decides who is allowed in.
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+
+# Who may sign in with Google. Comma-separated domains, e.g.
+# "listenfirstmedia.com". Leave empty to allow only addresses that already exist
+# as accounts — the safest default, since an OAuth client alone would otherwise
+# let anyone with a Google account in.
+GOOGLE_ALLOWED_DOMAINS = [
+    d.strip().lower().lstrip("@")
+    for d in os.environ.get("GOOGLE_ALLOWED_DOMAINS", "").split(",")
+    if d.strip()
+]
+
+
+def google_enabled() -> bool:
+    return bool(GOOGLE_CLIENT_ID) and is_available()
+
+
+def _verify_google_token(id_token_str: str) -> Optional[Dict[str, Any]]:
+    """Validate the ID token with Google and return its claims, or None."""
+    try:
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token as google_id_token
+    except ImportError:
+        print("  [AUTH] google-auth is not installed — Google sign-in unavailable.")
+        return None
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            id_token_str, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except Exception as exc:  # noqa: BLE001 — any failure is a failed sign-in
+        print(f"  [AUTH] Google token rejected: {exc.__class__.__name__}")
+        return None
+    if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        return None
+    if not claims.get("email") or not claims.get("email_verified"):
+        return None
+    return claims
+
+
+def _existing_user(email: str) -> Optional[Dict[str, Any]]:
+    try:
+        with db_service._connection() as conn, conn.cursor(row_factory=db_service.dict_row) as cur:
+            cur.execute("SELECT id, email, name, role, is_active FROM app_user "
+                        "WHERE lower(email) = %s", (email,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [AUTH] lookup failed: {exc.__class__.__name__}")
+        return None
+
+
+def google_sign_in(id_token_str: str) -> tuple[Optional[Dict[str, Any]], str]:
+    """
+    Exchange a verified Google ID token for an application user.
+
+    Returns ``(user, reason)``. ``user`` is None when sign-in is refused, and
+    ``reason`` explains why in terms safe to show the person trying to sign in.
+    """
+    if not google_enabled():
+        return None, "Google sign-in is not configured on this server."
+
+    claims = _verify_google_token(id_token_str)
+    if not claims:
+        return None, "Google could not verify that sign-in. Please try again."
+
+    email = claims["email"].strip().lower()
+    name = (claims.get("name") or "").strip()
+    domain = email.rsplit("@", 1)[-1]
+    existing = _existing_user(email)
+
+    if existing and not existing["is_active"]:
+        return None, "That account has been deactivated."
+
+    # An allowed domain provisions on first sign-in; otherwise the account must
+    # already exist. Without this, any Google account in the world could sign in.
+    if not existing and domain not in GOOGLE_ALLOWED_DOMAINS:
+        return None, (f"{email} is not authorised for this tool. Ask an administrator "
+                      f"to add you, or sign in with your work account.")
+
+    try:
+        with db_service._connection() as conn, conn.cursor(row_factory=db_service.dict_row) as cur:
+            cur.execute(
+                """
+                INSERT INTO app_user (email, name, password_hash, role)
+                VALUES (%s, %s, '', 'analyst')
+                ON CONFLICT (lower(email)) DO UPDATE
+                    SET name          = COALESCE(NULLIF(EXCLUDED.name, ''), app_user.name),
+                        last_login_at = now()
+                RETURNING id, email, name, role
+                """,
+                (email, name),
+            )
+            user = dict(cur.fetchone())
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [AUTH] Google provisioning failed: {exc.__class__.__name__}: {exc}")
+        return None, "Could not complete sign-in. Please try again."
+
+    # password_hash is '' for Google-only accounts. authenticate() runs the hash
+    # through Argon2 verify, which rejects an empty hash — so a Google account
+    # cannot be signed into with a password. That is intentional.
+    return user, ""
+
+
 def user_count() -> int:
     """Used to tell 'auth not set up yet' apart from 'wrong credentials'."""
     if not is_available():

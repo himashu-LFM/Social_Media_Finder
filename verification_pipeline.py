@@ -48,6 +48,7 @@ import apify_service
 import excel_service
 import profile_metadata
 import serper_service
+import search_options
 import social_urls
 import verification_service
 import wikipedia_service
@@ -142,7 +143,11 @@ def _add_candidate(candidates: List[dict], seen: set, platform: str, url: str,
     candidates.append({"url": norm, "source": source, "meta": dict(meta or {})})
 
 
-def _serper_primary_candidate(talent: str, platform: str) -> tuple[List[dict], bool]:
+def _serper_primary_candidate(
+    talent: str, platform: str,
+    options: search_options.SearchOptions = search_options.DEFAULT,
+    category: str = "", subcategory: str = "",
+) -> tuple[List[dict], bool]:
     """
     PRIMARY discovery: a Serper "<name> site:<platform-domain>" search, returning
     the TOP valid profile (or YouTube channel) result only — with its snippet.
@@ -153,7 +158,9 @@ def _serper_primary_candidate(talent: str, platform: str) -> tuple[List[dict], b
     """
     try:
         return serper_service.discover_by_site(
-            talent, platform, top_n=SERPER_CANDIDATES_PER_PLATFORM
+            talent, platform, top_n=SERPER_CANDIDATES_PER_PLATFORM,
+            query_template=options.template,
+            category=category, subcategory=subcategory,
         ), False
     except RuntimeError as exc:
         print(f"  [PIPELINE] Serper site-search unavailable for {platform}/{talent}: {exc}")
@@ -222,7 +229,9 @@ def _drop_missing_profiles(candidates: List[dict], platform: str) -> List[dict]:
 
 
 def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
-            candidates: List[dict]) -> VerificationResult:
+            candidates: List[dict],
+            options: search_options.SearchOptions = search_options.DEFAULT,
+            ) -> VerificationResult:
     if not candidates:
         return VerificationResult(platform=platform, status=STATUS_NOT_FOUND,
                                   reason="No candidate links to verify.")
@@ -234,7 +243,8 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
         )
     _enrich_candidates(candidates, platform)
     result = verification_service.verify_platform(
-        platform, wiki_meta.to_prompt_dict(), candidates, is_person=wiki_meta.is_person
+        platform, wiki_meta.to_prompt_dict(), candidates,
+        is_person=wiki_meta.is_person, thin_gate=options.thin_gate,
     )
     return _guard_ambiguous_identity(
         result, candidates, wiki_meta.name or wiki_meta.talent, platform
@@ -353,6 +363,9 @@ def _resolve_platform_serper(
     known_url: str = "",
     fanout_slugs: Optional[List[str]] = None,
     decisions: Optional[Dict[str, Dict[str, str]]] = None,
+    options: search_options.SearchOptions = search_options.DEFAULT,
+    category: str = "",
+    subcategory: str = "",
 ) -> VerificationResult:
     """
     Phase 1 — assemble candidates for one platform and verify them together.
@@ -375,7 +388,8 @@ def _resolve_platform_serper(
     # A human rejected these — never surface them again, on any run.
     rejected = {u for u in [(decisions.get("rejected") or {}).get(platform)] if u}
 
-    serper_candidates, errored = _serper_primary_candidate(talent, platform)
+    serper_candidates, errored = _serper_primary_candidate(
+        talent, platform, options, category, subcategory)
 
     candidates: List[dict] = []
     seen: set = set()
@@ -414,7 +428,7 @@ def _resolve_platform_serper(
             if errored else "No profile found via Serper search."
         )
         return VerificationResult(platform=platform, status=STATUS_NOT_FOUND, reason=reason)
-    return _verify(platform, wiki_meta, candidates)
+    return _verify(platform, wiki_meta, candidates, options)
 
 
 def _apify_backup_platform(
@@ -423,6 +437,7 @@ def _apify_backup_platform(
     wiki_meta: wikipedia_service.WikiMetadata,
     phase1: VerificationResult,
     apify_candidates: Dict[str, List[dict]],
+    options: search_options.SearchOptions = search_options.DEFAULT,
 ) -> VerificationResult:
     """
     Phase 2 (BACKUP) — runs only when Serper's result was NOT Verified.
@@ -449,7 +464,7 @@ def _apify_backup_platform(
                 print(f"  [AGREE] {platform} | {talent} -> Serper & Apify returned the same link")
 
     print(f"  [BACKUP] {platform} | {talent} -> Apify ('{phase1.status}' from Serper)")
-    apify_result = _verify(platform, wiki_meta, apify_cands)
+    apify_result = _verify(platform, wiki_meta, apify_cands, options)
     # Keep the better of the two LLM verdicts.
     return apify_result if _score(apify_result) >= _score(phase1) else phase1
 
@@ -458,6 +473,19 @@ def _apify_backup_platform(
 #  Per-row phases
 # ────────────────────────────────────────────────────────────────────────────
 
+def _row_taxonomy(input_metadata: Optional[Dict[str, str]]) -> tuple[str, str]:
+    """
+    The client's own category/subcategory for a row, for {category}/{subcategory}
+    in a custom query. Reuses wikipedia_service's key aliases so a template sees
+    exactly the taxonomy the rest of the pipeline reasoned about.
+    """
+    meta = input_metadata or {}
+    return (
+        wikipedia_service._meta_get(meta, "title_category", "category", "brand_type"),
+        wikipedia_service._meta_get(meta, "title_sub_category", "sub_category", "subcategory"),
+    )
+
+
 def _row_serper_phase(
     talent: str,
     wiki_meta: wikipedia_service.WikiMetadata,
@@ -465,10 +493,13 @@ def _row_serper_phase(
     should_cancel: Optional[Callable[[], bool]] = None,
     input_handles: Optional[Dict[str, str]] = None,
     decisions: Optional[Dict[str, Dict[str, str]]] = None,
+    options: search_options.SearchOptions = search_options.DEFAULT,
+    input_metadata: Optional[Dict[str, str]] = None,
 ) -> Dict[str, VerificationResult]:
     """Phase 1 for one row: Serper-primary verify across all platforms (concurrent)."""
     input_handles = input_handles or {}
     fanout = _fanout_slugs(input_handles)
+    category, subcategory = _row_taxonomy(input_metadata)
 
     def _task(platform: str) -> tuple:
         # Queued platform tasks drain as cheap no-ops once a stop is requested;
@@ -483,7 +514,8 @@ def _row_serper_phase(
             result = _resolve_platform_serper(
                 talent, platform, wiki_meta,
                 known_url=input_handles.get(platform, ""), fanout_slugs=fanout,
-                decisions=decisions,
+                decisions=decisions, options=options,
+                category=category, subcategory=subcategory,
             )
         except Exception as exc:  # noqa: BLE001 — isolate platform failures
             print(f"  [PIPELINE] {platform} Serper phase error for '{talent}': {exc}")
@@ -509,6 +541,7 @@ def _row_apify_phase(
     wiki_meta: wikipedia_service.WikiMetadata,
     phase1: Dict[str, VerificationResult],
     apify_candidates: Dict[str, List[dict]],
+    options: search_options.SearchOptions = search_options.DEFAULT,
 ) -> Dict[str, VerificationResult]:
     """Phase 2 for one row: Apify backup for the platforms Serper didn't Verify."""
     final = dict(phase1)
@@ -519,7 +552,8 @@ def _row_apify_phase(
     def _task(platform: str) -> tuple:
         try:
             result = _apify_backup_platform(
-                talent, platform, wiki_meta, phase1[platform], apify_candidates or {}
+                talent, platform, wiki_meta, phase1[platform], apify_candidates or {},
+                options=options,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  [PIPELINE] {platform} Apify backup error for '{talent}': {exc}")
@@ -555,6 +589,7 @@ def _corroborate_row(
     talent: str,
     wiki_meta: wikipedia_service.WikiMetadata,
     results: Dict[str, VerificationResult],
+    options: search_options.SearchOptions = search_options.DEFAULT,
 ) -> Dict[str, VerificationResult]:
     """
     Cross-platform corroboration. Handles CONFIRMED (Verified) on strong platforms
@@ -592,7 +627,8 @@ def _corroborate_row(
         try:
             _enrich_candidates([cand], platform)  # re-fetch snippet/kg/counts for the link
             res = verification_service.verify_platform(
-                platform, gt, [cand], is_person=wiki_meta.is_person
+                platform, gt, [cand], is_person=wiki_meta.is_person,
+                thin_gate=options.thin_gate,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  [CORROBORATE] {platform} | {talent} error: {exc.__class__.__name__}")
@@ -663,6 +699,7 @@ def _resolve_row_result(
     apify_candidates: Optional[Dict[str, List[dict]]] = None,
     platform_progress: Optional[Callable[[str, str], None]] = None,
     input_handles: Optional[Dict[str, str]] = None,
+    options: search_options.SearchOptions = search_options.DEFAULT,
 ) -> Dict[str, Any]:
     """
     Run the full verification workflow for ONE talent (both phases) and return a
@@ -677,7 +714,8 @@ def _resolve_row_result(
     # Phase 1 — Serper-primary discovery + verification.
     phase1 = _row_serper_phase(talent, wiki_meta, platform_progress,
                                input_handles=input_handles,
-                               decisions=load_decisions([talent]).get(talent.lower(), {}))
+                               decisions=load_decisions([talent]).get(talent.lower(), {}),
+                               options=options, input_metadata=input_metadata)
 
     # Phase 2 — Apify backup, only if some platform isn't Verified.
     failing = [p for p, r in phase1.items() if r.status not in _GOOD_STATUSES]
@@ -688,13 +726,14 @@ def _resolve_row_result(
             except Exception as exc:  # noqa: BLE001
                 print(f"  [PIPELINE] Apify lookup failed for '{talent}': {exc}")
                 apify_candidates = {}
-        final = _row_apify_phase(talent, wiki_meta, phase1, apify_candidates)
+        final = _row_apify_phase(talent, wiki_meta, phase1, apify_candidates,
+                                 options=options)
     else:
         final = phase1
 
     # Cross-platform corroboration: rescue Manual Reviews using handles confirmed
     # (Verified) on other platforms this run.
-    final = _corroborate_row(talent, wiki_meta, final)
+    final = _corroborate_row(talent, wiki_meta, final, options=options)
     return _assemble_row_out(final)
 
 
@@ -761,6 +800,7 @@ def run_pipeline_on_dataframe(
     row_status: Optional[Callable[[int, str], None]] = None,
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    options: search_options.SearchOptions = search_options.DEFAULT,
 ) -> pd.DataFrame:
     """
     Process every row and return the populated frame — Serper primary, Apify backup.
@@ -827,7 +867,8 @@ def run_pipeline_on_dataframe(
         try:
             phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
                                        input_handles=input_handles,
-                                       decisions=decisions_by_talent.get(talent.lower(), {}))
+                                       decisions=decisions_by_talent.get(talent.lower(), {}),
+                                       options=options, input_metadata=input_metadata)
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
             print(f"  [PIPELINE] Serper phase failed for '{talent}': {exc}")
             phase1 = {
@@ -872,9 +913,10 @@ def run_pipeline_on_dataframe(
             return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
         try:
             final = _row_apify_phase(
-                r["talent"], r["wiki_meta"], r["phase1"], apify_map.get(r["talent"], {})
+                r["talent"], r["wiki_meta"], r["phase1"], apify_map.get(r["talent"], {}),
+                options=options,
             )
-            final = _corroborate_row(r["talent"], r["wiki_meta"], final)
+            final = _corroborate_row(r["talent"], r["wiki_meta"], final, options=options)
             out = _assemble_row_out(final)
         except Exception as exc:  # noqa: BLE001
             print(f"  [PIPELINE] Apify phase failed for '{r['talent']}': {exc}")
@@ -910,6 +952,7 @@ def run_pipeline_for_names(
     row_status: Optional[Callable[[int, str], None]] = None,
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    options: search_options.SearchOptions = search_options.DEFAULT,
 ) -> pd.DataFrame:
     """Names-only entry point (no Wikipedia URLs — metadata falls back to search)."""
     clean = [str(name).strip() for name in names if name and str(name).strip()]
@@ -918,5 +961,5 @@ def run_pipeline_for_names(
     df = excel_service.build_talent_df(clean)
     return run_pipeline_on_dataframe(
         df, row_status=row_status, platform_progress=platform_progress,
-        should_cancel=should_cancel,
+        should_cancel=should_cancel, options=options,
     )
