@@ -521,11 +521,17 @@ def verify_platform(
     wiki_meta: Dict[str, Any],
     candidates: List[dict],
     is_person: bool = True,
+    allow_thin_verify: bool = False,
 ) -> VerificationResult:
     """
     Verify candidate profiles for one platform in a single LLM request.
     Every platform (including Facebook) is judged purely by the LLM.
     Failures degrade to a Manual Review result rather than aborting the run.
+
+    ``allow_thin_verify`` skips the name-only guard: used by the no-Wikipedia
+    (Google AI Mode) flow, where there is no Wikipedia ground truth to be "thin"
+    against and the caller trusts Google's AI answer as the disambiguator. The
+    evidence floor and authenticity guards still apply.
     """
     if not candidates:
         return VerificationResult(platform=platform, status=STATUS_NOT_FOUND,
@@ -611,7 +617,9 @@ def verify_platform(
 
     # Name-only ground truth can't rule out a namesake — downgrade a Verified to
     # Manual Review (better a human check than a confident wrong confirmation).
-    if status == STATUS_VERIFIED and _ground_truth_is_thin(wiki_meta):
+    # Skipped for the Google-AI-Mode flow (allow_thin_verify), which has no
+    # Wikipedia ground truth by definition and trusts Google's AI answer.
+    if status == STATUS_VERIFIED and not allow_thin_verify and _ground_truth_is_thin(wiki_meta):
         status = STATUS_MANUAL
         reason = (
             "Ground-truth identity is too thin (name only) to safely confirm — "

@@ -48,6 +48,7 @@ import apify_service
 import excel_service
 import profile_metadata
 import serper_service
+import serpapi_service
 import social_urls
 import verification_service
 import wikipedia_service
@@ -222,7 +223,7 @@ def _drop_missing_profiles(candidates: List[dict], platform: str) -> List[dict]:
 
 
 def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
-            candidates: List[dict]) -> VerificationResult:
+            candidates: List[dict], allow_thin_verify: bool = False) -> VerificationResult:
     if not candidates:
         return VerificationResult(platform=platform, status=STATUS_NOT_FOUND,
                                   reason="No candidate links to verify.")
@@ -234,7 +235,8 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
         )
     _enrich_candidates(candidates, platform)
     result = verification_service.verify_platform(
-        platform, wiki_meta.to_prompt_dict(), candidates, is_person=wiki_meta.is_person
+        platform, wiki_meta.to_prompt_dict(), candidates, is_person=wiki_meta.is_person,
+        allow_thin_verify=allow_thin_verify,
     )
     return _guard_ambiguous_identity(
         result, candidates, wiki_meta.name or wiki_meta.talent, platform
@@ -617,6 +619,83 @@ def _ground_truth(talent: str, wiki_url: str, input_metadata: dict,
 
 
 # ────────────────────────────────────────────────────────────────────────────
+#  No-Wikipedia flow — SerpApi "Google AI Mode" discovery + LLM tagging
+# ────────────────────────────────────────────────────────────────────────────
+
+# Excel columns (case-insensitive) that carry a talent's profession/category,
+# used to build the query "<name> <profession> all social media handles".
+_PROFESSION_KEYS = (
+    "title_sub_category", "title_subcategory", "sub_category", "subcategory",
+    "profession", "occupation", "title_category", "category",
+    "primary_genre", "genre", "role",
+)
+
+
+def _clean_profession(value: str) -> str:
+    """
+    Strip a 'Label - Value' prefix so queries stay clean.
+    e.g. 'Talent Type - Musician' -> 'Musician', 'Actor' -> 'Actor'.
+    """
+    parts = re.split(r"\s+[-–—]\s+|:\s+", value.strip())
+    return (parts[-1].strip() if parts else value.strip())
+
+
+def _detect_profession(input_metadata: dict) -> str:
+    """Best-effort profession/category term from the row's Excel columns."""
+    if not input_metadata:
+        return ""
+    lowered = {str(k).lower(): v for k, v in input_metadata.items()}
+    for key in _PROFESSION_KEYS:
+        val = lowered.get(key)
+        if isinstance(val, str) and val.strip():
+            return _clean_profession(val)
+    return ""
+
+
+def _row_serpapi_phase(
+    talent: str,
+    wiki_meta: wikipedia_service.WikiMetadata,
+    input_metadata: dict,
+    platform_progress: Optional[Callable[[str, str], None]] = None,
+) -> Dict[str, VerificationResult]:
+    """
+    Discovery for talents with NO Wikipedia link: ONE SerpApi Google-AI-Mode
+    query ("<name> <profession> all social media platforms"), then return the
+    links Google AI Mode cites — tagged Manual Review Needed (source: SerpApi).
+
+    There is NO LLM verification for these rows: the links are handed through
+    as-is for a human to review. (No Serper/Apify either — one SerpApi call/row.)
+    """
+    profession = _detect_profession(input_metadata)
+    try:
+        handles = serpapi_service.discover_handles(talent, profession)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [PIPELINE] SerpApi discovery failed for '{talent}': {exc}")
+        handles = {}
+
+    results: Dict[str, VerificationResult] = {}
+    for platform in PLATFORMS:
+        if platform_progress:
+            platform_progress(platform, "start")
+        cands = handles.get(platform, [])
+        if cands:
+            results[platform] = VerificationResult(
+                platform=platform, best_candidate=cands[0]["url"],
+                status=STATUS_MANUAL, confidence=0, decision="manual_review",
+                reason=("Link cited by SerpApi Google AI Mode search — not "
+                        "LLM-verified; manual review needed."),
+            )
+        else:
+            results[platform] = VerificationResult(
+                platform=platform, status=STATUS_NOT_FOUND,
+                reason="No link returned by Google AI Mode search.",
+            )
+        if platform_progress:
+            platform_progress(platform, "done")
+    return results
+
+
+# ────────────────────────────────────────────────────────────────────────────
 #  Row / dataframe processing
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -637,6 +716,12 @@ def _resolve_row_result(
     non-Verified (used by the single-row / CLI path).
     """
     wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
+
+    # No Wikipedia link -> SerpApi Google AI Mode discovery + LLM tagging
+    # (a different search API and pattern; no Serper/Apify for these rows).
+    if not (wiki_url or "").strip():
+        final = _row_serpapi_phase(talent, wiki_meta, input_metadata, platform_progress)
+        return _assemble_row_out(final)
 
     # Phase 1 — Serper-primary discovery + verification.
     phase1 = _row_serper_phase(talent, wiki_meta, platform_progress,
@@ -759,18 +844,24 @@ def run_pipeline_on_dataframe(
                 platform_progress(idx, platform, phase)
 
         wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
+        no_wiki = not (wiki_url or "").strip()
         try:
-            phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
-                                       input_handles=input_handles)
+            if no_wiki:
+                # Different pipeline: SerpApi Google AI Mode (no Serper/Apify).
+                phase1 = _row_serpapi_phase(talent, wiki_meta, input_metadata, _pp)
+            else:
+                phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
+                                           input_handles=input_handles)
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
-            print(f"  [PIPELINE] Serper phase failed for '{talent}': {exc}")
+            print(f"  [PIPELINE] {'SerpApi' if no_wiki else 'Serper'} phase failed for '{talent}': {exc}")
             phase1 = {
                 p: VerificationResult(platform=p, status=STATUS_MANUAL, confidence=0,
                                       reason="Verification error; manual review required.")
                 for p in PLATFORMS
             }
         return {"idx": idx, "row_label": row_label, "talent": talent,
-                "wiki_meta": wiki_meta, "phase1": phase1, "cancelled": False}
+                "wiki_meta": wiki_meta, "phase1": phase1, "cancelled": False,
+                "no_wiki": no_wiki}
 
     workers = max(1, min(PIPELINE_ROW_WORKERS, total or 1))
     phase_a: List[dict] = []
@@ -782,7 +873,7 @@ def run_pipeline_on_dataframe(
     stopped = _is_cancelled(should_cancel)
     failing_talents = sorted({
         r["talent"] for r in phase_a
-        if not r.get("cancelled")
+        if not r.get("cancelled") and not r.get("no_wiki")  # no-Wiki rows use SerpApi only
         and any(v.status not in _GOOD_STATUSES for v in r["phase1"].values())
     })
     if stopped:
@@ -803,6 +894,9 @@ def run_pipeline_on_dataframe(
         # Once stopped, assemble what Phase A produced instead of spending more
         # Apify/LLM calls — partial results are still saved and viewable.
         if r.get("cancelled") or _is_cancelled(should_cancel):
+            return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
+        # No-Wikipedia rows are already final from the SerpApi phase (no Apify).
+        if r.get("no_wiki"):
             return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
         try:
             final = _row_apify_phase(
