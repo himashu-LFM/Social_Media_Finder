@@ -10,6 +10,7 @@ export const MAIN_NAV: NavItem[] = [
   { icon: "table_chart", label: "Results", href: "/results" },
   { icon: "travel_explore", label: "Serper Result", href: "/serper" },
   { icon: "donut_large", label: "Analysis", href: "/analysis" },
+  { icon: "history", label: "History", href: "/history" },
 ];
 
 export function isNavActive(pathname: string, href: string): boolean {

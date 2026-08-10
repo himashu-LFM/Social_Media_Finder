@@ -339,12 +339,22 @@ def _fanout_slugs(input_handles: Dict[str, str]) -> List[str]:
     return slugs
 
 
+def _analyst_result(platform: str, url: str) -> VerificationResult:
+    """A decision a human already made. Outranks anything the pipeline can infer."""
+    return VerificationResult(
+        platform=platform, best_candidate=url, status=STATUS_VERIFIED, confidence=100,
+        reason="Confirmed by an analyst in a previous run (verified_url).",
+        decision="verified",
+    )
+
+
 def _resolve_platform_serper(
     talent: str,
     platform: str,
     wiki_meta: wikipedia_service.WikiMetadata,
     known_url: str = "",
     fanout_slugs: Optional[List[str]] = None,
+    decisions: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> VerificationResult:
     """
     Phase 1 — assemble candidates for one platform and verify them together.
@@ -355,6 +365,18 @@ def _resolve_platform_serper(
       3. ONLY if 1 and 2 produced nothing: the client's handle from ANOTHER
          platform, reused here — a cheap recall rescue that costs no search.
     """
+    decisions = decisions or {}
+    # A human already ruled on this cell — return it and spend nothing. This is
+    # the whole point of persisting decisions: one analyst's work makes every
+    # later run of the same talent cheaper AND more accurate.
+    confirmed = (decisions.get("verified") or {}).get(platform)
+    if confirmed:
+        print(f"  [DECISION] {platform} | {talent} -> served from verified_url (no API spend)")
+        return _analyst_result(platform, confirmed)
+
+    # A human rejected these — never surface them again, on any run.
+    rejected = {u for u in [(decisions.get("rejected") or {}).get(platform)] if u}
+
     serper_candidates, errored = _serper_primary_candidate(talent, platform)
 
     candidates: List[dict] = []
@@ -374,6 +396,18 @@ def _resolve_platform_serper(
         if candidates:
             print(f"  [FANOUT] {platform} | {talent} -> trying known handle(s) "
                   f"{fanout_slugs} (Serper found nothing)")
+
+    # Drop anything an analyst has already rejected, comparing on the normalised
+    # URL so a trailing slash or scheme difference can't smuggle it back in.
+    if rejected:
+        norm_rejected = {social_urls.normalize_profile_url(u, platform).lower() for u in rejected}
+        before = len(candidates)
+        candidates = [c for c in candidates
+                      if social_urls.normalize_profile_url(c["url"], platform).lower()
+                      not in norm_rejected]
+        if len(candidates) < before:
+            print(f"  [DECISION] {platform} | {talent} -> dropped "
+                  f"{before - len(candidates)} previously rejected candidate(s)")
 
     if not candidates:
         reason = (
@@ -432,6 +466,7 @@ def _row_serper_phase(
     platform_progress: Optional[Callable[[str, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     input_handles: Optional[Dict[str, str]] = None,
+    decisions: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Dict[str, VerificationResult]:
     """Phase 1 for one row: Serper-primary verify across all platforms (concurrent)."""
     input_handles = input_handles or {}
@@ -450,6 +485,7 @@ def _row_serper_phase(
             result = _resolve_platform_serper(
                 talent, platform, wiki_meta,
                 known_url=input_handles.get(platform, ""), fanout_slugs=fanout,
+                decisions=decisions,
             )
         except Exception as exc:  # noqa: BLE001 — isolate platform failures
             print(f"  [PIPELINE] {platform} Serper phase error for '{talent}': {exc}")
@@ -725,7 +761,8 @@ def _resolve_row_result(
 
     # Phase 1 — Serper-primary discovery + verification.
     phase1 = _row_serper_phase(talent, wiki_meta, platform_progress,
-                               input_handles=input_handles)
+                               input_handles=input_handles,
+                               decisions=load_decisions([talent]).get(talent.lower(), {}))
 
     # Phase 2 — Apify backup, only if some platform isn't Verified.
     failing = [p for p, r in phase1.items() if r.status not in _GOOD_STATUSES]
@@ -744,6 +781,30 @@ def _resolve_row_result(
     # (Verified) on other platforms this run.
     final = _corroborate_row(talent, wiki_meta, final)
     return _assemble_row_out(final)
+
+
+def load_decisions(talents: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
+    """
+    Analyst decisions for these talents, keyed by lowercased title.
+
+    Read once per run. Returns {} when the database is unconfigured or
+    unreachable — a missing decision store must never stop a run, it only means
+    the run costs full price.
+    """
+    try:
+        import db_service
+        if not db_service.is_configured():
+            return {}
+        found = db_service.fetch_decisions(talents)
+        if found:
+            v = sum(len(s.get("verified", {})) for s in found.values())
+            r = sum(len(s.get("rejected", {})) for s in found.values())
+            print(f"[DECISIONS] {v} confirmed and {r} rejected cell(s) loaded for "
+                  f"{len(found)} talent(s) — confirmed cells cost nothing to re-run.")
+        return found
+    except Exception as exc:  # noqa: BLE001 — never block a run on the decision store
+        print(f"[DECISIONS] unavailable ({exc.__class__.__name__}) — running at full cost.")
+        return {}
 
 
 def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
@@ -819,6 +880,10 @@ def run_pipeline_on_dataframe(
     total = len(rows)
     print(f"[PIPELINE] Verification run started for {total} talent row(s) "
           f"(Serper primary, Apify backup; row workers={PIPELINE_ROW_WORKERS}).")
+
+    # One lookup for the whole run: cells an analyst already ruled on cost nothing
+    # to re-run, and previously rejected URLs are never surfaced again.
+    decisions_by_talent = load_decisions([r[2] for r in rows]) if rows else {}
 
     # ── Phase A: Serper-primary discovery + verification for every row ──
     def _phase_a(entry: tuple) -> dict:

@@ -8,3 +8,5 @@ uvicorn[standard]>=0.32.0
 python-multipart>=0.0.9
 # Analyst decision storage (verified_url / rejected_url)
 psycopg[binary,pool]>=3.1
+# Auth: Argon2id password hashing
+argon2-cffi>=23.1

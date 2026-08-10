@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { MAIN_NAV, isNavActive } from "@/config/navigation";
+import { UserMenu } from "@/components/UserMenu";
 
 export function AppSidebar() {
   const pathname = usePathname();
@@ -59,6 +60,7 @@ export function AppSidebar() {
             </p>
           </div>
         </div>
+        <UserMenu />
       </div>
     </nav>
   );
