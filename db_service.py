@@ -41,7 +41,27 @@ except ImportError:
     ConnectionPool = None  # type: ignore
     _DRIVER = "psycopg3 (no pool)" if psycopg else "none"
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+def _require_tls(url: str) -> str:
+    """
+    Make sure a deployed connection is encrypted.
+
+    libpq defaults to sslmode=prefer, which silently falls back to plaintext if
+    the server does not insist. Between App Runner and RDS that traffic carries
+    session tokens and client talent lists, so in production we require TLS and
+    fail rather than quietly downgrade. Local and socket connections are left
+    alone — developers should not need certificates to run the app.
+    """
+    if not url or "sslmode=" in url:
+        return url
+    env = os.environ.get("APP_ENV", "development").strip().lower()
+    if env not in ("production", "prod", "staging"):
+        return url
+    if any(h in url for h in ("@localhost", "@127.0.0.1", "@/")):
+        return url
+    return url + ("&" if "?" in url else "?") + "sslmode=require"
+
+
+DATABASE_URL = _require_tls(os.environ.get("DATABASE_URL", "").strip())
 
 # UI platform key -> database column. The single source of truth for the
 # mapping; both the API and the upsert build their SQL from this.

@@ -35,6 +35,7 @@ from typing import Any, Dict, List
 
 import requests
 
+import bio_link_service
 import social_urls
 from retry_util import request_with_retry
 
@@ -143,6 +144,8 @@ def _collect_candidates(items: List[dict]) -> Dict[str, List[dict]]:
         platform = social_urls.platform_from_url(url)
         if not platform or not social_urls.is_valid_profile_url(url, platform):
             return
+        if bio_link_service.is_platform_chrome(url, platform):
+            return   # site furniture the actor scraped off the page, not a profile
         norm = social_urls.normalize_profile_url(url, platform)
         bucket = seen.setdefault(platform, set())
         if norm in bucket:
@@ -157,6 +160,15 @@ def _collect_candidates(items: List[dict]) -> Dict[str, List[dict]]:
         for value in _iter_strings(item):
             if value.startswith("http"):
                 add(value, item_meta)
+
+        # A bio rarely writes a full URL. "yt: youtube.com/@kako" and
+        # "https:\/\/x.com\/kako" inside a JSON blob both name a real profile
+        # and neither starts with "http", so the loop above skips them — and on
+        # Instagram the bio is the ONLY place the other platforms appear.
+        bio = str(item_meta.get("bio") or "")
+        if bio:
+            for platform, url in bio_link_service.links_by_platform(bio).items():
+                add(url, {**item_meta, "found_in_profile_bio": True})
 
     return by_platform
 

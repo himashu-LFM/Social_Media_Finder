@@ -97,6 +97,18 @@ _THIN_EVIDENCE_MIN_CONFIDENCE = max(
     0, min(100, int(os.environ.get("THIN_EVIDENCE_MIN_CONFIDENCE", "85"))))
 
 
+#: Entity types that describe a performer rather than a company. The loosened
+#: gate below is for ORGANISATIONS, where a brand name plus an industry really
+#: does disambiguate. A person — or a band, which carries exactly the same
+#: namesake risk as a person — must not slip through it. Reading the honest
+#: "person or group (unspecified)" as a company did precisely that, switching
+#: the gate off for every non-Wikipedia row in the file.
+_PERSONISH_ENTITY_TYPES = frozenset({
+    "", "person", "human", "person or group (unspecified)",
+    "band", "musical group", "duo", "group", "talent",
+})
+
+
 def _ground_truth_is_thin(ground_truth: Dict[str, Any]) -> bool:
     """
     True when the ground truth carries no facts that could rule out a namesake.
@@ -111,7 +123,7 @@ def _ground_truth_is_thin(ground_truth: Dict[str, Any]) -> bool:
     if any(ground_truth.get(k) for k in _IDENTITY_SIGNALS):
         return False
     entity_type = str(ground_truth.get("entity_type", "")).strip().lower()
-    is_org = entity_type not in ("", "person", "human")
+    is_org = entity_type not in _PERSONISH_ENTITY_TYPES
     if is_org and ground_truth.get("provided_metadata"):
         return False
     return True
@@ -124,6 +136,10 @@ _EVIDENCE_META_KEYS = (
     "serper_title", "serper_snippet", "serper_results", "knowledge_graph",
     "bio", "display_name", "followers", "subscribers", "likes", "verified",
     "website", "title", "snippet",
+    # Corroboration is retrieved evidence too: both of these were established by
+    # comparing this candidate against something outside itself. Omitting them
+    # meant the floor escalated a cell the gate had just cleared.
+    "anchor_handle_match", "backlink_to_client_profile",
 )
 
 
@@ -225,12 +241,48 @@ _FAN_HANDLE_RE = re.compile(
 )
 
 # Evidence that is genuinely about the account holder rather than a search blurb.
-_STRONG_EVIDENCE_KEYS = ("bio", "knowledge_graph", "verified", "followers", "subscribers")
+#
+# ``anchor_handle_match`` is set by the pipeline when a candidate's handle is an
+# exact match for a DISTINCTIVE handle the client already confirmed on another
+# platform. Artists register the same handle everywhere, so "mettya_bizin on
+# Facebook" given a client-confirmed "mettya_bizin on Instagram" is a real,
+# first-party-ish signal — not the bare URL match the prompt warns about, which
+# is a handle matching a *declared* (possibly stale) handle from metadata.
+_STRONG_EVIDENCE_KEYS = ("bio", "knowledge_graph", "verified", "followers",
+                         "subscribers", "anchor_handle_match",
+                         "backlink_to_client_profile")
+
+
+def _snippet_is_first_party(cand: Dict[str, Any]) -> bool:
+    """
+    True when the Serper snippet describes THIS profile page, not the subject.
+
+    Snippets are excluded from strong evidence by default, and rightly: a search
+    blurb often talks about the person rather than the account. But when the top
+    result's link IS the candidate URL, the snippet is that page's own meta
+    description — the bio, arriving by a different route. On X and Facebook,
+    where an anonymous page fetch returns nothing at all, this is frequently the
+    only substantive evidence that exists, and discarding it sent correct
+    profiles to Manual Review purely because we could not scrape them.
+    """
+    meta = cand.get("meta") or {}
+    if not meta.get("serper_snippet"):
+        return False
+    url = str(cand.get("url", "")).rstrip("/").lower()
+    if not url:
+        return False
+    for result in (meta.get("serper_results") or [])[:2]:
+        link = str((result or {}).get("link", "")).rstrip("/").lower()
+        if link and (link == url or link.endswith(url.split("//")[-1])):
+            return True
+    return False
 
 
 def _has_strong_evidence(cand: Dict[str, Any]) -> bool:
     meta = cand.get("meta") or {}
-    return any(meta.get(k) not in ("", None, [], {}) for k in _STRONG_EVIDENCE_KEYS)
+    if any(meta.get(k) not in ("", None, [], {}) for k in _STRONG_EVIDENCE_KEYS):
+        return True
+    return _snippet_is_first_party(cand)
 
 
 _THIN_STRICT_REASON = (
@@ -269,6 +321,24 @@ def _thin_gate_block(thin_gate: str, chosen: Optional[Dict[str, Any]],
                 f"below the {_THIN_EVIDENCE_MIN_CONFIDENCE} required to confirm "
                 f"without one.")
     return ""
+
+
+def _name_is_present(talent: str, cand: Dict[str, Any]) -> bool:
+    """
+    Does the candidate carry the subject's name at all?
+
+    Deliberately generous — a handle match counts, and so does any single name
+    token — because this only decides whether a 'wrong' verdict is trustworthy.
+    The non-Latin-script cases we care about ("อูโน่ หลาวทอง" for "Uno Laothong")
+    survive precisely because the handle usually stays in Latin script.
+    """
+    tokens = [t for t in re.findall(r"[a-z0-9]+", (talent or "").lower()) if len(t) > 2]
+    if not tokens:
+        # Nothing distinctive enough to match on ("AM:PM"). Leave the model's
+        # verdict alone rather than excusing it on a two-letter coincidence.
+        return False
+    haystack = (_candidate_text(cand) + " " + str(cand.get("url", ""))).lower()
+    return any(re.search(rf"(?<![a-z0-9]){re.escape(t)}", haystack) for t in tokens)
 
 
 def _implausible_following(ground_truth: Dict[str, Any], cand: Dict[str, Any]) -> str:
@@ -331,6 +401,10 @@ class VerificationResult:
     evidence: List[Any] = field(default_factory=list)
     rejected: List[Any] = field(default_factory=list)
     decision: str = ""
+    #: Metadata of the candidate that was chosen. Carried so downstream steps can
+    #: reason about HOW it was evidenced (e.g. it linked back to a client profile)
+    #: without re-fetching. Never exported to the workbook.
+    source_meta: Dict[str, Any] = field(default_factory=dict)
 
 
 def is_configured() -> bool:
@@ -383,6 +457,21 @@ _SYSTEM_MSG = (
     "clear variant of) one of them is strong corroboration — you may treat that "
     "cross-platform consistency as supporting evidence toward 'verified', provided no "
     "content contradicts the identity.\n\n"
+    "BACK-LINK TO A KNOWN PROFILE — THE STRONGEST SIGNAL HERE: a candidate flagged "
+    "'backlink_to_client_profile' publishes, on its own page, a link to the exact "
+    "profile the CLIENT supplied for this subject on another platform. The candidate "
+    "is therefore agreeing with a fact from OUR records that no search engine supplied "
+    "to it. Weigh this heavily toward 'verified'. The one thing it does not rule out is "
+    "a fan or news account, which may also link the real artist — so if the candidate's "
+    "own words describe the subject in the third party ('fan page', 'all about X', "
+    "'updates on X'), it is still not first-party and you must not verify it.\n\n"
+    "CONFIRMED-HANDLE REUSE: a candidate flagged 'anchor_handle_match' uses the exact "
+    "same distinctive handle as a profile the CLIENT supplied and confirmed for this "
+    "same subject on another platform. Artists routinely register one handle across "
+    "every platform, so this is meaningful corroboration and, combined with a matching "
+    "name, is normally enough for 'verified' on data-sparse platforms. It is still not "
+    "proof on its own: if the candidate's content points to a different subject, say "
+    "'wrong'.\n\n"
     "CROSS-SOURCE AGREEMENT: a candidate flagged 'cross_source_agreement' was returned "
     "INDEPENDENTLY by two different discovery tools (a Serper web search AND Apify). "
     "That agreement makes it more likely to be the real, active profile and should "
@@ -404,6 +493,32 @@ _SYSTEM_MSG = (
     "(X, TikTok) you will often see only a handle and a name. 'Nothing contradicts this' "
     "is the default state of an empty profile, not a reason to verify. Verification "
     "requires a POSITIVE identity signal, never merely the lack of a negative one.\n\n"
+    "THIN GROUND TRUTH — UNSTATED IS NOT CONTRADICTED (READ THIS FIRST): many "
+    "subjects have no Wikipedia page, so the ground truth is little more than a name "
+    "and a broad category such as 'Talent'. When that is the case, the ground truth is "
+    "INCOMPLETE, not exhaustive. A candidate that reveals specifics the ground truth "
+    "never mentioned — that the subject makes music, tours, is a band, works in a "
+    "particular genre or city — is ELABORATING on a sparse record, which is exactly "
+    "what a real profile does. That is NOT a conflict and is NOT grounds for 'wrong'. "
+    "Only an ACTIVE contradiction counts: the candidate is demonstrably a different "
+    "subject (a business trading under a similar name, a person in an unrelated field "
+    "with a different name, a different band). Ask yourself: 'is this fact absent from "
+    "my ground truth, or does it CONFLICT with my ground truth?' Absent is fine.\n\n"
+    "A GROUP IS NOT A CONTRADICTION: bands, duos, collectives, DJ projects and "
+    "stage personas are talent. If the ground truth says the subject is a 'Talent' or "
+    "a musician and the candidate profile turns out to be a band, a group account or a "
+    "project rather than one named individual, that is NORMAL and is NOT a conflict — "
+    "do not label it 'wrong' for that reason. Many artists in these lists ARE the band. "
+    "Reserve 'wrong' for a genuinely DIFFERENT subject (a different band, a business "
+    "trading under a similar name, an unrelated person). Likewise, a profile written "
+    "in a different script or language than the input name (Japanese, Thai, Korean, "
+    "Cyrillic) is expected for non-English talent: if the native-script name is a "
+    "transliteration of the input name, treat that as a MATCH, not a discrepancy.\n\n"
+    "OFFICIALITY MARKERS IN ANY LANGUAGE: words meaning 'official' in the profile's own "
+    "language are first-party self-identification and are strong evidence toward "
+    "'verified' — e.g. 公式 (Japanese), 공식 (Korean), 官方 (Chinese), oficial, officiel, "
+    "ufficiale, официальный, ทางการ (Thai). Do not overlook them because they are not "
+    "the English word.\n\n"
     "NAME ORDER MATTERS: a displayed name containing the subject's words in a different "
     "order ('Scully N James' for 'James Scully') usually indicates a different person, "
     "not a stylisation. Extra middle names or suffixes are fine; reordering is not.\n\n"
@@ -415,7 +530,9 @@ _SYSTEM_MSG = (
     "identity match is enough, so do not withhold 'verified' merely because some "
     "details are missing. (A declared-handle/URL match with NO such content signal is "
     "still not enough on its own.)\n"
-    "  • wrong — the candidate belongs to a DIFFERENT person/entity (including a "
+    "  • wrong — reserved for a DEMONSTRABLY different subject. Do NOT use it merely "
+    "because the candidate is more specific than a thin ground truth. The candidate "
+    "belongs to a DIFFERENT person/entity (including a "
     "same-name or same-handle namesake in a different field), is a post/video rather "
     "than a profile, is broken/redirected, or its content contradicts the ground "
     "truth. If the candidate's content points to a different domain than the ground "
@@ -473,9 +590,29 @@ def _flatten_candidate(i: int, cand: dict) -> dict:
     return {k: v for k, v in entry.items() if v not in ("", None, [], {})}
 
 
+#: Placed immediately above the sparse record it describes. The same rule exists
+#: in the system prompt and was measurably ignored there — buried in two thousand
+#: words of standing instructions it lost to the model's default reflex of
+#: treating any unlisted detail as a mismatch. Next to the data, it holds.
+_THIN_GT_NOTICE = (
+    "!! THIS GROUND TRUTH IS SPARSE — READ BEFORE JUDGING !!\n"
+    "This subject has no Wikipedia record. What follows is a name and a broad\n"
+    "category, and that is ALL we know — it is not a complete description.\n"
+    "  * Detail in a candidate that is simply ABSENT here (a genre, a city, being\n"
+    "    a band or duo rather than one person, a label, a tour) is the profile\n"
+    "    filling in what we do not know. That is expected. It is NOT a conflict.\n"
+    "  * Do NOT answer 'wrong' because the candidate is more specific than this\n"
+    "    record. 'Wrong' requires positive proof of a DIFFERENT subject.\n"
+    "  * A name written in the subject's own script (Japanese, Thai, Korean,\n"
+    "    Cyrillic) is a MATCH, not a discrepancy.\n"
+)
+
+
 def _build_user_message(platform: str, wiki_meta: Dict[str, Any], candidates: List[dict]) -> str:
     candidate_payload = [_flatten_candidate(i, c) for i, c in enumerate(candidates, start=1)]
+    notice = _THIN_GT_NOTICE + "\n" if _ground_truth_is_thin(wiki_meta) else ""
     return (
+        notice +
         "GROUND-TRUTH PROFILE (Wikipedia + input metadata):\n"
         f"{json.dumps(wiki_meta, ensure_ascii=False, indent=2)}\n\n"
         f"PLATFORM: {platform}\n\n"
@@ -508,6 +645,12 @@ def _call_anthropic(system_msg: str, user_msg: str) -> dict:
     body = {
         "model": ANTHROPIC_MODEL,
         "max_tokens": 1024,
+        # Same input must produce the same label. Without this a re-run of an
+        # identical file changed roughly a quarter of its cells, which is
+        # indistinguishable from the pipeline being wrong a quarter of the time
+        # and makes any before/after measurement meaningless. The OpenAI path
+        # has always pinned this; the primary path had not.
+        "temperature": 0,
         # System prompt is a top-level field on the Messages API (not a message).
         "system": system_msg,
         "messages": [
@@ -658,6 +801,23 @@ def verify_platform(
                 reason = f"{block} {reason}".strip()
                 print(f"  [VERIFY] {platform} authenticity guard -> manual review")
 
+    # "Wrong" is an assertion about identity, and a name-only record does not
+    # support it. The model kept rejecting real profiles for being MORE specific
+    # than the ground truth ("a four-member band … contradicts 'Talent'"), which
+    # is not a contradiction at all. When the record is thin and the candidate
+    # still carries the subject's name, that claim becomes Manual Review: we
+    # genuinely do not know, and saying so is the honest answer. A candidate whose
+    # name does NOT match is left as Wrong — that judgement stands on its own.
+    if status == STATUS_WRONG and thin_gate == GATE_EVIDENCE and best:
+        chosen = next((c for c in candidates if c.get("url") == best), None)
+        if chosen is not None and _name_is_present(str(wiki_meta.get("name") or ""), chosen):
+            status = STATUS_MANUAL
+            confidence = min(confidence or 50, 60)
+            reason = ("Rejected only for being more specific than our name-only "
+                      "record, which is not evidence of a different subject — "
+                      "needs a human. " + (reason or "")).strip()
+            print(f"  [VERIFY] {platform} thin-record 'wrong' downgraded to manual review")
+
     # Name-only ground truth can't rule out a namesake — downgrade a Verified to
     # Manual Review (better a human check than a confident wrong confirmation).
     if status == STATUS_VERIFIED and _ground_truth_is_thin(wiki_meta):
@@ -667,6 +827,8 @@ def verify_platform(
             status = STATUS_MANUAL
             reason = f"{block} {reason or ''}".strip()
 
+    chosen_meta = dict((next((c for c in candidates if c.get("url") == best), {})
+                        or {}).get("meta") or {})
     result = VerificationResult(
         platform=platform,
         best_candidate=best,
@@ -676,6 +838,7 @@ def verify_platform(
         evidence=evidence if isinstance(evidence, list) else [evidence],
         rejected=rejected if isinstance(rejected, list) else [rejected],
         decision=decision,
+        source_meta=chosen_meta,
     )
     print(f"  [VERIFY] {platform} -> {status} ({confidence}) | {best or '(none)'}")
     return result

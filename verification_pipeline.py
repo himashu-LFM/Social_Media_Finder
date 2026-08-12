@@ -48,6 +48,7 @@ import apify_service
 import excel_service
 import profile_metadata
 import serper_service
+import bio_link_service
 import search_options
 import social_urls
 import verification_service
@@ -347,6 +348,133 @@ def _fanout_slugs(input_handles: Dict[str, str]) -> List[str]:
     return slugs
 
 
+# A handle short enough to collide by chance ("uno", "ampm") proves nothing;
+# a distinctive one ("mettya_bizin") is very unlikely to be two different people.
+_MIN_ANCHOR_HANDLE_LEN = max(4, int(os.environ.get("MIN_ANCHOR_HANDLE_LEN", "6")))
+
+
+def _tag_anchor_handle_matches(candidates: List[dict], fanout_slugs: List[str],
+                               options: search_options.SearchOptions) -> None:
+    """
+    Flag candidates that reuse a handle the client already confirmed elsewhere.
+
+    Musicians register one handle across every platform, so given a
+    client-supplied ``instagram.com/mettya_bizin``, a Facebook page at
+    ``/mettya_bizin`` is corroboration rather than coincidence. Without this,
+    X and TikTok — which expose almost no metadata to an anonymous fetch — can
+    never clear the evidence gate and every such cell lands in Manual Review,
+    which is exactly what happened on the first non-Wikipedia run.
+
+    Custom mode only, and it only ever ADDS evidence: the LLM still adjudicates
+    and every authenticity guard still applies, so a squatter reusing a handle
+    gets caught by the same checks as before.
+    """
+    if not options.is_custom or not fanout_slugs:
+        return
+    anchors = {s.lower() for s in fanout_slugs if len(s) >= _MIN_ANCHOR_HANDLE_LEN}
+    if not anchors:
+        return
+    for cand in candidates:
+        handle = _handle_from_url(cand.get("url", ""))
+        if handle and handle.lower() in anchors:
+            cand.setdefault("meta", {})["anchor_handle_match"] = handle
+
+
+def _same_profile(a: str, b: str, platform: str) -> bool:
+    """Same account, regardless of scheme, www, or a trailing slash."""
+    ha = social_urls.handle_from_url(a, platform).lstrip("@").lower()
+    hb = social_urls.handle_from_url(b, platform).lstrip("@").lower()
+    return bool(ha) and ha == hb
+
+
+def _tag_backlinks(candidates: List[dict], input_handles: Dict[str, str],
+                   options: search_options.SearchOptions) -> None:
+    """
+    Flag candidates that link BACK to a profile the client supplied.
+
+    The client's Instagram handle is the one fact about this subject that no
+    search engine could have guessed. A YouTube channel whose page independently
+    lists that exact handle is corroborating itself against OUR ground truth, not
+    merely against its own claims — the strongest signal available on a subject
+    with no Wikipedia page.
+
+    It is evidence, not a verdict. A tribute channel can also link the artist's
+    real Instagram, which is exactly the "about them, not them" trap that caused
+    the earlier false positives, so the LLM and every authenticity guard still
+    run. What changes is that the candidate now clears the evidence gate.
+    """
+    if not options.is_custom or not input_handles:
+        return
+    for cand in candidates:
+        published = (cand.get("meta") or {}).get("profile_links") or {}
+        if not isinstance(published, dict):
+            continue
+        for platform, client_url in input_handles.items():
+            listed = published.get(platform)
+            if not listed or not client_url:
+                continue
+            # Compare handles, not URLs: normalize_profile_url canonicalises the
+            # host only for X, so "http://instagram.com/x/" and
+            # "https://www.instagram.com/x" are different strings for the same
+            # account and a real back-link would be missed.
+            if _same_profile(listed, client_url, platform):
+                cand["meta"]["backlink_to_client_profile"] = client_url
+                print(f"  [BACKLINK] {cand.get('url','')[:56]}… links back to "
+                      f"the client's {platform} — treating as strong evidence.")
+                break
+
+
+def _adopt_backlink_discoveries(
+    talent: str,
+    results: Dict[str, VerificationResult],
+    input_handles: Dict[str, str],
+    decisions: Optional[Dict[str, Dict[str, str]]],
+    options: search_options.SearchOptions,
+) -> Dict[str, VerificationResult]:
+    """
+    Once a back-linked candidate is CONFIRMED, adopt the rest of its bio links.
+
+    The chain is: the client gave us Instagram → a YouTube channel published that
+    exact Instagram → the LLM and the guards agreed the channel is genuine →
+    therefore the other platforms that same channel lists are first-party too.
+    Each step is checked; only the last one is inherited.
+
+    Fills empty cells only. A platform the pipeline already Verified keeps its own
+    result, so this can add coverage but never overwrite a finding.
+    """
+    if not options.is_custom:
+        return results
+
+    rejected = {u for u in ((decisions or {}).get("rejected") or {}).values() if u}
+    out = dict(results)
+
+    for platform, result in results.items():
+        if result.status != STATUS_VERIFIED or not result.best_candidate:
+            continue
+        meta = getattr(result, "source_meta", None) or {}
+        if not meta.get("backlink_to_client_profile"):
+            continue
+        for other, url in (meta.get("profile_links") or {}).items():
+            if other == platform or other not in PLATFORMS:
+                continue
+            if out.get(other) and out[other].status in _GOOD_STATUSES:
+                continue          # never overwrite a finding we already trust
+            if url in rejected:
+                continue          # an analyst's rejection outranks the bio
+            out[other] = VerificationResult(
+                platform=other, best_candidate=url, status=STATUS_VERIFIED,
+                confidence=95,
+                reason=(f"Published by {result.best_candidate}, which was confirmed "
+                        f"for this subject and links back to the client-supplied "
+                        f"profile — so its other listed links are first-party."),
+                evidence=[f"{result.best_candidate} publishes {url}"],
+                decision="verified",
+            )
+            print(f"  [BACKLINK] '{talent}' {other} adopted from the confirmed "
+                  f"{platform} profile: {url}")
+    return out
+
+
 def _analyst_result(platform: str, url: str) -> VerificationResult:
     """A decision a human already made. Outranks anything the pipeline can infer."""
     return VerificationResult(
@@ -366,6 +494,7 @@ def _resolve_platform_serper(
     options: search_options.SearchOptions = search_options.DEFAULT,
     category: str = "",
     subcategory: str = "",
+    input_handles_for_backlink: Optional[Dict[str, str]] = None,
 ) -> VerificationResult:
     """
     Phase 1 — assemble candidates for one platform and verify them together.
@@ -428,6 +557,9 @@ def _resolve_platform_serper(
             if errored else "No profile found via Serper search."
         )
         return VerificationResult(platform=platform, status=STATUS_NOT_FOUND, reason=reason)
+
+    _tag_anchor_handle_matches(candidates, fanout_slugs or [], options)
+    _tag_backlinks(candidates, input_handles_for_backlink or {}, options)
     return _verify(platform, wiki_meta, candidates, options)
 
 
@@ -486,6 +618,98 @@ def _row_taxonomy(input_metadata: Optional[Dict[str, str]]) -> tuple[str, str]:
     )
 
 
+# ────────────────────────────────────────────────────────────────────────────
+#  Phase 0 — first-party bio links (custom mode only)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _bio_link_result(platform: str, url: str, anchor_platform: str,
+                     anchor_url: str) -> VerificationResult:
+    """
+    A link the anchor profile publishes about itself.
+
+    Confirmed without adjudication, by design: the account holder wrote it. The
+    reason text names the anchor so the assumption underneath it — that the
+    client's handle for this row is correct — stays auditable rather than
+    disappearing into a bare "Verified".
+    """
+    return VerificationResult(
+        platform=platform, best_candidate=url, status=STATUS_VERIFIED, confidence=100,
+        reason=(f"Published as a first-party link in the {anchor_platform} bio of "
+                f"{anchor_url} (handle supplied in the input file)."),
+        evidence=[f"{anchor_platform} profile {anchor_url} links to {url}"],
+        decision="verified",
+    )
+
+
+def _row_bio_link_phase(
+    talent: str,
+    input_handles: Optional[Dict[str, str]] = None,
+    decisions: Optional[Dict[str, Dict[str, str]]] = None,
+    options: search_options.SearchOptions = search_options.DEFAULT,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Dict[str, VerificationResult]:
+    """
+    Read the client-supplied anchor profile and adopt the platforms it links to.
+
+    Returns only the platforms it filled; everything absent from the result
+    falls through to ordinary discovery. Runs in custom mode only — the
+    Wikipedia flow is measured and must not change.
+    """
+    if not options.is_custom or _is_cancelled(should_cancel):
+        return {}
+
+    candidates = bio_link_service.anchors(input_handles or {})
+    if not candidates:
+        return {}
+
+    # Every client-supplied handle is confirmed on the file's authority, and we
+    # keep reading anchors until one actually yields links — Instagram often
+    # publishes none to an anonymous reader while YouTube publishes them all.
+    found: Dict[str, str] = {}
+    anchor_platform, anchor_url = candidates[0]
+    for platform, url in candidates:
+        try:
+            harvested = bio_link_service.harvest(url, platform)
+        except Exception as exc:  # noqa: BLE001 — a bad harvest costs spend, not correctness
+            print(f"  [BIO-LINKS] harvest failed for '{talent}': {exc.__class__.__name__}")
+            continue
+        if harvested:
+            anchor_platform, anchor_url = platform, url
+            found = harvested
+            break
+
+    rejected = {
+        url for url in ((decisions or {}).get("rejected") or {}).values() if url
+    }
+    adopted: Dict[str, VerificationResult] = {}
+
+    # The anchor itself is confirmed too: the file asserts it, and every link
+    # below is only as good as that assertion anyway — labelling the source
+    # Manual Review while confirming what it points at would be incoherent.
+    for platform, url in candidates:
+        if platform in PLATFORMS:
+            adopted[platform] = VerificationResult(
+                platform=platform, best_candidate=url,
+                status=STATUS_VERIFIED, confidence=100,
+                reason="Supplied in the input file by the client.",
+                decision="verified",
+            )
+
+    for platform, url in found.items():
+        if platform not in PLATFORMS:
+            continue
+        # An analyst who rejected this URL outranks the bio that published it.
+        if url in rejected:
+            print(f"  [BIO-LINKS] {platform} {url} skipped — previously rejected by an analyst.")
+            continue
+        adopted[platform] = _bio_link_result(platform, url, anchor_platform, anchor_url)
+
+    if adopted:
+        print(f"  [BIO-LINKS] '{talent}': {len(adopted)} platform(s) resolved with no "
+              f"search or LLM spend -> {', '.join(sorted(adopted))}")
+    return adopted
+
+
 def _row_serper_phase(
     talent: str,
     wiki_meta: wikipedia_service.WikiMetadata,
@@ -495,9 +719,16 @@ def _row_serper_phase(
     decisions: Optional[Dict[str, Dict[str, str]]] = None,
     options: search_options.SearchOptions = search_options.DEFAULT,
     input_metadata: Optional[Dict[str, str]] = None,
+    resolved: Optional[Dict[str, VerificationResult]] = None,
 ) -> Dict[str, VerificationResult]:
-    """Phase 1 for one row: Serper-primary verify across all platforms (concurrent)."""
+    """
+    Phase 1 for one row: Serper-primary verify across all platforms (concurrent).
+
+    ``resolved`` carries anything Phase 0 already settled from first-party bio
+    links. Those platforms are never searched — that saved spend is the point.
+    """
     input_handles = input_handles or {}
+    resolved = resolved or {}
     fanout = _fanout_slugs(input_handles)
     category, subcategory = _row_taxonomy(input_metadata)
 
@@ -516,6 +747,7 @@ def _row_serper_phase(
                 known_url=input_handles.get(platform, ""), fanout_slugs=fanout,
                 decisions=decisions, options=options,
                 category=category, subcategory=subcategory,
+                input_handles_for_backlink=input_handles,
             )
         except Exception as exc:  # noqa: BLE001 — isolate platform failures
             print(f"  [PIPELINE] {platform} Serper phase error for '{talent}': {exc}")
@@ -528,12 +760,20 @@ def _row_serper_phase(
                 platform_progress(platform, "done")
         return platform, result
 
-    results: Dict[str, VerificationResult] = {}
-    workers = min(_MAX_PLATFORM_WORKERS, len(PLATFORMS))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for platform, result in executor.map(_task, list(PLATFORMS)):
+    results: Dict[str, VerificationResult] = dict(resolved)
+    pending = [p for p in PLATFORMS if p not in results]
+    if not pending:
+        return results
+    workers = min(_MAX_PLATFORM_WORKERS, len(pending))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        for platform, result in executor.map(_task, pending):
             results[platform] = result
-    return results
+
+    # A confirmed profile that links back to the client's own handle vouches for
+    # the rest of the links it publishes. Runs after every platform is settled so
+    # it can fill the gaps search left behind.
+    return _adopt_backlink_discoveries(talent, results, input_handles,
+                                       decisions, options)
 
 
 def _row_apify_phase(
@@ -585,6 +825,30 @@ def _handle_from_url(url: str) -> str:
     return path.split("/")[0].lstrip("@").lower()
 
 
+def _tag_cross_platform_match(cand: dict, platform: str,
+                              verified_handles: Dict[str, str],
+                              options: search_options.SearchOptions) -> None:
+    """
+    Mark a candidate whose handle was already confirmed on another platform.
+
+    Distinct from ``_tag_anchor_handle_matches``, which compares against handles
+    the CLIENT supplied. This compares against handles this run verified on its
+    own, so the corroboration is only as strong as those verdicts — which is why
+    it is evidence for the adjudicator rather than a verdict of its own.
+    """
+    if not options.is_custom:
+        return
+    handle = _handle_from_url(cand.get("url", ""))
+    if not handle or len(handle) < _MIN_ANCHOR_HANDLE_LEN:
+        return
+    for other, confirmed in verified_handles.items():
+        if other != platform and confirmed and confirmed.lower() == handle.lower():
+            cand.setdefault("meta", {})["anchor_handle_match"] = handle
+            print(f"  [CORROBORATE] {platform} handle '{handle}' already confirmed "
+                  f"on {other} — counting as evidence.")
+            return
+
+
 def _corroborate_row(
     talent: str,
     wiki_meta: wikipedia_service.WikiMetadata,
@@ -626,6 +890,12 @@ def _corroborate_row(
             )
         try:
             _enrich_candidates([cand], platform)  # re-fetch snippet/kg/counts for the link
+            # A handle already confirmed for this subject on another platform IS
+            # substantive evidence. Without tagging it, corroboration could never
+            # promote anything in custom mode: the LLM would agree, and the
+            # evidence gate would immediately re-block the cell for having no
+            # fetchable metadata — which is exactly why it needed rescuing.
+            _tag_cross_platform_match(cand, platform, verified_handles, options)
             res = verification_service.verify_platform(
                 platform, gt, [cand], is_person=wiki_meta.is_person,
                 thin_gate=options.thin_gate,
@@ -712,10 +982,16 @@ def _resolve_row_result(
     wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
 
     # Phase 1 — Serper-primary discovery + verification.
+    decisions = load_decisions([talent]).get(talent.lower(), {})
+
+    # Phase 0 — first-party bio links (custom mode only; a no-op otherwise).
+    resolved = _row_bio_link_phase(talent, input_handles, decisions, options)
+
     phase1 = _row_serper_phase(talent, wiki_meta, platform_progress,
                                input_handles=input_handles,
-                               decisions=load_decisions([talent]).get(talent.lower(), {}),
-                               options=options, input_metadata=input_metadata)
+                               decisions=decisions,
+                               options=options, input_metadata=input_metadata,
+                               resolved=resolved)
 
     # Phase 2 — Apify backup, only if some platform isn't Verified.
     failing = [p for p, r in phase1.items() if r.status not in _GOOD_STATUSES]
@@ -824,6 +1100,7 @@ def run_pipeline_on_dataframe(
     wikipedia_service.clear_cache()
     profile_metadata.clear_cache()
     serper_service.clear_cache()
+    bio_link_service.clear_cache()
 
     # Collect processable rows (skip blank names), preserving 0-based index.
     rows = []
@@ -865,10 +1142,14 @@ def run_pipeline_on_dataframe(
 
         wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
         try:
+            row_decisions = decisions_by_talent.get(talent.lower(), {})
+            resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
+                                           options, should_cancel)
             phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
                                        input_handles=input_handles,
-                                       decisions=decisions_by_talent.get(talent.lower(), {}),
-                                       options=options, input_metadata=input_metadata)
+                                       decisions=row_decisions,
+                                       options=options, input_metadata=input_metadata,
+                                       resolved=resolved)
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
             print(f"  [PIPELINE] Serper phase failed for '{talent}': {exc}")
             phase1 = {

@@ -40,8 +40,22 @@ except ImportError:  # pragma: no cover
 # How long a sign-in lasts before the user must authenticate again.
 SESSION_TTL_HOURS = max(1, int(os.environ.get("SESSION_TTL_HOURS", "12")))
 
+def _flag(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
+
+
 # Set AUTH_REQUIRED=0 to run the API open (local development only).
-AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "1").strip() not in ("0", "false", "no")
+AUTH_REQUIRED = _flag("AUTH_REQUIRED", "1")
+
+# Set APP_ENV=production on every deployed environment.
+#
+# This exists because ``enforced()`` used to FAIL OPEN: it returned False
+# whenever the database was unreachable, so a missing DATABASE_URL or a momentary
+# RDS failover would silently drop authentication from every endpoint and serve
+# the whole tool to anonymous callers. That is the correct behaviour on a laptop
+# and unacceptable anywhere else. In production the API now refuses requests it
+# cannot authenticate instead of waving them through.
+IS_PRODUCTION = _flag("APP_ENV", "development") and     os.environ.get("APP_ENV", "development").strip().lower() in ("production", "prod", "staging")
 
 
 def is_available() -> bool:
@@ -52,6 +66,44 @@ def is_available() -> bool:
 def enforced() -> bool:
     """True when requests must carry a valid session."""
     return AUTH_REQUIRED and is_available()
+
+
+def fail_closed() -> bool:
+    """
+    True when auth is REQUIRED but cannot currently be performed.
+
+    The caller must reject the request (503) rather than serve it unauthenticated.
+    Only ever true in production: locally, a developer without a database still
+    gets the open API they expect.
+    """
+    return IS_PRODUCTION and AUTH_REQUIRED and not is_available()
+
+
+def startup_report() -> list[str]:
+    """
+    Configuration problems that make a deployment unsafe or unusable.
+
+    Returned rather than raised so the caller decides whether to refuse to boot
+    (production) or simply warn (local development).
+    """
+    problems: list[str] = []
+    if not IS_PRODUCTION:
+        return problems
+    if not AUTH_REQUIRED:
+        problems.append(
+            "AUTH_REQUIRED=0 in production — every endpoint would be public.")
+    if not db_service.is_configured():
+        problems.append(
+            "DATABASE_URL is not set — accounts and sessions cannot be read, so "
+            "no request can be authenticated.")
+    if _hasher is None:
+        problems.append(
+            "argon2-cffi is not installed — passwords cannot be verified.")
+    if not os.environ.get("CORS_ORIGINS", "").strip():
+        problems.append(
+            "CORS_ORIGINS is not set — the browser UI will be unable to call this "
+            "API from its real origin.")
+    return problems
 
 
 def _token_hash(token: str) -> str:

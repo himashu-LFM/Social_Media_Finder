@@ -105,11 +105,26 @@ async def _lifespan(app: FastAPI):
     paths = sorted(
         {getattr(r, "path", "") for r in app.routes if getattr(r, "path", "").startswith("/api")}
     )
+    # Refuse to serve a production deployment that cannot authenticate anyone.
+    # Discovering this from a log line after the fact is how an internal tool
+    # ends up briefly public; a container that will not start is noticed at once.
+    problems = auth_service.startup_report()
+    if problems:
+        for problem in problems:
+            print(f"[api_server] FATAL CONFIG: {problem}")
+        raise RuntimeError(
+            "Refusing to start: the production configuration above would leave this "
+            "API unauthenticated or unreachable. Fix the environment and redeploy."
+        )
+
     purged = auth_service.purge_expired_sessions()
     if purged:
         print(f"[api_server] Purged {purged} expired session(s).")
     if auth_service.enforced():
         print(f"[api_server] Authentication ENFORCED ({auth_service.user_count()} account(s)).")
+    elif auth_service.IS_PRODUCTION:
+        print("[api_server] Authentication unavailable — requests will be REFUSED (503), "
+              "never served anonymously.")
     else:
         print("[api_server] Authentication is OFF — set DATABASE_URL and create a user to enable it.")
     reaped = db_service.reap_orphaned_jobs()
@@ -130,14 +145,22 @@ app = FastAPI(title="Curator AI", version="1.0.0", lifespan=_lifespan)
 _cors_origins_env = os.getenv("CORS_ORIGINS", "").strip()
 _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
 
+# Localhost is trusted ONLY outside production. Leaving the regex on in a
+# deployed environment means any page a user happens to be running locally can
+# call the production API with their session — an origin we never intended to
+# allow and cannot audit.
+_LOCALHOST_RE = r"https?://(127\.0\.0\.1|localhost)(:\d+)?"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    # Keep localhost enabled even when production CORS_ORIGINS is set.
-    allow_origin_regex=r"https?://(127\.0\.0\.1|localhost)(:\d+)?",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origin_regex=None if auth_service.IS_PRODUCTION else _LOCALHOST_RE,
+    # Bearer tokens travel in the Authorization header, not cookies, so the API
+    # never needs credentialed cross-origin requests. Off by default keeps a
+    # misconfigured origin from becoming a session-riding hole.
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -331,7 +354,17 @@ def _bearer(authorization: Optional[str]) -> str:
 
 
 def current_user(authorization: Optional[str] = Header(default=None)) -> Optional[Dict[str, Any]]:
-    """Resolve the caller. Returns None when auth is not enforced."""
+    """
+    Resolve the caller. Returns None only when auth is genuinely not enforced.
+
+    In production, "we cannot check credentials right now" must never mean "come
+    in". If the account store is unreachable the request is refused, not served.
+    """
+    if auth_service.fail_closed():
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is temporarily unavailable. Please retry shortly.",
+        )
     if not auth_service.enforced():
         return None
     user = auth_service.user_for_token(_bearer(authorization))
@@ -664,6 +697,29 @@ def api_results_serper_latest(job_id: Optional[str] = None,
     return _read_rows_response(paths)
 
 
+def _rebuild_export_from_db(job_id: Optional[str]) -> Optional[Path]:
+    """
+    Regenerate a run's workbook from the rows persisted in Postgres.
+
+    Local disk cannot be the system of record once this runs on more than one
+    container: uploads and exports written by instance A simply do not exist on
+    instance B, and both vanish on the next deploy. The job row already carries
+    every result cell as JSONB, so a download is always reproducible.
+    """
+    if not job_id:
+        return None
+    try:
+        rows = db_service.load_job_rows(job_id)
+        if not rows:
+            return None
+        frame = pd.DataFrame(rows)
+        return testing.excel_service.save_results(frame, output_dir=EXPORT_DIR)
+    except Exception as exc:  # noqa: BLE001 — a failed rebuild is a 404, not a 500
+        print(f"[api_server] export rebuild failed for {job_id}: "
+              f"{exc.__class__.__name__}: {exc}")
+        return None
+
+
 @app.get("/api/export/latest")
 def api_export_latest(job_id: Optional[str] = None,
                       user: Optional[Dict[str, Any]] = Depends(current_user)) -> FileResponse:
@@ -672,6 +728,16 @@ def api_export_latest(job_id: Optional[str] = None,
     if pending:
         raise HTTPException(status_code=409, detail="That run is still processing.")
     if not paths:
+        # Nothing on this container's disk. On AWS that is routine, not an error:
+        # the filesystem is ephemeral and the instance that ran the job is often
+        # not the one serving the download. Postgres holds the rows, so rebuild
+        # the workbook rather than telling the analyst their results are gone.
+        rebuilt = _rebuild_export_from_db(job_id)
+        if rebuilt:
+            return FileResponse(
+                path=str(rebuilt), filename=rebuilt.name,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         raise HTTPException(status_code=404, detail="No export available for that request.")
     last_err: Optional[str] = None
     for p in paths:
@@ -707,8 +773,14 @@ class DecisionLookupBody(BaseModel):
 
 
 @app.get("/api/db/health")
-def db_health() -> dict[str, Any]:
-    """Is the decision database reachable and are both tables present?"""
+def db_health(user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
+    """
+    Is the decision database reachable and are both tables present?
+
+    Authenticated: the response names our tables and reports connection errors,
+    which is useful to an analyst and equally useful to someone probing the
+    deployment. /api/health stays open for the load balancer.
+    """
     return {"configured": db_service.is_configured(), **db_service.ping()}
 
 

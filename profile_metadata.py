@@ -24,6 +24,8 @@ from typing import Any, Dict, List
 
 import requests
 
+from retry_util import request_with_retry
+
 import social_urls
 
 # Social sites expose the richest OpenGraph tags to crawler/OG-scraper agents.
@@ -103,8 +105,13 @@ def _fetch_html(url: str) -> str:
     last = ""
     for ua in _USER_AGENTS:
         try:
-            resp = requests.get(url, headers={**_BASE_HEADERS, "User-Agent": ua},
-                                timeout=_TIMEOUT, allow_redirects=True)
+            # request_with_retry, not a bare get: TikTok in particular resets
+            # the TLS connection on a first contact often enough that a single
+            # attempt returns nothing, the candidate looks evidence-free, and a
+            # correct profile gets escalated to Manual Review for no reason.
+            resp = request_with_retry("GET", url,
+                                      headers={**_BASE_HEADERS, "User-Agent": ua},
+                                      timeout=_TIMEOUT, allow_redirects=True)
             if not resp.ok or len(resp.content) > _MAX_BYTES:
                 continue
             html = resp.text or ""
@@ -192,6 +199,18 @@ def fetch_profile_metadata(url: str, platform: str) -> Dict[str, Any]:
     if re.search(r'"is_verified"\s*:\s*true|"isVerified"\s*:\s*true|"verified"\s*:\s*true',
                  html, re.I):
         meta["verified"] = True
+
+    # Every social profile this page links to. Free: the HTML is already here,
+    # and it is what lets the pipeline check whether a discovered candidate links
+    # BACK to a profile the client gave us. Imported lazily — bio_link_service
+    # imports this module, so a top-level import would be circular.
+    try:
+        import bio_link_service
+        links = bio_link_service.links_by_platform(html, exclude_url=url)
+        if links:
+            meta["profile_links"] = links
+    except Exception as exc:  # noqa: BLE001 — enrichment must never raise
+        print(f"  [PROFILE] link scan failed {url[:60]}… : {exc.__class__.__name__}")
 
     # Drop empty values so the LLM payload stays clean.
     meta = {k: v for k, v in meta.items() if v not in ("", None)}

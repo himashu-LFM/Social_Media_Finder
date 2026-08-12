@@ -154,7 +154,14 @@ class WikiMetadata:
             # Identity details supplied directly in the spreadsheet.
             data["provided_metadata"] = self.input_metadata
         # Tell the LLM whether this is a person or an organization/brand.
-        data["entity_type"] = self.entity_type or ("person" if self.is_person else "organization")
+        #
+        # When the only source is a generic client category ("Talent"), that says
+        # the subject is a performer — not that they are one human being. Plenty
+        # are bands or duos. Asserting "person" from it made the model reject real
+        # band profiles as contradicting the ground truth, so where nothing more
+        # specific is known we say exactly that instead of guessing.
+        data["entity_type"] = self.entity_type or (
+            "person or group (unspecified)" if self.is_person else "organization")
         # Drop empty top-level fields to keep the payload tight.
         return {k: v for k, v in data.items() if v not in ("", None, [], {})}
 

@@ -128,6 +128,16 @@ export function SearchModeCard() {
               </div>
             )}
 
+            <p className="flex items-start gap-2 rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-3 py-2.5 text-xs leading-relaxed text-emerald-100">
+              <span className="material-symbols-outlined text-base">bolt</span>
+              <span>
+                <strong className="font-bold">Bio links run first.</strong> If a row has an
+                Instagram or YouTube handle in the file, that profile is read once and any
+                platform it links to is confirmed straight away — no search, no LLM, no cost.
+                The query below only runs for whatever is left.
+              </span>
+            </p>
+
             <p className="flex items-start gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2.5 text-xs leading-relaxed text-amber-100">
               <span className="material-symbols-outlined text-base">info</span>
               <span>
