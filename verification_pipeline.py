@@ -660,9 +660,12 @@ def _ground_truth(talent: str, wiki_url: str, input_metadata: dict,
 
 # Excel columns (case-insensitive) that carry a talent's profession/category,
 # used to build the query "<name> <profession> all social media handles".
+# An explicit ``profession``/``occupation`` column wins when present (it is the
+# cleanest, most direct signal); otherwise fall back to the taxonomy columns.
 _PROFESSION_KEYS = (
+    "profession", "occupation",
     "title_sub_category", "title_subcategory", "sub_category", "subcategory",
-    "profession", "occupation", "title_category", "category",
+    "title_category", "category",
     "primary_genre", "genre", "role",
 )
 
@@ -693,18 +696,27 @@ def _row_serpapi_phase(
     wiki_meta: wikipedia_service.WikiMetadata,
     input_metadata: dict,
     platform_progress: Optional[Callable[[str, str], None]] = None,
+    custom_query: Optional[str] = None,
+    include_profession: bool = True,
 ) -> Dict[str, VerificationResult]:
     """
     Discovery for talents with NO Wikipedia link: ONE SerpApi Google-AI-Mode
-    query ("<name> <profession> all social media platforms"), then return the
-    links Google AI Mode cites — tagged Manual Review Needed (source: SerpApi).
+    query, then return the links Google AI Mode cites — tagged Manual Review
+    Needed (source: SerpApi).
+
+    Query = ``"<name> [<profession>] <suffix>"``:
+      * ``profession`` is taken from the row's Excel columns, and is omitted
+        entirely when ``include_profession`` is False.
+      * ``custom_query`` overrides the default suffix — this is the operator's
+        free-text prompt from the "Without Wikipedia" UI. ``None`` keeps the
+        configured default suffix.
 
     There is NO LLM verification for these rows: the links are handed through
     as-is for a human to review. (No Serper/Apify either — one SerpApi call/row.)
     """
-    profession = _detect_profession(input_metadata)
+    profession = _detect_profession(input_metadata) if include_profession else ""
     try:
-        handles = serpapi_service.discover_handles(talent, profession)
+        handles = serpapi_service.discover_handles(talent, profession, suffix=custom_query)
     except Exception as exc:  # noqa: BLE001
         print(f"  [PIPELINE] SerpApi discovery failed for '{talent}': {exc}")
         handles = {}
@@ -846,9 +858,22 @@ def run_pipeline_on_dataframe(
     row_status: Optional[Callable[[int, str], None]] = None,
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    mode: str = "wiki",
+    custom_query: str = "",
+    include_profession: bool = True,
 ) -> pd.DataFrame:
     """
     Process every row and return the populated frame — Serper primary, Apify backup.
+
+    ``mode`` selects the discovery strategy for the whole run:
+      * ``"wiki"`` (default) — per-row auto routing: rows WITH a Wikipedia URL go
+        through Serper + LLM (+ Apify backup); rows without one fall back to the
+        SerpApi Google-AI-Mode discovery with the default query suffix.
+      * ``"non_wiki"`` — force EVERY row through SerpApi Google-AI-Mode using a
+        custom query ``"<name> [<profession>] <custom_query>"``. ``custom_query``
+        is the operator's free-text prompt; ``include_profession`` controls
+        whether the Excel profession/category is included in the query. No
+        Wikipedia lookup, no Serper, no Apify, no LLM for these rows.
 
     Two global phases keep the run scalable to hundreds of rows:
       Phase A — every row's Serper-primary discovery + verification, concurrently
@@ -860,6 +885,11 @@ def run_pipeline_on_dataframe(
     futures complete, so there are no concurrent pandas writes.
     ``row_status(row_index, status)`` reports per-row lifecycle ("processing"/"done").
     """
+    non_wiki_mode = str(mode or "wiki").strip().lower() == "non_wiki"
+    if non_wiki_mode:
+        print(f"[PIPELINE] Mode: NON-WIKI custom query — suffix={custom_query!r}, "
+              f"include_profession={include_profession}. Every row uses SerpApi "
+              f"Google AI Mode (no Serper/Apify/LLM).")
     df = df.copy()
     for col in excel_service.ordered_columns():
         if col not in df.columns:
@@ -908,17 +938,30 @@ def run_pipeline_on_dataframe(
             if platform_progress:
                 platform_progress(idx, platform, phase)
 
-        wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
-        no_wiki = not (wiki_url or "").strip()
+        # SerpApi path when the operator chose Non-Wiki mode, OR (in Wiki mode)
+        # when a row simply has no Wikipedia URL to anchor on.
+        use_serpapi = non_wiki_mode or not (wiki_url or "").strip()
+        # No Wikipedia lookup for SerpApi rows — the SerpApi phase never uses the
+        # ground-truth record, so skip the (often fruitless) Wikidata/REST calls.
+        if use_serpapi:
+            wiki_meta = wikipedia_service.WikiMetadata(talent=talent, name=talent)
+        else:
+            wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
         try:
-            if no_wiki:
+            if use_serpapi:
                 # Different pipeline: SerpApi Google AI Mode (no Serper/Apify).
-                phase1 = _row_serpapi_phase(talent, wiki_meta, input_metadata, _pp)
+                # The custom query + profession toggle apply only in Non-Wiki mode;
+                # Wiki-mode fallback rows keep the default suffix + profession.
+                phase1 = _row_serpapi_phase(
+                    talent, wiki_meta, input_metadata, _pp,
+                    custom_query=(custom_query if non_wiki_mode else None),
+                    include_profession=(include_profession if non_wiki_mode else True),
+                )
             else:
                 phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
                                            input_handles=input_handles)
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
-            print(f"  [PIPELINE] {'SerpApi' if no_wiki else 'Serper'} phase failed for '{talent}': {exc}")
+            print(f"  [PIPELINE] {'SerpApi' if use_serpapi else 'Serper'} phase failed for '{talent}': {exc}")
             phase1 = {
                 p: VerificationResult(platform=p, status=STATUS_MANUAL, confidence=0,
                                       reason="Verification error; manual review required.")
@@ -926,7 +969,7 @@ def run_pipeline_on_dataframe(
             }
         return {"idx": idx, "row_label": row_label, "talent": talent,
                 "wiki_meta": wiki_meta, "phase1": phase1, "cancelled": False,
-                "no_wiki": no_wiki}
+                "no_wiki": use_serpapi}
 
     workers = max(1, min(PIPELINE_ROW_WORKERS, total or 1))
     phase_a: List[dict] = []

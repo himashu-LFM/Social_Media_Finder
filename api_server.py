@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -247,7 +247,9 @@ def _run_job(job_id: str, names: List[str]) -> None:
         _persist(job_id)
 
 
-def _run_job_from_file(job_id: str, path: Path) -> None:
+def _run_job_from_file(job_id: str, path: Path,
+                       mode: str = "wiki", custom_query: str = "",
+                       include_profession: bool = True) -> None:
     def row_status(row_index: int, status: str) -> None:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -273,6 +275,9 @@ def _run_job_from_file(job_id: str, path: Path) -> None:
             row_status=row_status,
             platform_progress=platform_progress,
             should_cancel=_cancel_event(job_id).is_set,
+            mode=mode,
+            custom_query=custom_query,
+            include_profession=include_profession,
         )
 
         out_path, serper_path = _persist_outputs(final_df)
@@ -415,15 +420,30 @@ def start_job(body: StartJobBody,
 @app.post("/api/upload")
 @app.post("/api/jobs/upload")
 async def start_job_from_upload(file: UploadFile = File(...),
+                                mode: str = Form("wiki"),
+                                custom_query: str = Form(""),
+                                include_profession: str = Form("true"),
                                 user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """
     Upload an .xlsx / .xls / .csv from the UI. Rows are parsed like Demo_Social.xlsx
     (Talent Name + optional category columns). No need to copy the file into the repo folder.
 
+    Optional run options (multipart form fields, defaulting to the classic Wiki flow):
+      * ``mode`` — ``"wiki"`` (per-row auto routing) or ``"non_wiki"`` (force every
+        row through SerpApi Google AI Mode with a custom query).
+      * ``custom_query`` — the free-text prompt appended after ``<name> <profession>``
+        in Non-Wiki mode (ignored in Wiki mode).
+      * ``include_profession`` — ``"true"``/``"false"``; whether the Excel
+        profession/category is included in the Non-Wiki query.
+
     Use POST /api/upload or POST /api/jobs/upload (both work). The /api/jobs/upload path is
     registered as POST-only before GET /api/jobs/{job_id}, so it does not collide with the
     dynamic route.
     """
+    run_mode = "non_wiki" if str(mode).strip().lower() == "non_wiki" else "wiki"
+    include_prof = str(include_profession).strip().lower() not in ("false", "0", "no", "")
+    custom_q = (custom_query or "").strip()
+
     raw_name = (file.filename or "upload").strip()
     lower = raw_name.lower()
     if not (lower.endswith(".xlsx") or lower.endswith(".xls") or lower.endswith(".csv")):
@@ -474,12 +494,19 @@ async def start_job_from_upload(file: UploadFile = File(...),
             "output_path": None,
             "error": None,
             "source_filename": raw_name,
+            "mode": run_mode,
+            "custom_query": custom_q,
+            "include_profession": include_prof,
             "started_by": _uid(user),
         }
     _persist(job_id)
     db_service.record_upload(job_id, raw_name, len(body), len(names), _uid(user))
 
-    thread = threading.Thread(target=_run_job_from_file, args=(job_id, dest), daemon=True)
+    thread = threading.Thread(
+        target=_run_job_from_file,
+        args=(job_id, dest, run_mode, custom_q, include_prof),
+        daemon=True,
+    )
     thread.start()
 
     return {

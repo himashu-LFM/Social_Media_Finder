@@ -20,6 +20,8 @@ const excelColumns = [
   },
 ] as const;
 
+type DiscoveryMode = "wiki" | "non_wiki";
+
 export function DiscoveryWorkspace() {
   const router = useRouter();
   const { pushToast } = useToast();
@@ -27,6 +29,9 @@ export function DiscoveryWorkspace() {
   const [status, setStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [mode, setMode] = useState<DiscoveryMode>("wiki");
+  const [customQuery, setCustomQuery] = useState("");
+  const [includeProfession, setIncludeProfession] = useState(true);
 
   const base = getPythonApiUrl();
 
@@ -42,6 +47,11 @@ export function DiscoveryWorkspace() {
 
     const fd = new FormData();
     fd.append("file", file);
+    fd.append("mode", mode);
+    if (mode === "non_wiki") {
+      fd.append("custom_query", customQuery.trim());
+      fd.append("include_profession", includeProfession ? "true" : "false");
+    }
 
     try {
       const res = await fetch(`${base}/api/upload`, {
@@ -137,6 +147,96 @@ export function DiscoveryWorkspace() {
             Upload an Excel/CSV file. We’ll read the talent rows, resolve official profiles across
             platforms, and export a confidence-scored workbook.
           </p>
+
+          {/* ── Mode selector: Wiki (verified pipeline) vs Non-Wiki (custom SerpApi query) ── */}
+          <div className="mb-6">
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+              Discovery mode
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <button
+                type="button"
+                onClick={() => setMode("wiki")}
+                aria-pressed={mode === "wiki"}
+                className={`rounded-xl border p-4 text-left transition ${
+                  mode === "wiki"
+                    ? "border-primary/50 bg-primary/10 ring-1 ring-primary/30"
+                    : "border-white/8 bg-slate-950/50 hover:border-white/20"
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="material-symbols-outlined text-primary">menu_book</span>
+                  <span className="text-sm font-bold text-slate-100">With Wikipedia</span>
+                </div>
+                <p className="mt-1.5 text-[11px] leading-relaxed text-slate-400">
+                  Full pipeline: Wikipedia/Wikidata ground truth → discover → LLM-verified
+                  Verified / Wrong / Manual Review labels.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setMode("non_wiki")}
+                aria-pressed={mode === "non_wiki"}
+                className={`rounded-xl border p-4 text-left transition ${
+                  mode === "non_wiki"
+                    ? "border-primary/50 bg-primary/10 ring-1 ring-primary/30"
+                    : "border-white/8 bg-slate-950/50 hover:border-white/20"
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="material-symbols-outlined text-primary">travel_explore</span>
+                  <span className="text-sm font-bold text-slate-100">Without Wikipedia</span>
+                </div>
+                <p className="mt-1.5 text-[11px] leading-relaxed text-slate-400">
+                  No ground truth. Type a custom Google AI Mode query; every found link is
+                  returned tagged Manual Review (no LLM).
+                </p>
+              </button>
+            </div>
+
+            {mode === "non_wiki" && (
+              <div className="mt-3 rounded-xl border border-primary/20 bg-slate-950/60 p-4 ring-1 ring-white/5">
+                <label
+                  htmlFor="custom-query"
+                  className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-slate-400"
+                >
+                  Custom query prompt
+                </label>
+                <input
+                  id="custom-query"
+                  type="text"
+                  value={customQuery}
+                  onChange={(e) => setCustomQuery(e.target.value)}
+                  placeholder="e.g. social media handles"
+                  className="w-full rounded-lg border border-white/10 bg-slate-900/80 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-primary/50"
+                />
+
+                <label className="mt-3 flex cursor-pointer items-center gap-2 text-xs text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={includeProfession}
+                    onChange={(e) => setIncludeProfession(e.target.checked)}
+                    className="h-4 w-4 accent-[var(--color-primary,#f2d100)]"
+                  />
+                  Include profession from Excel in the query
+                </label>
+
+                <p className="mt-3 text-[11px] leading-relaxed text-slate-500">
+                  Query sent per talent:
+                </p>
+                <code className="mt-1 block break-words rounded-lg bg-slate-900/80 px-3 py-2 font-mono text-[11px] text-primary/90 ring-1 ring-white/5">
+                  &lt;Name&gt;{includeProfession ? " <Profession>" : ""}
+                  {customQuery.trim() ? ` ${customQuery.trim()}` : ""}
+                </code>
+                <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
+                  <span className="font-semibold text-slate-400">Name</span> and{" "}
+                  <span className="font-semibold text-slate-400">Profession</span> are pulled from
+                  your Excel; only the prompt is yours to type.
+                </p>
+              </div>
+            )}
+          </div>
 
           <div className="mb-6 rounded-xl border border-white/8 bg-slate-950/50 p-4 ring-1 ring-white/5 sm:p-5">
             <div className="mb-3 flex flex-wrap items-center gap-2">
