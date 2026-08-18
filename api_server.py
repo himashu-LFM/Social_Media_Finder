@@ -168,21 +168,24 @@ class StartJobBody(BaseModel):
     names: List[str] = Field(..., min_length=1)
     # "wikipedia" (default) or "custom". See search_options for what changes.
     search_mode: str = ""
-    query_template: str = ""
+    # Custom mode: the free-text SerpApi query prompt + whether to include the
+    # file's profession in the query "<name> [<profession>] <prompt>".
+    prompt: str = ""
+    include_profession: bool = True
 
 
-def _search_options(mode: str, template: str) -> search_options.SearchOptions:
+def _search_options(mode: str, prompt: str,
+                    include_profession: bool = True) -> search_options.SearchOptions:
     """
-    Build run options from request input. A bad template is rejected here,
-    before a single row is searched — otherwise the analyst discovers the typo
-    after the whole file's Serper budget has been spent on it.
+    Build run options from request input. A bad mode/prompt is rejected here,
+    before a single row is searched.
     """
     bad_mode = search_options.validate_mode(mode)
     if bad_mode:
         raise HTTPException(status_code=400, detail=bad_mode)
-    opts = search_options.from_request(mode, template)
+    opts = search_options.from_request(mode, prompt, include_profession)
     if opts.is_custom:
-        problem = search_options.validate_template(opts.query_template)
+        problem = search_options.validate_prompt(opts.prompt)
         if problem:
             raise HTTPException(status_code=400, detail=problem)
     return opts
@@ -464,7 +467,7 @@ def start_job(body: StartJobBody,
     names = [n.strip() for n in body.names if n and str(n).strip()]
     if not names:
         raise HTTPException(status_code=400, detail="Provide at least one non-empty name.")
-    options = _search_options(body.search_mode, body.query_template)
+    options = _search_options(body.search_mode, body.prompt, body.include_profession)
     if len(names) > MAX_ROWS_PER_JOB:
         raise HTTPException(
             status_code=413,
@@ -488,7 +491,8 @@ def start_job(body: StartJobBody,
             "error": None,
             "started_by": _uid(user),
             "search_mode": options.mode,
-            "query_template": options.template,
+            "prompt": options.prompt,
+            "include_profession": options.include_profession,
         }
     _persist(job_id)
 
@@ -501,17 +505,24 @@ def start_job(body: StartJobBody,
 @app.post("/api/jobs/upload")
 async def start_job_from_upload(file: UploadFile = File(...),
                                 search_mode: str = Form(""),
-                                query_template: str = Form(""),
+                                prompt: str = Form(""),
+                                include_profession: str = Form("true"),
                                 user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """
     Upload an .xlsx / .xls / .csv from the UI. Rows are parsed like Demo_Social.xlsx
     (Talent Name + optional category columns). No need to copy the file into the repo folder.
 
+    Custom (non-Wikipedia) mode form fields:
+      * ``search_mode`` — "wikipedia" (default) or "custom".
+      * ``prompt`` — free-text SerpApi query suffix ("<name> [<profession>] <prompt>").
+      * ``include_profession`` — "true"/"false"; include the file's profession in the query.
+
     Use POST /api/upload or POST /api/jobs/upload (both work). The /api/jobs/upload path is
     registered as POST-only before GET /api/jobs/{job_id}, so it does not collide with the
     dynamic route.
     """
-    options = _search_options(search_mode, query_template)
+    include_prof = str(include_profession).strip().lower() not in ("false", "0", "no", "")
+    options = _search_options(search_mode, prompt, include_prof)
     raw_name = (file.filename or "upload").strip()
     lower = raw_name.lower()
     if not (lower.endswith(".xlsx") or lower.endswith(".xls") or lower.endswith(".csv")):
@@ -564,7 +575,8 @@ async def start_job_from_upload(file: UploadFile = File(...),
             "source_filename": raw_name,
             "started_by": _uid(user),
             "search_mode": options.mode,
-            "query_template": options.template,
+            "prompt": options.prompt,
+            "include_profession": options.include_profession,
         }
     _persist(job_id)
     db_service.record_upload(job_id, raw_name, len(body), len(names), _uid(user))

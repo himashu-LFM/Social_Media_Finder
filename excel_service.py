@@ -88,11 +88,16 @@ def reason_col(platform: str) -> str:
     return f"{platform} Reason"
 
 
+def source_col(platform: str) -> str:
+    """Where the chosen link came from — SerpApi, Phase 0 bio, input file, etc."""
+    return f"{platform} Source"
+
+
 def ordered_columns() -> List[str]:
     cols: List[str] = [TALENT_COL, WIKI_COL]
     for platform in PLATFORM_ORDER:
         cols.extend([
-            link_col(platform), status_col(platform),
+            link_col(platform), status_col(platform), source_col(platform),
             conf_col(platform), reason_col(platform),
         ])
     cols.append(OVERALL_CONF_COL)

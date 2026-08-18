@@ -10,7 +10,7 @@ import search_options as so
 import verification_pipeline as vp
 import verification_service as vs
 
-CUSTOM = so.SearchOptions(mode="custom", query_template="{name} site:{domain}")
+CUSTOM = so.SearchOptions(mode="custom", prompt="social media handles")
 
 
 # ── a band is talent ────────────────────────────────────────────────────────

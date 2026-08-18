@@ -115,7 +115,7 @@ def test_wikipedia_mode_never_harvests(monkeypatch):
     assert calls == []
 
 
-CUSTOM = so.SearchOptions(mode="custom", query_template="{name} site:{domain}")
+CUSTOM = so.SearchOptions(mode="custom", prompt="social media handles")
 
 
 def test_custom_mode_adopts_the_links_and_the_anchor(monkeypatch):
