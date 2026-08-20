@@ -1,0 +1,39 @@
+# AWS Amplify Hosting build spec.
+#
+# The Next.js app lives in curator-ai/, not at the repo root, so this uses
+# Amplify's monorepo format: the `applications` list with an `appRoot`. Without
+# it Amplify looks for package.json at the root, finds none, and fails the build
+# before it starts.
+#
+# The app is NOT a static export — /results, /serper and /analysis are
+# server-rendered — so Amplify must deploy it on the Next.js SSR (WEB_COMPUTE)
+# platform. It detects that automatically from the build output; do not add
+# `output: "export"` to next.config.ts or those routes will break.
+
+version: 1
+applications:
+  - appRoot: curator-ai
+    frontend:
+      phases:
+        preBuild:
+          commands:
+            # npm ci, not npm install: it installs exactly what package-lock.json
+            # pins, so the deployed build matches the one tested locally.
+            - nvm use 20 || true
+            - node -v
+            - npm ci
+        build:
+          commands:
+            # NEXT_PUBLIC_* values are compiled INTO the bundle at build time,
+            # not read at runtime. Changing NEXT_PUBLIC_PYTHON_API_URL in the
+            # Amplify console therefore requires a redeploy to take effect.
+            - echo "API base -> $NEXT_PUBLIC_PYTHON_API_URL"
+            - npm run build
+      artifacts:
+        baseDirectory: .next
+        files:
+          - "**/*"
+      cache:
+        paths:
+          - node_modules/**/*
+          - .next/cache/**/*
