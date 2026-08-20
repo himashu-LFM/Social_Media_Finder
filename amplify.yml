@@ -5,15 +5,10 @@
 # it Amplify looks for package.json at the root, finds none, and fails the build
 # before it starts.
 #
-# The app IS a static export (`output: "export"` in next.config.ts), so the
-# Amplify app platform must be WEB (static), NOT WEB_COMPUTE.
-#
-# Amplify Hosting's compute service supports Next.js 12-15 and this app is on
-# 16, so the SSR path fails with "Failed to find the deploy-manifest.json file".
-# Nothing here needs a server anyway: every page fetches from the Python API in
-# the browser, using a bearer token that only exists there.
-#
-#   aws amplify update-app --app-id <id> --platform WEB
+# The app is NOT a static export — /results, /serper and /analysis are
+# server-rendered — so Amplify must deploy it on the Next.js SSR (WEB_COMPUTE)
+# platform. It detects that automatically from the build output; do not add
+# `output: "export"` to next.config.ts or those routes will break.
 
 version: 1
 applications:
@@ -35,8 +30,7 @@ applications:
             - echo "API base -> $NEXT_PUBLIC_PYTHON_API_URL"
             - npm run build
       artifacts:
-        # `out`, not `.next` — that is where `output: "export"` writes.
-        baseDirectory: out
+        baseDirectory: .next
         files:
           - "**/*"
       cache:

@@ -401,6 +401,10 @@ class VerificationResult:
     evidence: List[Any] = field(default_factory=list)
     rejected: List[Any] = field(default_factory=list)
     decision: str = ""
+    #: Human-readable origin of the chosen link, exported as the "<Platform>
+    #: Source" column (e.g. "SerpApi (Google AI Mode)", "Phase 0 (YouTube bio)",
+    #: "Input file", "Serper + LLM", "Apify + LLM", "Analyst (saved decision)").
+    source: str = ""
     #: Metadata of the candidate that was chosen. Carried so downstream steps can
     #: reason about HOW it was evidenced (e.g. it linked back to a client profile)
     #: without re-fetching. Never exported to the workbook.

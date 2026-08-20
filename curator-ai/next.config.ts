@@ -18,10 +18,12 @@ import type { NextConfig } from "next";
  * token held in localStorage, which a server cannot read.
  */
 const nextConfig: NextConfig = {
-  output: "export",
-
-  // Next's default image loader needs a server to resize on request. Static
-  // export has none, so images are emitted as-is.
+  // Pin the workspace root to this directory. Without this, Next infers the
+  // parent (which holds the Python `venv/` with a broken `python3` symlink) as
+  // the root and Turbopack panics while scanning it.
+  turbopack: {
+    root: __dirname,
+  },
   images: {
     unoptimized: true,
     remotePatterns: [

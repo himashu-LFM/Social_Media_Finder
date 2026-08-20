@@ -1,39 +1,36 @@
 """
 search_options.py  —  how a run should search
 
-Two modes, one code path.
+Two modes.
 
 **Wikipedia mode** (the default, and what every existing caller gets by passing
-nothing) is the flow that has been tuned and measured: Wikipedia/Wikidata ground
-truth, a ``"<name> site:<domain>"`` Serper query, and the strict thin-ground-truth
-gate that refuses to Verify a name-only match.
+nothing) is the tuned, measured flow: Wikipedia/Wikidata ground truth, a
+``"<name> site:<domain>"`` Serper query, LLM verification, and the strict
+thin-ground-truth gate that refuses to Verify a name-only match.
 
-**Custom mode** is for the populations that have no Wikipedia page — the majority
-of a typical client file. The analyst writes the Serper query themselves, because
-they know what disambiguates their list (a label, a sport, a show, a city) far
-better than a generic template does.
+**Custom mode** is for the populations that have no Wikipedia page. It does NOT
+run Serper/LLM/Apify. Instead:
 
-The important property is that these are *not* two pipelines. Custom mode changes
-exactly two things — the query string and the thin-ground-truth gate — and shares
-every guard, every enrichment step and every adjudication prompt with Wikipedia
-mode. There is no second code path to drift out of sync, and a run that passes no
-options is byte-for-byte the run that shipped before this file existed.
+    Phase 0  — first-party bio links from the client's own Instagram/YouTube
+               handle (adopted Verified — the account holder published them).
+    SerpApi  — for every platform Phase 0 did not fill, one SerpApi Google-AI-Mode
+               query "<name> [<profession>] <prompt>" returns the links Google
+               cites, tagged Manual Review Needed (no LLM).
+
+The analyst supplies a free-text ``prompt`` (e.g. "social media handles") and
+chooses whether the profession pulled from the file is included in the query.
+``name`` and ``profession`` come from the spreadsheet; only the prompt is typed.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-
-import serper_service
-from serper_service import TEMPLATE_FIELDS
 
 MODE_WIKIPEDIA = "wikipedia"
 MODE_CUSTOM = "custom"
 
-# What the thin-ground-truth gate does when the subject has no identity facts:
-#   "strict"   — never Verify (Wikipedia mode; unchanged behaviour)
-#   "evidence" — Verify only on strong evidence + high confidence (custom mode)
+# What the thin-ground-truth gate does when the subject has no identity facts.
+# Retained for the Wikipedia flow; custom mode does not verify with the LLM.
 GATE_STRICT = "strict"
 GATE_EVIDENCE = "evidence"
 
@@ -43,7 +40,11 @@ class SearchOptions:
     """Per-run search configuration. The default instance is Wikipedia mode."""
 
     mode: str = MODE_WIKIPEDIA
-    query_template: str = ""
+    # Custom-mode SerpApi query suffix — the analyst's free-text prompt, appended
+    # after "<name> <profession>". Empty is valid (just name + profession).
+    prompt: str = ""
+    # Whether the file's profession/category is included in the custom query.
+    include_profession: bool = True
 
     @property
     def is_custom(self) -> bool:
@@ -51,34 +52,37 @@ class SearchOptions:
 
     @property
     def template(self) -> str:
-        """The template Serper should render. Empty in Wikipedia mode."""
-        return self.query_template.strip() if self.is_custom else ""
+        """
+        Serper query template. Always empty here — Wikipedia mode uses Serper's
+        own default ("<name> site:<domain>"), and custom mode does not use Serper
+        at all. Kept so the Wikipedia discovery path can read it unconditionally.
+        """
+        return ""
 
     @property
     def thin_gate(self) -> str:
-        """
-        Custom mode exists precisely for subjects Wikipedia does not cover, so
-        the strict gate would reject every result it is asked to produce. It is
-        replaced by an evidence-based gate, not removed — see
-        ``verification_service`` for what that requires.
-        """
         return GATE_EVIDENCE if self.is_custom else GATE_STRICT
 
 
 DEFAULT = SearchOptions()
 
 
-def from_request(mode: str = "", query_template: str = "") -> SearchOptions:
+def from_request(mode: str = "", prompt: str = "",
+                 include_profession: bool = True) -> SearchOptions:
     """
     Build options from untrusted input (an API body, a form field).
 
     Anything unrecognised falls back to Wikipedia mode: a typo in the mode name
-    must not silently hand the analyst a differently-gated run.
+    must not silently hand the analyst a differently-behaving run.
     """
     mode = (mode or "").strip().lower()
     if mode != MODE_CUSTOM:
         return DEFAULT
-    return SearchOptions(mode=MODE_CUSTOM, query_template=(query_template or "").strip())
+    return SearchOptions(
+        mode=MODE_CUSTOM,
+        prompt=(prompt or "").strip(),
+        include_profession=bool(include_profession),
+    )
 
 
 def validate_mode(mode: str) -> str:
@@ -87,8 +91,7 @@ def validate_mode(mode: str) -> str:
 
     Empty means "caller said nothing", which is Wikipedia mode and always fine.
     A non-empty value we do not recognise is a typo, and it is reported rather
-    than absorbed: silently running Wikipedia mode for someone who asked for
-    custom is exactly the surprise ``from_request``'s fallback is meant to avoid.
+    than absorbed.
     """
     mode = (mode or "").strip().lower()
     if not mode or mode in (MODE_WIKIPEDIA, MODE_CUSTOM):
@@ -96,36 +99,13 @@ def validate_mode(mode: str) -> str:
     return f"Unknown search mode {mode!r}. Use {MODE_WIKIPEDIA!r} or {MODE_CUSTOM!r}."
 
 
-def validate_template(template: str) -> str:
+def validate_prompt(prompt: str) -> str:
     """
-    Return a human-readable problem with the template, or "" if it is usable.
+    Return a human-readable problem with the custom prompt, or "" if usable.
 
-    Catches the mistakes that would waste a whole run's Serper budget. An
-    unrecognised placeholder counts: ``build_query`` leaves it as literal text,
-    so a typo like ``{platfrom}`` puts that brace-wrapped string into every
-    single query and quietly degrades the entire run's results.
+    The prompt is optional (an empty prompt just searches "<name> <profession>"),
+    so the only real limit is length — Google truncates very long queries.
     """
-    template = (template or "").strip()
-    if not template:
-        return "Enter a search query, or switch back to Wikipedia mode."
-    if "{name}" not in template:
-        return "The query must include {name}, or every row would search for the same thing."
-    if len(template) > 300:
-        return "That query is too long for a Google search."
-    unknown = [f"{{{f}}}" for f in re.findall(r"\{([^{}]*)\}", template)
-               if f not in TEMPLATE_FIELDS]
-    if unknown:
-        return (f"Unknown placeholder{'s' if len(unknown) > 1 else ''} "
-                f"{', '.join(sorted(set(unknown)))}. Available: "
-                f"{', '.join('{' + f + '}' for f in TEMPLATE_FIELDS)}.")
+    if (prompt or "").strip() and len(prompt.strip()) > 300:
+        return "That prompt is too long for a Google search."
     return ""
-
-
-def preview(template: str, example_name: str = "Virat Kohli",
-            platform: str = "Instagram", category: str = "Talent",
-            subcategory: str = "Athlete") -> str:
-    """Render the template exactly as Serper will see it, for the UI preview."""
-    return serper_service.build_query(
-        template or serper_service.DEFAULT_QUERY_TEMPLATE,
-        example_name, platform, "instagram.com", category, subcategory,
-    )

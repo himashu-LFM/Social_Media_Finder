@@ -48,6 +48,7 @@ import apify_service
 import excel_service
 import profile_metadata
 import serper_service
+import serpapi_service
 import bio_link_service
 import search_options
 import social_urls
@@ -247,9 +248,33 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
         platform, wiki_meta.to_prompt_dict(), candidates,
         is_person=wiki_meta.is_person, thin_gate=options.thin_gate,
     )
-    return _guard_ambiguous_identity(
+    result = _guard_ambiguous_identity(
         result, candidates, wiki_meta.name or wiki_meta.talent, platform
     )
+    # Label where the chosen link came from, for the "<Platform> Source" column.
+    _label_verify_source(result, candidates)
+    return result
+
+
+# Candidate ``source`` tag (set at discovery) -> human-readable Source label.
+_VERIFY_SOURCE_LABELS = {
+    "input": "Input file + LLM",
+    "serper": "Serper + LLM",
+    "apify": "Apify + LLM",
+    "handle_fanout": "Input handle reused + LLM",
+}
+
+
+def _label_verify_source(result: VerificationResult, candidates: List[dict]) -> None:
+    """Set ``result.source`` from the discovery origin of the chosen candidate."""
+    if not result.best_candidate:
+        return
+    for cand in candidates:
+        if cand.get("url") == result.best_candidate:
+            tag = cand.get("source", "")
+            result.source = _VERIFY_SOURCE_LABELS.get(tag, "Serper + LLM")
+            return
+    result.source = "Serper + LLM"
 
 
 def _score(result: VerificationResult) -> tuple:
@@ -464,6 +489,7 @@ def _adopt_backlink_discoveries(
             out[other] = VerificationResult(
                 platform=other, best_candidate=url, status=STATUS_VERIFIED,
                 confidence=95,
+                source=f"Bio backlink (via {platform})",
                 reason=(f"Published by {result.best_candidate}, which was confirmed "
                         f"for this subject and links back to the client-supplied "
                         f"profile — so its other listed links are first-party."),
@@ -479,6 +505,7 @@ def _analyst_result(platform: str, url: str) -> VerificationResult:
     """A decision a human already made. Outranks anything the pipeline can infer."""
     return VerificationResult(
         platform=platform, best_candidate=url, status=STATUS_VERIFIED, confidence=100,
+        source="Analyst (saved decision)",
         reason="Confirmed by an analyst in a previous run (verified_url).",
         decision="verified",
     )
@@ -634,6 +661,7 @@ def _bio_link_result(platform: str, url: str, anchor_platform: str,
     """
     return VerificationResult(
         platform=platform, best_candidate=url, status=STATUS_VERIFIED, confidence=100,
+        source=f"Phase 0 ({anchor_platform} bio)",
         reason=(f"Published as a first-party link in the {anchor_platform} bio of "
                 f"{anchor_url} (handle supplied in the input file)."),
         evidence=[f"{anchor_platform} profile {anchor_url} links to {url}"],
@@ -691,6 +719,7 @@ def _row_bio_link_phase(
             adopted[platform] = VerificationResult(
                 platform=platform, best_candidate=url,
                 status=STATUS_VERIFIED, confidence=100,
+                source="Input file (Phase 0 anchor)",
                 reason="Supplied in the input file by the client.",
                 decision="verified",
             )
@@ -708,6 +737,93 @@ def _row_bio_link_phase(
         print(f"  [BIO-LINKS] '{talent}': {len(adopted)} platform(s) resolved with no "
               f"search or LLM spend -> {', '.join(sorted(adopted))}")
     return adopted
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Custom-mode discovery: SerpApi Google AI Mode (no Serper / LLM / Apify)
+# ────────────────────────────────────────────────────────────────────────────
+
+# Excel columns (case-insensitive) that carry a talent's profession/category,
+# used to build the SerpApi query "<name> <profession> <prompt>". An explicit
+# ``profession``/``occupation`` column wins when present (cleanest signal);
+# otherwise fall back to the taxonomy columns.
+_PROFESSION_KEYS = (
+    "profession", "occupation",
+    "title_sub_category", "title_subcategory", "sub_category", "subcategory",
+    "title_category", "category",
+    "primary_genre", "genre", "role",
+)
+
+
+def _clean_profession(value: str) -> str:
+    """
+    Strip a 'Label - Value' prefix so the query stays clean.
+    e.g. 'Talent Type - Musician' -> 'Musician', 'Actor' -> 'Actor'.
+    """
+    parts = re.split(r"\s+[-–—]\s+|:\s+", value.strip())
+    return parts[-1].strip() if parts else value.strip()
+
+
+def _detect_profession(input_metadata: Optional[Dict[str, str]]) -> str:
+    """Best-effort profession/category term from the row's Excel columns."""
+    if not input_metadata:
+        return ""
+    lowered = {str(k).lower(): v for k, v in input_metadata.items()}
+    for key in _PROFESSION_KEYS:
+        val = lowered.get(key)
+        if isinstance(val, str) and val.strip():
+            return _clean_profession(val)
+    return ""
+
+
+def _row_serpapi_phase(
+    talent: str,
+    input_metadata: Optional[Dict[str, str]],
+    options: search_options.SearchOptions,
+    resolved: Optional[Dict[str, VerificationResult]] = None,
+    platform_progress: Optional[Callable[[str, str], None]] = None,
+) -> Dict[str, VerificationResult]:
+    """
+    Custom-mode discovery for the platforms Phase 0 (bio links) did NOT fill.
+
+    ONE SerpApi Google-AI-Mode query — "<name> [<profession>] <prompt>" — then the
+    links Google AI Mode cites are tagged Manual Review Needed. There is NO LLM,
+    NO Serper and NO Apify for these rows: the links are handed through as-is for
+    a human to review.
+
+    ``resolved`` carries the platforms Phase 0 already confirmed (Verified). Those
+    are kept untouched; only the remaining platforms are filled from SerpApi.
+    """
+    resolved = dict(resolved or {})
+    profession = _detect_profession(input_metadata) if options.include_profession else ""
+    try:
+        handles = serpapi_service.discover_handles(talent, profession, suffix=options.prompt)
+    except Exception as exc:  # noqa: BLE001 — never abort the row on SerpApi failure
+        print(f"  [PIPELINE] SerpApi discovery failed for '{talent}': {exc}")
+        handles = {}
+
+    results: Dict[str, VerificationResult] = dict(resolved)
+    for platform in PLATFORMS:
+        if platform_progress:
+            platform_progress(platform, "start")
+        if platform not in results:  # Phase 0 already confirmed ones stay as-is
+            cands = handles.get(platform, [])
+            if cands:
+                results[platform] = VerificationResult(
+                    platform=platform, best_candidate=cands[0]["url"],
+                    status=STATUS_MANUAL, confidence=0, decision="manual_review",
+                    source="SerpApi (Google AI Mode)",
+                    reason=("Link cited by SerpApi Google AI Mode search — not "
+                            "LLM-verified; manual review needed."),
+                )
+            else:
+                results[platform] = VerificationResult(
+                    platform=platform, status=STATUS_NOT_FOUND,
+                    reason="No link returned by Google AI Mode search.",
+                )
+        if platform_progress:
+            platform_progress(platform, "done")
+    return results
 
 
 def _row_serper_phase(
@@ -925,6 +1041,7 @@ def _assemble_row_out(results: Dict[str, VerificationResult]) -> Dict[str, Any]:
         has_link = bool(result.best_candidate)
         out[excel_service.link_col(platform)] = result.best_candidate
         out[excel_service.status_col(platform)] = result.status
+        out[excel_service.source_col(platform)] = result.source if has_link else ""
         out[excel_service.conf_col(platform)] = result.confidence if has_link else ""
         out[excel_service.reason_col(platform)] = result.reason
         if has_link and result.status in _USABLE_STATUSES:
@@ -979,14 +1096,23 @@ def _resolve_row_result(
     a per-talent Apify lookup is done ONLY when Serper leaves a platform
     non-Verified (used by the single-row / CLI path).
     """
-    wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
-
-    # Phase 1 — Serper-primary discovery + verification.
     decisions = load_decisions([talent]).get(talent.lower(), {})
 
-    # Phase 0 — first-party bio links (custom mode only; a no-op otherwise).
+    # Custom (non-Wikipedia) mode: Phase 0 first-party bio links (Verified), then
+    # SerpApi Google AI Mode for the platforms left over (Manual Review). No
+    # Wikipedia lookup, no Serper, no LLM, no Apify.
+    if options.is_custom:
+        resolved = _row_bio_link_phase(talent, input_handles, decisions, options)
+        final = _row_serpapi_phase(talent, input_metadata, options, resolved,
+                                   platform_progress)
+        return _assemble_row_out(final)
+
+    wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
+
+    # Phase 0 — first-party bio links (a no-op in Wikipedia mode).
     resolved = _row_bio_link_phase(talent, input_handles, decisions, options)
 
+    # Phase 1 — Serper-primary discovery + verification.
     phase1 = _row_serper_phase(talent, wiki_meta, platform_progress,
                                input_handles=input_handles,
                                decisions=decisions,
@@ -1140,25 +1266,40 @@ def run_pipeline_on_dataframe(
             if platform_progress:
                 platform_progress(idx, platform, phase)
 
-        wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
+        # Custom (non-Wikipedia) mode skips the Wikipedia lookup entirely — the
+        # SerpApi phase never uses the ground-truth record.
+        if options.is_custom:
+            wiki_meta = wikipedia_service.WikiMetadata(talent=talent, name=talent)
+        else:
+            wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
         try:
             row_decisions = decisions_by_talent.get(talent.lower(), {})
-            resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
-                                           options, should_cancel)
-            phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
-                                       input_handles=input_handles,
-                                       decisions=row_decisions,
-                                       options=options, input_metadata=input_metadata,
-                                       resolved=resolved)
+            if options.is_custom:
+                # Phase 0 bio links (Verified) + SerpApi Google AI Mode for the
+                # rest (Manual Review). No Serper / LLM / Apify.
+                resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
+                                               options, should_cancel)
+                phase1 = _row_serpapi_phase(talent, input_metadata, options,
+                                            resolved, _pp)
+            else:
+                resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
+                                               options, should_cancel)
+                phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
+                                           input_handles=input_handles,
+                                           decisions=row_decisions,
+                                           options=options, input_metadata=input_metadata,
+                                           resolved=resolved)
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
-            print(f"  [PIPELINE] Serper phase failed for '{talent}': {exc}")
+            print(f"  [PIPELINE] {'SerpApi' if options.is_custom else 'Serper'} "
+                  f"phase failed for '{talent}': {exc}")
             phase1 = {
                 p: VerificationResult(platform=p, status=STATUS_MANUAL, confidence=0,
                                       reason="Verification error; manual review required.")
                 for p in PLATFORMS
             }
         return {"idx": idx, "row_label": row_label, "talent": talent,
-                "wiki_meta": wiki_meta, "phase1": phase1, "cancelled": False}
+                "wiki_meta": wiki_meta, "phase1": phase1, "cancelled": False,
+                "custom": options.is_custom}
 
     workers = max(1, min(PIPELINE_ROW_WORKERS, total or 1))
     phase_a: List[dict] = []
@@ -1170,7 +1311,7 @@ def run_pipeline_on_dataframe(
     stopped = _is_cancelled(should_cancel)
     failing_talents = sorted({
         r["talent"] for r in phase_a
-        if not r.get("cancelled")
+        if not r.get("cancelled") and not r.get("custom")  # custom rows: SerpApi only
         and any(v.status not in _GOOD_STATUSES for v in r["phase1"].values())
     })
     if stopped:
@@ -1191,6 +1332,10 @@ def run_pipeline_on_dataframe(
         # Once stopped, assemble what Phase A produced instead of spending more
         # Apify/LLM calls — partial results are still saved and viewable.
         if r.get("cancelled") or _is_cancelled(should_cancel):
+            return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
+        # Custom rows are already final from Phase 0 + SerpApi — no Apify backup,
+        # no cross-platform corroboration (those belong to the Wikipedia flow).
+        if r.get("custom"):
             return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
         try:
             final = _row_apify_phase(

@@ -4,34 +4,41 @@
  * The choice lives in localStorage rather than component state because the
  * analyst picks it on the discovery page and the upload happens in a sibling
  * component; keeping it in one place also means a returning analyst gets the
- * query they wrote last time instead of retyping it.
+ * prompt they wrote last time instead of retyping it.
+ *
+ * Wikipedia mode = the tuned Wikipedia/Wikidata + Serper + LLM pipeline.
+ * Custom mode    = first-party bio links (Phase 0) + SerpApi Google AI Mode for
+ *                  whatever is left, with the query "<Name> [<Profession>] <prompt>".
+ *                  Name and Profession are pulled from the file; the analyst only
+ *                  types the prompt.
  */
 
 export type SearchMode = "wikipedia" | "custom";
 
 const MODE_KEY = "curator-ai-search-mode-v1";
-const TEMPLATE_KEY = "curator-ai-search-template-v1";
+const PROMPT_KEY = "curator-ai-search-prompt-v1";
+const INCLUDE_PROF_KEY = "curator-ai-search-include-profession-v1";
 
-/** What Wikipedia mode sends to Google today. Shown as the starting point. */
-export const DEFAULT_QUERY_TEMPLATE = "{name} site:{domain}";
+/** The default custom-mode prompt, matching the backend default suffix. */
+export const DEFAULT_PROMPT = "social media handles";
 
-export const PLACEHOLDERS = [
-  { token: "{name}", label: "Talent name", example: "Kako Fujita" },
-  { token: "{domain}", label: "Platform domain", example: "instagram.com" },
-  { token: "{platform}", label: "Platform name", example: "Instagram" },
-  { token: "{category}", label: "Title category from the file", example: "Talent" },
-  { token: "{subcategory}", label: "Title subcategory from the file", example: "Musician" },
-] as const;
-
-export type SearchConfig = { mode: SearchMode; queryTemplate: string };
+export type SearchConfig = {
+  mode: SearchMode;
+  prompt: string;
+  includeProfession: boolean;
+};
 
 export function readSearchConfig(): SearchConfig {
-  if (typeof window === "undefined") return { mode: "wikipedia", queryTemplate: "" };
+  if (typeof window === "undefined")
+    return { mode: "wikipedia", prompt: DEFAULT_PROMPT, includeProfession: true };
   try {
     const mode = localStorage.getItem(MODE_KEY) === "custom" ? "custom" : "wikipedia";
-    return { mode, queryTemplate: localStorage.getItem(TEMPLATE_KEY) ?? DEFAULT_QUERY_TEMPLATE };
+    const prompt = localStorage.getItem(PROMPT_KEY) ?? DEFAULT_PROMPT;
+    // Absent means "not set yet" → default ON. Only an explicit "false" turns it off.
+    const includeProfession = localStorage.getItem(INCLUDE_PROF_KEY) !== "false";
+    return { mode, prompt, includeProfession };
   } catch {
-    return { mode: "wikipedia", queryTemplate: "" };
+    return { mode: "wikipedia", prompt: DEFAULT_PROMPT, includeProfession: true };
   }
 }
 
@@ -39,7 +46,8 @@ export function writeSearchConfig(config: SearchConfig): void {
   if (typeof window === "undefined") return;
   try {
     localStorage.setItem(MODE_KEY, config.mode);
-    localStorage.setItem(TEMPLATE_KEY, config.queryTemplate);
+    localStorage.setItem(PROMPT_KEY, config.prompt);
+    localStorage.setItem(INCLUDE_PROF_KEY, config.includeProfession ? "true" : "false");
   } catch {
     /* private mode */
   }
@@ -51,7 +59,11 @@ export function writeSearchConfig(config: SearchConfig): void {
 // effect (which cascades a render) and without an SSR hydration mismatch: the
 // server snapshot is the default, and React swaps in the stored value itself.
 
-const SERVER_SNAPSHOT: SearchConfig = { mode: "wikipedia", queryTemplate: DEFAULT_QUERY_TEMPLATE };
+const SERVER_SNAPSHOT: SearchConfig = {
+  mode: "wikipedia",
+  prompt: DEFAULT_PROMPT,
+  includeProfession: true,
+};
 let cached: SearchConfig | null = null;
 const listeners = new Set<() => void>();
 
@@ -74,46 +86,25 @@ export function getSearchConfigServerSnapshot(): SearchConfig {
 export function applySearchConfig(fd: FormData, config = readSearchConfig()): void {
   if (config.mode !== "custom") return;
   fd.append("search_mode", "custom");
-  fd.append("query_template", config.queryTemplate.trim());
+  fd.append("prompt", config.prompt.trim());
+  fd.append("include_profession", config.includeProfession ? "true" : "false");
 }
 
 /**
- * Same checks the API runs, so the analyst sees the problem while typing rather
- * than as a rejected upload. Returns "" when the template is usable.
+ * Render the query exactly as the backend builds it, for the UI preview:
+ * "<Name> [<Profession>] <prompt>". Name and Profession are placeholders here
+ * (they come from each row's Excel data at run time).
  */
-export function validateTemplate(template: string): string {
-  const t = template.trim();
-  if (!t) return "Enter a search query, or switch back to Wikipedia mode.";
-  if (!t.includes("{name}"))
-    return "The query must include {name}, or every row would search for the same thing.";
-  if (t.length > 300) return "That query is too long for a Google search.";
-  // An unrecognised token is left as literal text by the renderer, so a typo
-  // like {platfrom} would end up in every query in the file.
-  const known = new Set<string>(PLACEHOLDERS.map((p) => p.token));
-  const unknown = [...new Set(t.match(/\{[^{}]*\}/g) ?? [])].filter((tok) => !known.has(tok));
-  if (unknown.length)
-    return (
-      `Unknown placeholder${unknown.length > 1 ? "s" : ""} ${unknown.sort().join(", ")}. ` +
-      `Available: ${PLACEHOLDERS.map((p) => p.token).join(", ")}.`
-    );
-  return "";
-}
-
-/** Render the template the way serper_service.build_query does, for the preview. */
 export function previewQuery(
-  template: string,
-  values: Partial<Record<string, string>> = {},
+  prompt: string,
+  includeProfession: boolean,
+  exampleName = "Kako Fujita",
+  exampleProfession = "Musician",
 ): string {
-  const filled: Record<string, string> = {
-    name: values.name ?? "Kako Fujita",
-    domain: values.domain ?? "instagram.com",
-    platform: values.platform ?? "Instagram",
-    category: values.category ?? "Talent",
-    subcategory: values.subcategory ?? "Musician",
-  };
-  let out = template || DEFAULT_QUERY_TEMPLATE;
-  for (const [key, value] of Object.entries(filled)) {
-    out = out.split(`{${key}}`).join(value);
-  }
-  return out.replace(/\s+/g, " ").trim();
+  const parts = [
+    exampleName,
+    includeProfession ? exampleProfession : "",
+    prompt.trim(),
+  ].filter((p) => p);
+  return parts.join(" ").replace(/\s+/g, " ").trim();
 }
