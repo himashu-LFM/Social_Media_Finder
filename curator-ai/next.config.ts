@@ -18,6 +18,11 @@ import type { NextConfig } from "next";
  * token held in localStorage, which a server cannot read.
  */
 const nextConfig: NextConfig = {
+  // Without this the build emits a .next server bundle, Amplify has nothing
+  // static to serve, and every route 404s. It was dropped once already — the
+  // docstring above describes the static export, so keep the two in step.
+  output: "export",
+
   // Pin the workspace root to this directory. Without this, Next infers the
   // parent (which holds the Python `venv/` with a broken `python3` symlink) as
   // the root and Turbopack panics while scanning it.
