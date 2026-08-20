@@ -1,0 +1,43 @@
+# systemd unit for the Curator AI API.
+#
+#   sudo cp deploy/curator-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now curator-api
+#
+# Binds to 127.0.0.1 only. Caddy terminates TLS on 443 and proxies to it, so the
+# app itself is never exposed directly — nothing on port 8080 is reachable from
+# the internet even if the security group is later loosened by mistake.
+
+[Unit]
+Description=Curator AI verification API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=ec2-user
+WorkingDirectory=/home/ec2-user/Social_Media_Finder
+
+# Secrets live here, not in the unit file: systemd units are world-readable and
+# this file is chmod 600. Never commit it.
+EnvironmentFile=/home/ec2-user/curator.env
+
+ExecStart=/home/ec2-user/Social_Media_Finder/venv/bin/uvicorn api_server:app \
+    --host 127.0.0.1 --port 8080 --workers 1
+
+# ONE worker, deliberately. Job progress lives in a per-process dict and each
+# run continues in background threads owned by that process. A second worker
+# would answer status polls for jobs it knows nothing about, and the UI would
+# show a run flickering between "running" and "not found".
+Restart=always
+RestartSec=5
+
+# print() reaches journalctl immediately instead of sitting in a buffer.
+Environment=PYTHONUNBUFFERED=1
+
+# Basic hardening — the app only ever needs to read its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

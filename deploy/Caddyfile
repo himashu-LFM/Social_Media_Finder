@@ -1,0 +1,41 @@
+# Caddy reverse proxy — terminates TLS in front of the API.
+#
+#   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#   sudo nano /etc/caddy/Caddyfile      # replace the domain below
+#   sudo systemctl restart caddy
+#
+# HTTPS is NOT optional here. The UI is served from Amplify over HTTPS, and a
+# browser refuses to let an HTTPS page call an http:// API — the requests are
+# blocked as mixed content before they leave the browser. The app would look
+# completely broken with nothing in the server logs to explain it.
+#
+# Caddy obtains and renews a Let's Encrypt certificate automatically, which is
+# why a real domain name is required: certificates are not issued for bare IPs.
+
+api.example.com {
+    # Everything is proxied to the local uvicorn. The API is bound to loopback,
+    # so this is the only way in.
+    reverse_proxy 127.0.0.1:8080
+
+    # A verification run streams for a long time; the default 30s would cut off
+    # the slower endpoints. Uploads of a 5,000-row workbook also need headroom.
+    request_body {
+        max_size 30MB
+    }
+
+    encode gzip
+
+    header {
+        # The API is called by a browser on another origin, so these are the
+        # headers that protect the response itself rather than the transport.
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
+    log {
+        output file /var/log/caddy/curator-api.log
+        format json
+    }
+}

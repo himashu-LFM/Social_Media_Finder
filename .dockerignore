@@ -1,0 +1,33 @@
+# Keep the image small and, more importantly, keep secrets and local state out
+# of it. Anyone who can pull an image can read every layer, so .env must never
+# reach the build context even though it is also gitignored.
+.env
+.env.*
+*.pem
+*.key
+
+.git
+.gitignore
+.gitattributes
+
+# The frontend is deployed separately on Amplify; it has no business here and
+# node_modules alone would add hundreds of megabytes.
+curator-ai/
+
+# Local runtime state. The container creates its own.
+uploads/
+exports/
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# Local scratch and docs — nothing the running service reads.
+*.xlsx
+*.pdf
+tests/
+docs/
+deploy/
+README.md
