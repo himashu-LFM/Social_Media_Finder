@@ -21,7 +21,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import (Depends, FastAPI, File, Form, Header, HTTPException, Request,
+                     UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -31,6 +32,7 @@ load_dotenv(ROOT / ".env")
 
 import auth_service  # noqa: E402  — after dotenv so DATABASE_URL loads
 import db_service  # noqa: E402  — after dotenv so DATABASE_URL loads
+import search_options  # noqa: E402
 import verification_pipeline as testing  # noqa: E402  — after dotenv so keys load
 
 _jobs_lock = threading.Lock()
@@ -103,11 +105,26 @@ async def _lifespan(app: FastAPI):
     paths = sorted(
         {getattr(r, "path", "") for r in app.routes if getattr(r, "path", "").startswith("/api")}
     )
+    # Refuse to serve a production deployment that cannot authenticate anyone.
+    # Discovering this from a log line after the fact is how an internal tool
+    # ends up briefly public; a container that will not start is noticed at once.
+    problems = auth_service.startup_report()
+    if problems:
+        for problem in problems:
+            print(f"[api_server] FATAL CONFIG: {problem}")
+        raise RuntimeError(
+            "Refusing to start: the production configuration above would leave this "
+            "API unauthenticated or unreachable. Fix the environment and redeploy."
+        )
+
     purged = auth_service.purge_expired_sessions()
     if purged:
         print(f"[api_server] Purged {purged} expired session(s).")
     if auth_service.enforced():
         print(f"[api_server] Authentication ENFORCED ({auth_service.user_count()} account(s)).")
+    elif auth_service.IS_PRODUCTION:
+        print("[api_server] Authentication unavailable — requests will be REFUSED (503), "
+              "never served anonymously.")
     else:
         print("[api_server] Authentication is OFF — set DATABASE_URL and create a user to enable it.")
     reaped = db_service.reap_orphaned_jobs()
@@ -128,19 +145,50 @@ app = FastAPI(title="Curator AI", version="1.0.0", lifespan=_lifespan)
 _cors_origins_env = os.getenv("CORS_ORIGINS", "").strip()
 _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
 
+# Localhost is trusted ONLY outside production. Leaving the regex on in a
+# deployed environment means any page a user happens to be running locally can
+# call the production API with their session — an origin we never intended to
+# allow and cannot audit.
+_LOCALHOST_RE = r"https?://(127\.0\.0\.1|localhost)(:\d+)?"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    # Keep localhost enabled even when production CORS_ORIGINS is set.
-    allow_origin_regex=r"https?://(127\.0\.0\.1|localhost)(:\d+)?",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origin_regex=None if auth_service.IS_PRODUCTION else _LOCALHOST_RE,
+    # Bearer tokens travel in the Authorization header, not cookies, so the API
+    # never needs credentialed cross-origin requests. Off by default keeps a
+    # misconfigured origin from becoming a session-riding hole.
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
 class StartJobBody(BaseModel):
     names: List[str] = Field(..., min_length=1)
+    # "wikipedia" (default) or "custom". See search_options for what changes.
+    search_mode: str = ""
+    # Custom mode: the free-text SerpApi query prompt + whether to include the
+    # file's profession in the query "<name> [<profession>] <prompt>".
+    prompt: str = ""
+    include_profession: bool = True
+
+
+def _search_options(mode: str, prompt: str,
+                    include_profession: bool = True) -> search_options.SearchOptions:
+    """
+    Build run options from request input. A bad mode/prompt is rejected here,
+    before a single row is searched.
+    """
+    bad_mode = search_options.validate_mode(mode)
+    if bad_mode:
+        raise HTTPException(status_code=400, detail=bad_mode)
+    opts = search_options.from_request(mode, prompt, include_profession)
+    if opts.is_custom:
+        problem = search_options.validate_prompt(opts.prompt)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
+    return opts
 
 
 def _reset_row_platform_state(entry: Dict[str, Any]) -> None:
@@ -209,7 +257,8 @@ def _frame_to_rows(df: Any) -> List[dict]:
         return []
 
 
-def _run_job(job_id: str, names: List[str]) -> None:
+def _run_job(job_id: str, names: List[str],
+             options: search_options.SearchOptions = search_options.DEFAULT) -> None:
     def row_status(row_index: int, status: str) -> None:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -234,6 +283,7 @@ def _run_job(job_id: str, names: List[str]) -> None:
             row_status=row_status,
             platform_progress=platform_progress,
             should_cancel=_cancel_event(job_id).is_set,
+            options=options,
         )
 
         out_path, serper_path = _persist_outputs(final_df)
@@ -247,7 +297,8 @@ def _run_job(job_id: str, names: List[str]) -> None:
         _persist(job_id)
 
 
-def _run_job_from_file(job_id: str, path: Path) -> None:
+def _run_job_from_file(job_id: str, path: Path,
+                       options: search_options.SearchOptions = search_options.DEFAULT) -> None:
     def row_status(row_index: int, status: str) -> None:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -273,6 +324,7 @@ def _run_job_from_file(job_id: str, path: Path) -> None:
             row_status=row_status,
             platform_progress=platform_progress,
             should_cancel=_cancel_event(job_id).is_set,
+            options=options,
         )
 
         out_path, serper_path = _persist_outputs(final_df)
@@ -305,7 +357,17 @@ def _bearer(authorization: Optional[str]) -> str:
 
 
 def current_user(authorization: Optional[str] = Header(default=None)) -> Optional[Dict[str, Any]]:
-    """Resolve the caller. Returns None when auth is not enforced."""
+    """
+    Resolve the caller. Returns None only when auth is genuinely not enforced.
+
+    In production, "we cannot check credentials right now" must never mean "come
+    in". If the account store is unreachable the request is refused, not served.
+    """
+    if auth_service.fail_closed():
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is temporarily unavailable. Please retry shortly.",
+        )
     if not auth_service.enforced():
         return None
     user = auth_service.user_for_token(_bearer(authorization))
@@ -323,14 +385,37 @@ class LoginBody(BaseModel):
     password: str = Field(..., min_length=1)
 
 
+class GoogleLoginBody(BaseModel):
+    credential: str = Field(..., min_length=10)   # Google ID token (JWT)
+
+
 @app.get("/api/auth/status")
 def auth_status() -> dict[str, Any]:
-    """Lets the UI decide whether to show a sign-in wall — no auth required."""
+    """Lets the UI decide what sign-in options to show — no auth required."""
     return {
         "auth_available": auth_service.is_available(),
         "auth_required": auth_service.enforced(),
         "has_accounts": auth_service.user_count() > 0,
+        "google_enabled": auth_service.google_enabled(),
+        "google_client_id": auth_service.GOOGLE_CLIENT_ID,   # public by design
     }
+
+
+@app.post("/api/auth/google")
+def auth_google(body: GoogleLoginBody, request: Request) -> dict[str, Any]:
+    """
+    Sign in with a Google ID token.
+
+    The token is verified against Google's public keys server-side; the email a
+    client claims is never trusted on its own.
+    """
+    if not auth_service.google_enabled():
+        raise HTTPException(status_code=503, detail="Google sign-in is not configured.")
+    user, reason = auth_service.google_sign_in(body.credential)
+    if not user:
+        raise HTTPException(status_code=401, detail=reason)
+    session = auth_service.start_session(user["id"], request.headers.get("user-agent", ""))
+    return {"user": user, **session}
 
 
 @app.post("/api/auth/login")
@@ -382,6 +467,7 @@ def start_job(body: StartJobBody,
     names = [n.strip() for n in body.names if n and str(n).strip()]
     if not names:
         raise HTTPException(status_code=400, detail="Provide at least one non-empty name.")
+    options = _search_options(body.search_mode, body.prompt, body.include_profession)
     if len(names) > MAX_ROWS_PER_JOB:
         raise HTTPException(
             status_code=413,
@@ -404,10 +490,13 @@ def start_job(body: StartJobBody,
             "output_path": None,
             "error": None,
             "started_by": _uid(user),
+            "search_mode": options.mode,
+            "prompt": options.prompt,
+            "include_profession": options.include_profession,
         }
     _persist(job_id)
 
-    thread = threading.Thread(target=_run_job, args=(job_id, names), daemon=True)
+    thread = threading.Thread(target=_run_job, args=(job_id, names, options), daemon=True)
     thread.start()
     return {"job_id": job_id}
 
@@ -415,15 +504,25 @@ def start_job(body: StartJobBody,
 @app.post("/api/upload")
 @app.post("/api/jobs/upload")
 async def start_job_from_upload(file: UploadFile = File(...),
+                                search_mode: str = Form(""),
+                                prompt: str = Form(""),
+                                include_profession: str = Form("true"),
                                 user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     """
     Upload an .xlsx / .xls / .csv from the UI. Rows are parsed like Demo_Social.xlsx
     (Talent Name + optional category columns). No need to copy the file into the repo folder.
 
+    Custom (non-Wikipedia) mode form fields:
+      * ``search_mode`` — "wikipedia" (default) or "custom".
+      * ``prompt`` — free-text SerpApi query suffix ("<name> [<profession>] <prompt>").
+      * ``include_profession`` — "true"/"false"; include the file's profession in the query.
+
     Use POST /api/upload or POST /api/jobs/upload (both work). The /api/jobs/upload path is
     registered as POST-only before GET /api/jobs/{job_id}, so it does not collide with the
     dynamic route.
     """
+    include_prof = str(include_profession).strip().lower() not in ("false", "0", "no", "")
+    options = _search_options(search_mode, prompt, include_prof)
     raw_name = (file.filename or "upload").strip()
     lower = raw_name.lower()
     if not (lower.endswith(".xlsx") or lower.endswith(".xls") or lower.endswith(".csv")):
@@ -475,11 +574,14 @@ async def start_job_from_upload(file: UploadFile = File(...),
             "error": None,
             "source_filename": raw_name,
             "started_by": _uid(user),
+            "search_mode": options.mode,
+            "prompt": options.prompt,
+            "include_profession": options.include_profession,
         }
     _persist(job_id)
     db_service.record_upload(job_id, raw_name, len(body), len(names), _uid(user))
 
-    thread = threading.Thread(target=_run_job_from_file, args=(job_id, dest), daemon=True)
+    thread = threading.Thread(target=_run_job_from_file, args=(job_id, dest, options), daemon=True)
     thread.start()
 
     return {
@@ -487,6 +589,7 @@ async def start_job_from_upload(file: UploadFile = File(...),
         "names": names,
         "row_count": len(names),
         "source_filename": raw_name,
+        "search_mode": options.mode,
     }
 
 
@@ -606,6 +709,29 @@ def api_results_serper_latest(job_id: Optional[str] = None,
     return _read_rows_response(paths)
 
 
+def _rebuild_export_from_db(job_id: Optional[str]) -> Optional[Path]:
+    """
+    Regenerate a run's workbook from the rows persisted in Postgres.
+
+    Local disk cannot be the system of record once this runs on more than one
+    container: uploads and exports written by instance A simply do not exist on
+    instance B, and both vanish on the next deploy. The job row already carries
+    every result cell as JSONB, so a download is always reproducible.
+    """
+    if not job_id:
+        return None
+    try:
+        rows = db_service.load_job_rows(job_id)
+        if not rows:
+            return None
+        frame = pd.DataFrame(rows)
+        return testing.excel_service.save_results(frame, output_dir=EXPORT_DIR)
+    except Exception as exc:  # noqa: BLE001 — a failed rebuild is a 404, not a 500
+        print(f"[api_server] export rebuild failed for {job_id}: "
+              f"{exc.__class__.__name__}: {exc}")
+        return None
+
+
 @app.get("/api/export/latest")
 def api_export_latest(job_id: Optional[str] = None,
                       user: Optional[Dict[str, Any]] = Depends(current_user)) -> FileResponse:
@@ -614,6 +740,16 @@ def api_export_latest(job_id: Optional[str] = None,
     if pending:
         raise HTTPException(status_code=409, detail="That run is still processing.")
     if not paths:
+        # Nothing on this container's disk. On AWS that is routine, not an error:
+        # the filesystem is ephemeral and the instance that ran the job is often
+        # not the one serving the download. Postgres holds the rows, so rebuild
+        # the workbook rather than telling the analyst their results are gone.
+        rebuilt = _rebuild_export_from_db(job_id)
+        if rebuilt:
+            return FileResponse(
+                path=str(rebuilt), filename=rebuilt.name,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         raise HTTPException(status_code=404, detail="No export available for that request.")
     last_err: Optional[str] = None
     for p in paths:
@@ -649,8 +785,14 @@ class DecisionLookupBody(BaseModel):
 
 
 @app.get("/api/db/health")
-def db_health() -> dict[str, Any]:
-    """Is the decision database reachable and are both tables present?"""
+def db_health(user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
+    """
+    Is the decision database reachable and are both tables present?
+
+    Authenticated: the response names our tables and reports connection errors,
+    which is useful to an analyst and equally useful to someone probing the
+    deployment. /api/health stays open for the load balancer.
+    """
     return {"configured": db_service.is_configured(), **db_service.ping()}
 
 

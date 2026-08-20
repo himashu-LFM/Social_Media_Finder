@@ -1,6 +1,8 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import { authedFetch } from "@/lib/auth";
+import { applySearchConfig } from "@/lib/search-mode";
 import { useRef, useState } from "react";
 import { useToast } from "@/components/ToastProvider";
 import { getPythonApiUrl, saveProcessingNames, setPythonJobId } from "@/lib/processing-job";
@@ -42,9 +44,10 @@ export function DiscoveryWorkspace() {
 
     const fd = new FormData();
     fd.append("file", file);
+    applySearchConfig(fd);   // no-op in Wikipedia mode
 
     try {
-      const res = await fetch(`${base}/api/upload`, {
+      const res = await authedFetch("/api/upload", {
         method: "POST",
         body: fd,
       });

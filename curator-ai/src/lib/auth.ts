@@ -4,7 +4,14 @@ import { getPythonApiUrl } from "@/lib/processing-job";
 const TOKEN_KEY = "curator-ai-auth-token-v1";
 
 export type AuthUser = { id: number; email: string; name: string; role: string };
-export type AuthStatus = { auth_available: boolean; auth_required: boolean; has_accounts: boolean };
+export type AuthStatus = {
+  auth_available: boolean;
+  auth_required: boolean;
+  has_accounts: boolean;
+  /** Set when the server has a GOOGLE_CLIENT_ID configured. */
+  google_enabled?: boolean;
+  google_client_id?: string;
+};
 
 export function getToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -67,6 +74,34 @@ export async function login(email: string, password: string): Promise<AuthUser> 
   });
   if (!res.ok) {
     let detail = "Sign-in failed.";
+    try {
+      detail = ((await res.json()) as { detail?: string }).detail ?? detail;
+    } catch {
+      /* non-JSON */
+    }
+    throw new Error(detail);
+  }
+  const data = (await res.json()) as { user: AuthUser; token: string };
+  setToken(data.token);
+  return data.user;
+}
+
+/**
+ * Exchange a Google ID token for an application session.
+ *
+ * The token is only ever a claim until the server verifies it against Google's
+ * public keys — this function does not, and must not, trust the email inside it.
+ */
+export async function googleSignIn(idToken: string): Promise<AuthUser> {
+  const api = getPythonApiUrl();
+  if (!api) throw new Error("NEXT_PUBLIC_PYTHON_API_URL is not set.");
+  const res = await fetch(`${api}/api/auth/google`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id_token: idToken }),
+  });
+  if (!res.ok) {
+    let detail = "Google sign-in failed.";
     try {
       detail = ((await res.json()) as { detail?: string }).detail ?? detail;
     } catch {

@@ -7,10 +7,10 @@ import serper_service
 
 def _stub(monkeypatch, counter):
     monkeypatch.setattr(serper_service, "discover_by_site",
-        lambda t, p, top_n=1: counter.__setitem__("serper", counter["serper"] + 1) or
+        lambda t, p, top_n=1, **kw: counter.__setitem__("serper", counter["serper"] + 1) or
         [{"url": f"https://www.instagram.com/found_{t.lower()}", "source": "serper",
           "meta": {"serper_title": "T"}}])
-    def verify(p, gt, c, is_person=True):
+    def verify(p, gt, c, is_person=True, **kw):
         counter["llm"] += 1
         return vs.VerificationResult(platform=p, best_candidate=c[0]["url"],
                                      status=vs.STATUS_MANUAL, confidence=60, reason="stub")

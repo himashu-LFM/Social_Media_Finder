@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { authedFetch } from "@/lib/auth";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import * as XLSX from "xlsx";
@@ -65,9 +66,9 @@ async function loadSerperWorkbookRows(jobId?: string): Promise<{
   if (api) {
     try {
       const url = jobId
-        ? `${api}/api/results/serper/latest?job_id=${encodeURIComponent(jobId)}`
-        : `${api}/api/results/serper/latest`;
-      const res = await fetch(url, { cache: "no-store" });
+        ? `/api/results/serper/latest?job_id=${encodeURIComponent(jobId)}`
+        : "/api/results/serper/latest";
+      const res = await authedFetch(url, { cache: "no-store" });
       if (res.ok) {
         const data = (await res.json()) as {
           rows?: Record<string, unknown>[];

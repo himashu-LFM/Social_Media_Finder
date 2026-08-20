@@ -1,5 +1,6 @@
 /** Client for the analyst decision endpoints (verified_url / rejected_url). */
 import { getPythonApiUrl } from "@/lib/processing-job";
+import { authedFetch } from "@/lib/auth";
 
 export type DecisionKind = "verified" | "rejected";
 
@@ -20,9 +21,7 @@ type DecisionPayload = {
 };
 
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const api = getPythonApiUrl();
-  if (!api) throw new Error("NEXT_PUBLIC_PYTHON_API_URL is not set.");
-  const res = await fetch(`${api}${path}`, {
+  const res = await authedFetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -53,7 +52,7 @@ export async function checkDbHealth(): Promise<DbHealth | null> {
   const api = getPythonApiUrl();
   if (!api) return null;
   try {
-    const res = await fetch(`${api}/api/db/health`, { cache: "no-store" });
+    const res = await authedFetch("/api/db/health", { cache: "no-store" });
     if (!res.ok) return null;
     return (await res.json()) as DbHealth;
   } catch {

@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { authedFetch } from "@/lib/auth";
 import Link from "next/link";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
@@ -51,7 +52,7 @@ async function loadRows(): Promise<ResultRow[]> {
   const api = getPythonApiUrl();
   if (api) {
     try {
-      const res = await fetch(`${api}/api/results/latest`, { cache: "no-store" });
+      const res = await authedFetch("/api/results/latest", { cache: "no-store" });
       if (res.ok) {
         const data = (await res.json()) as { rows?: Record<string, unknown>[] };
         if (data.rows && data.rows.length > 0) {
