@@ -1,0 +1,38 @@
+# AWS App Runner build spec for the Curator AI Python API.
+#
+# Source-based deployment: App Runner clones this repo, installs
+# requirements.txt and runs uvicorn. No Dockerfile needed — api_server.py and
+# every module it imports sit at the repo root, which is what App Runner uses
+# as its source directory by default.
+#
+# NOTHING SECRET GOES IN THIS FILE. It is committed to git. Set DATABASE_URL,
+# the API keys and CORS_ORIGINS as environment variables in the App Runner
+# console (or, better, as secrets referencing AWS Secrets Manager).
+#
+# APP_ENV=production is set here deliberately rather than left to the console:
+# it is the switch that makes the API fail CLOSED when it cannot authenticate a
+# caller, and forgetting it in a console form would silently serve the whole
+# tool to anonymous users. See docs/DEPLOYMENT.md.
+
+version: 1.0
+runtime: python311
+
+build:
+  commands:
+    build:
+      - pip install --no-cache-dir -r requirements.txt
+
+run:
+  runtime-version: 3.11.9
+  # 0.0.0.0, not 127.0.0.1 — App Runner health-checks the container from
+  # outside it, and a loopback-only bind fails every check with no useful log.
+  command: uvicorn api_server:app --host 0.0.0.0 --port 8080
+  network:
+    port: 8080
+  env:
+    - name: APP_ENV
+      value: production
+    - name: AUTH_REQUIRED
+      value: "1"
+    - name: PYTHONUNBUFFERED
+      value: "1"          # so print() reaches CloudWatch immediately
