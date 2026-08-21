@@ -141,21 +141,21 @@ export function AnalysisClient() {
 
             <div className="space-y-4">
               <AnalysisRow
-                label="Green (>85%)"
+                label="Verified"
                 count={greenCount}
                 pct={asPct(greenCount)}
                 tone="emerald"
                 icon="check_circle"
               />
               <AnalysisRow
-                label="Yellow (70%-85%)"
+                label="Need Manual Review"
                 count={yellowCount}
                 pct={asPct(yellowCount)}
                 tone="amber"
                 icon="warning"
               />
               <AnalysisRow
-                label="Red (<70%)"
+                label="Wrong"
                 count={redCount}
                 pct={asPct(redCount)}
                 tone="rose"
