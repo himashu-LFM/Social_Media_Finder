@@ -37,7 +37,7 @@ import re
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 
 import requests
 

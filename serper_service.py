@@ -262,10 +262,6 @@ def discover_candidates(
     return candidates
 
 
-# Placeholders an analyst may use in a custom query template. Anything else in
-# the template is passed through to Google verbatim.
-QUERY_PLACEHOLDERS = ("name", "platform", "domain", "category", "subcategory")
-
 # The default, used whenever no custom template is supplied. Keeping it here as
 # a literal means the Wikipedia flow and the custom flow run the same code path
 # with different templates — no separate branch to drift out of sync.
