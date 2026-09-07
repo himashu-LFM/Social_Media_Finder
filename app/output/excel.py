@@ -28,8 +28,8 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-import social_urls
-from verification_service import (
+from app.platforms import social_urls
+from app.verification.verifier import (
     STATUS_MANUAL,
     STATUS_NOT_FOUND,
     STATUS_STOPPED,
@@ -293,7 +293,7 @@ def save_results(
 ) -> Path:
     """Write the results workbook with header styling and status colour bands."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = Path(output_dir) if output_dir is not None else Path(__file__).resolve().parent
+    base_dir = Path(output_dir) if output_dir is not None else Path(__file__).resolve().parents[2]
     base_dir.mkdir(parents=True, exist_ok=True)
     output_path = base_dir / f"{filename_prefix}_{timestamp}.xlsx"
 

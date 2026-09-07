@@ -11,10 +11,10 @@ Two things this file is really guarding:
 """
 import pytest
 
-import bio_link_service as bl
-import search_options as so
-import verification_pipeline as vp
-import verification_service as vs
+from app.discovery import bio_links as bl
+from app.pipeline import options as so
+from app.pipeline import orchestrator as vp
+from app.verification import verifier as vs
 
 
 # ── unwrapping the platforms' link redirectors ──────────────────────────────

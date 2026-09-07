@@ -1,0 +1,56 @@
+{
+  "solution": "1_internal_scraper",
+  "date": "2026-09-03",
+  "source_files": {
+    "youtube": "profiles-8864d5b2.csv",
+    "instagram": "profiles-e9b51fa0.csv"
+  },
+  "metrics": {
+    "youtube": {
+      "anchor": "youtube",
+      "rows": 100,
+      "status": {
+        "success": 100,
+        "partial": 0,
+        "error": 0,
+        "other": 0
+      },
+      "extraction_success_pct": 100.0,
+      "rows_with_any_external_link": 97,
+      "rows_with_other_target_platform": 81,
+      "rows_with_aggregator": 3,
+      "rows_useful_other_or_agg": 82,
+      "useful_pct": 82.0,
+      "avg_other_platforms_per_row": 2.39,
+      "per_other_platform_found": {
+        "instagram": 74,
+        "facebook": 66,
+        "tiktok": 35,
+        "x": 64
+      }
+    },
+    "instagram": {
+      "anchor": "instagram",
+      "rows": 100,
+      "status": {
+        "success": 28,
+        "partial": 8,
+        "error": 64,
+        "other": 0
+      },
+      "extraction_success_pct": 36.0,
+      "rows_with_any_external_link": 33,
+      "rows_with_other_target_platform": 3,
+      "rows_with_aggregator": 9,
+      "rows_useful_other_or_agg": 11,
+      "useful_pct": 11.0,
+      "avg_other_platforms_per_row": 0.03,
+      "per_other_platform_found": {
+        "facebook": 0,
+        "youtube": 2,
+        "tiktok": 0,
+        "x": 1
+      }
+    }
+  }
+}

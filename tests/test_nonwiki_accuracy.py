@@ -4,11 +4,11 @@ Accuracy fixes for the non-Wikipedia population.
 Every case here is a cell the pipeline actually got wrong on the first custom-mode
 run (scraper_test.xlsx — Japanese and Thai indie musicians), traced to its cause.
 """
-import apify_service as ap
-import bio_link_service as bl
-import search_options as so
-import verification_pipeline as vp
-import verification_service as vs
+from app.discovery import apify as ap
+from app.discovery import bio_links as bl
+from app.pipeline import options as so
+from app.pipeline import orchestrator as vp
+from app.verification import verifier as vs
 
 CUSTOM = so.SearchOptions(mode="custom", prompt="social media handles")
 

@@ -35,9 +35,9 @@ from typing import Any, Dict, List
 
 import requests
 
-import bio_link_service
-import social_urls
-from retry_util import request_with_retry
+from app.discovery import bio_links as bio_link_service
+from app.platforms import social_urls
+from app.common.retry import request_with_retry
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "").strip()
 APIFY_ACTOR_ID = os.environ.get("APIFY_ACTOR_ID", "").strip()

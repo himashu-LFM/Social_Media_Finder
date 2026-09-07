@@ -19,10 +19,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-import auth_service  # noqa: E402  — after dotenv so DATABASE_URL loads
-import db_service  # noqa: E402
+from app.persistence import auth as auth_service  # noqa: E402  — after dotenv so DATABASE_URL loads
+from app.persistence import db as db_service  # noqa: E402
 
 
 def main() -> int:

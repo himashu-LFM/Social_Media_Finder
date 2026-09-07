@@ -1,0 +1,42 @@
+{
+  "solution": "apify_actors",
+  "date": "2026-09-03",
+  "actors": {
+    "instagram": "instagram-user-info-scraper-cookieless",
+    "youtube": "youtube-channel-contacts-scraper"
+  },
+  "metrics": {
+    "youtube": {
+      "anchor": "youtube",
+      "rows": 107,
+      "extraction_success_pct": 91.6,
+      "rows_with_other_target_platform": 76,
+      "rows_with_aggregator": 3,
+      "rows_useful_other_or_agg": 77,
+      "useful_pct": 72.0,
+      "avg_other_platforms_per_row": 2.12,
+      "per_other_platform_found": {
+        "instagram": 70,
+        "facebook": 61,
+        "tiktok": 33,
+        "x": 63
+      }
+    },
+    "instagram": {
+      "anchor": "instagram",
+      "rows": 101,
+      "extraction_success_pct": 96.0,
+      "rows_with_other_target_platform": 20,
+      "rows_with_aggregator": 16,
+      "rows_useful_other_or_agg": 33,
+      "useful_pct": 32.7,
+      "avg_other_platforms_per_row": 0.21,
+      "per_other_platform_found": {
+        "facebook": 0,
+        "youtube": 19,
+        "tiktok": 0,
+        "x": 2
+      }
+    }
+  }
+}

@@ -3,7 +3,7 @@ Curator AI — Python API for the Next.js frontend.
 
 Run (from C:\\Testing):
   pip install -r requirements.txt
-  uvicorn api_server:app --host 127.0.0.1 --port 8787 --reload
+  uvicorn app.main:app --host 127.0.0.1 --port 8787 --reload
 
 Set NEXT_PUBLIC_PYTHON_API_URL=http://127.0.0.1:8787 in curator-ai/.env.local
 """
@@ -27,13 +27,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
 
-import auth_service  # noqa: E402  — after dotenv so DATABASE_URL loads
-import db_service  # noqa: E402  — after dotenv so DATABASE_URL loads
-import search_options  # noqa: E402
-import verification_pipeline as testing  # noqa: E402  — after dotenv so keys load
+from app.persistence import auth as auth_service  # noqa: E402  — after dotenv so DATABASE_URL loads
+from app.persistence import db as db_service  # noqa: E402  — after dotenv so DATABASE_URL loads
+from app.pipeline import options as search_options  # noqa: E402
+from app.pipeline import orchestrator as testing  # noqa: E402  — after dotenv so keys load
 
 _jobs_lock = threading.Lock()
 _jobs: Dict[str, Dict[str, Any]] = {}

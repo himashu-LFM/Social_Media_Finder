@@ -7,7 +7,7 @@ comment on each says which. All guards are one-directional: they may only
 downgrade Verified to Manual Review, so a regression shows up as a false
 positive escaping, never as a correct answer being suppressed.
 """
-import verification_service as vs
+from app.verification import verifier as vs
 
 NOTABLE = {"name": "X", "known_works": ["A Work"], "summary": "An actor"}
 

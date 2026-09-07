@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-import wikidata_lookup as wd
+from app.identity import wikidata as wd
 
 # Reuse the shared HTTP session + timeout from wikidata_lookup so we keep a
 # single set of headers / connection pool across the Wikipedia services.

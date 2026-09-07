@@ -67,7 +67,7 @@ Manual Review, never the reverse, so a guard misfiring costs coverage but never 
 ```bash
 python -m pip install -r requirements.txt
 copy .env.example .env        # then fill in the keys
-uvicorn api_server:app --host 127.0.0.1 --port 8787 --reload
+uvicorn app.main:app --host 127.0.0.1 --port 8787 --reload
 ```
 
 **Frontend**:

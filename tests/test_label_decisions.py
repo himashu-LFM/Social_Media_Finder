@@ -12,7 +12,7 @@ actual verdict as observed. No network, no API cost, runs in milliseconds.
 """
 import pytest
 
-import verification_service as vs
+from app.verification import verifier as vs
 
 # Ground truth for a non-Wikipedia subject: a name and a broad category. This is
 # genuinely all the client file provides for most of these rows.

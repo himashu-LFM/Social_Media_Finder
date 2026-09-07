@@ -14,9 +14,9 @@ still tested here because the WIKIPEDIA flow continues to use it.
 """
 import pytest
 
-import search_options as so
-import serper_service as ss
-import verification_service as vs
+from app.pipeline import options as so
+from app.discovery import serper as ss
+from app.verification import verifier as vs
 
 
 # ── the default (Wikipedia) path must not have moved ────────────────────────

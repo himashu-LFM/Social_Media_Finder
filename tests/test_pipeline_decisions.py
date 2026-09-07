@@ -1,8 +1,8 @@
 """Analyst decisions must short-circuit the pipeline and never resurface rejections."""
-import verification_pipeline as vp
-import verification_service as vs
-import wikipedia_service as ws
-import serper_service
+from app.pipeline import orchestrator as vp
+from app.verification import verifier as vs
+from app.identity import wikipedia as ws
+from app.discovery import serper as serper_service
 
 
 def _stub(monkeypatch, counter):
@@ -60,7 +60,7 @@ def test_no_decisions_means_normal_full_price_run(monkeypatch):
 
 
 def test_decision_store_failure_does_not_break_a_run(monkeypatch):
-    import db_service
+    from app.persistence import db as db_service
     monkeypatch.setattr(db_service, "is_configured", lambda: True)
     monkeypatch.setattr(db_service, "fetch_decisions",
                         lambda t: (_ for _ in ()).throw(RuntimeError("db down")))
@@ -69,7 +69,7 @@ def test_decision_store_failure_does_not_break_a_run(monkeypatch):
 
 def test_cancellation_marks_cells_not_checked_not_not_found():
     """'Not Checked' must stay distinct from 'Not Found' — one asserts an absence."""
-    import excel_service as ex
+    from app.output import excel as ex
     df = ex.build_talent_df(["A", "B"])
     out = vp.run_pipeline_on_dataframe(df, should_cancel=lambda: True)
     statuses = {str(out.iloc[i][ex.status_col(p)]) for i in range(len(out)) for p in vp.PLATFORMS}
