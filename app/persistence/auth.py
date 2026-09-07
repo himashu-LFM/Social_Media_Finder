@@ -27,7 +27,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-import db_service
+from app.persistence import db as db_service
 
 try:
     from argon2 import PasswordHasher

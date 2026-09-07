@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 
 import requests
 
-import social_urls
+from app.platforms import social_urls
 from app.common.retry import request_with_retry
 
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "").strip()

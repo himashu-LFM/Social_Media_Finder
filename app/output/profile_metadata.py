@@ -26,7 +26,7 @@ import requests
 
 from app.common.retry import request_with_retry
 
-import social_urls
+from app.platforms import social_urls
 
 # Social sites expose the richest OpenGraph tags to crawler/OG-scraper agents.
 # We try the Facebook OG fetcher UA first (unlocks Instagram etc.), then fall
@@ -205,7 +205,7 @@ def fetch_profile_metadata(url: str, platform: str) -> Dict[str, Any]:
     # BACK to a profile the client gave us. Imported lazily — bio_link_service
     # imports this module, so a top-level import would be circular.
     try:
-        import bio_link_service
+        from app.discovery import bio_links as bio_link_service
         links = bio_link_service.links_by_platform(html, exclude_url=url)
         if links:
             meta["profile_links"] = links

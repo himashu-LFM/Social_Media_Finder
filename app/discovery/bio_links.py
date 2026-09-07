@@ -32,8 +32,8 @@ import threading
 from typing import Dict, List, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
-import profile_metadata
-import social_urls
+from app.output import profile_metadata
+from app.platforms import social_urls
 
 # Platforms whose profile pages are worth reading for outbound links, in the
 # order we would rather anchor on. Instagram first because that is the column

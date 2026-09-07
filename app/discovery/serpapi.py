@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-import social_urls
+from app.platforms import social_urls
 from app.common.retry import request_with_retry
 
 SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY", "").strip()

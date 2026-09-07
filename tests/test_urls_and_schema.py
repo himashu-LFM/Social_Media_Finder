@@ -2,8 +2,8 @@
 import pandas as pd
 import pytest
 
-import excel_service as ex
-import social_urls as su
+from app.output import excel as ex
+from app.platforms import social_urls as su
 
 
 # ── profile URL validation ──────────────────────────────────────────────────

@@ -44,17 +44,17 @@ from urllib.parse import urlparse
 
 import pandas as pd
 
-import apify_service
-import excel_service
-import profile_metadata
-import serper_service
-import serpapi_service
-import bio_link_service
-import search_options
-import social_urls
-import verification_service
-import wikipedia_service
-from verification_service import (
+from app.discovery import apify as apify_service
+from app.output import excel as excel_service
+from app.output import profile_metadata
+from app.discovery import serper as serper_service
+from app.discovery import serpapi as serpapi_service
+from app.discovery import bio_links as bio_link_service
+from app.pipeline import options as search_options
+from app.platforms import social_urls
+from app.verification import verifier as verification_service
+from app.identity import wikipedia as wikipedia_service
+from app.verification.verifier import (
     STATUS_MANUAL,
     STATUS_NOT_FOUND,
     STATUS_STOPPED,
@@ -1148,7 +1148,7 @@ def load_decisions(talents: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
     the run costs full price.
     """
     try:
-        import db_service
+        from app.persistence import db as db_service
         if not db_service.is_configured():
             return {}
         found = db_service.fetch_decisions(talents)

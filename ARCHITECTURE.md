@@ -51,5 +51,6 @@ have an obvious home and the flat root stops growing.
 5. Frontend is unaffected (`NEXT_PUBLIC_PYTHON_API_URL` is just a URL).
 
 ## Status
-- **Phase 0 — skeleton:** done (empty packages, no moves).
-- Phase 1+ (moves) pending.
+- **Phase 0 — skeleton:** done.
+- **Phase 2 — moves:** done. All backend modules moved into `app/` (+ `scripts/create_user.py`); entry is `app.main:app`; 149 tests green; server boots.
+- Follow-ups (optional): split `app/main.py` into `app/api/routes_*.py`, add `app/config.py`, refresh the README layout section (superseded by this file), drop the `as old_name` import aliases for full cleanliness.

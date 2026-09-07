@@ -24,7 +24,7 @@ For platforms already found by Wikidata, Serper is SKIPPED entirely —
 saving credits and removing wrong-person errors.
 
 Usage in testing.py:
-    from wikidata_lookup import run_wiki_preflight
+    from app.identity.wikidata import run_wiki_preflight
 
     wiki_results = run_wiki_preflight(talent, title_category, title_sub_category,
                                       wikipedia_url=row.get("wikipedia_url"))

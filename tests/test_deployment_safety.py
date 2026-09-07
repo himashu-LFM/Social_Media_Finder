@@ -13,9 +13,9 @@ import os
 
 import pytest
 
-import api_server
-import auth_service
-import db_service
+from app import main as api_server
+from app.persistence import auth as auth_service
+from app.persistence import db as db_service
 
 
 @pytest.fixture

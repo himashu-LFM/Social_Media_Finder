@@ -1,7 +1,7 @@
 # AWS App Runner build spec for the Curator AI Python API.
 #
 # Source-based deployment: App Runner clones this repo, installs
-# requirements.txt and runs uvicorn. No Dockerfile needed — api_server.py and
+# requirements.txt and runs uvicorn. No Dockerfile needed — app/main.py and
 # every module it imports sit at the repo root, which is what App Runner uses
 # as its source directory by default.
 #
@@ -26,7 +26,7 @@ run:
   runtime-version: 3.11.9
   # 0.0.0.0, not 127.0.0.1 — App Runner health-checks the container from
   # outside it, and a loopback-only bind fails every check with no useful log.
-  command: uvicorn api_server:app --host 0.0.0.0 --port 8080
+  command: uvicorn app.main:app --host 0.0.0.0 --port 8080
   network:
     port: 8080
   env:
