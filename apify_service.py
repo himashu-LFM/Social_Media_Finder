@@ -37,7 +37,7 @@ import requests
 
 import bio_link_service
 import social_urls
-from retry_util import request_with_retry
+from app.common.retry import request_with_retry
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "").strip()
 APIFY_ACTOR_ID = os.environ.get("APIFY_ACTOR_ID", "").strip()

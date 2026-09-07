@@ -24,7 +24,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from retry_util import request_with_retry
+from app.common.retry import request_with_retry
 
 import social_urls
 

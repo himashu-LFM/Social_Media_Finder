@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 import social_urls
-from retry_util import request_with_retry
+from app.common.retry import request_with_retry
 
 SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY", "").strip()
 SERPAPI_ENGINE = os.environ.get("SERPAPI_ENGINE", "google_ai_mode").strip()

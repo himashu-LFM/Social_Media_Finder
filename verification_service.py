@@ -44,7 +44,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from retry_util import request_with_retry
+from app.common.retry import request_with_retry
 
 # ── Primary LLM: Anthropic (Claude) ──
 # Read the user's env spelling (ANTROPIC_API_KEY) first, then the correct one.
