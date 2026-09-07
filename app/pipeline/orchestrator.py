@@ -44,6 +44,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 
+from app.discovery import aggregators
 from app.discovery import apify as apify_service
 from app.output import excel as excel_service
 from app.output import profile_metadata
@@ -1227,6 +1228,7 @@ def run_pipeline_on_dataframe(
     profile_metadata.clear_cache()
     serper_service.clear_cache()
     bio_link_service.clear_cache()
+    aggregators.clear_cache()
 
     # Collect processable rows (skip blank names), preserving 0-based index.
     rows = []
