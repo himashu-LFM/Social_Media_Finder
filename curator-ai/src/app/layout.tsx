@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Inter, Manrope } from "next/font/google";
 import { AppChrome } from "@/components/AppChrome";
 import { AuthGuard } from "@/components/AuthGuard";
+import { SidebarProvider } from "@/components/SidebarState";
 import { BackgroundScene } from "@/components/three/BackgroundScene";
 import { ToastProvider } from "@/components/ToastProvider";
 import "./globals.css";
@@ -43,10 +44,12 @@ export default function RootLayout({
         <div className="lf-aurora" aria-hidden />
         <BackgroundScene />
         <ToastProvider>
-          {/* Nothing renders until the session is confirmed (or auth is off). */}
-          <AuthGuard>
-            <AppChrome>{children}</AppChrome>
-          </AuthGuard>
+          <SidebarProvider>
+            {/* Nothing renders until the session is confirmed (or auth is off). */}
+            <AuthGuard>
+              <AppChrome>{children}</AppChrome>
+            </AuthGuard>
+          </SidebarProvider>
         </ToastProvider>
       </body>
     </html>

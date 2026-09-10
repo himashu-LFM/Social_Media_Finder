@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import { AppMain } from "@/components/AppMain";
 import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppPageHeader } from "@/components/AppPageHeader";
 import { ResultsAnalysisButton } from "@/components/ResultsAnalysisButton";
@@ -114,14 +115,14 @@ export function ResultsClient() {
       />
       <AppSidebar />
 
-      <main className="relative z-10 flex-1 p-4 pb-32 md:ml-64 md:p-8">
+      <AppMain className="relative z-10 flex-1 p-4 pb-32 md:p-8">
         <AppPageHeader
           title="Results"
           subtitle="Verification output"
           icon="table_chart"
           actions={
             <>
-              <ResultsAnalysisButton />
+              <ResultsAnalysisButton jobId={jobId} />
               <ResultsExportButton rows={rows} sourceFileName={latestFileName} />
             </>
           }
@@ -217,7 +218,7 @@ export function ResultsClient() {
             </div>
           </div>
         </div>
-      </main>
+      </AppMain>
 
       <AppMobileNav />
     </div>

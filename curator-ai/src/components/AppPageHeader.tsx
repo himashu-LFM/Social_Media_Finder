@@ -10,7 +10,7 @@ type AppPageHeaderProps = {
 
 export function AppPageHeader({ title, subtitle, icon, badge, actions }: AppPageHeaderProps) {
   return (
-    <header className="lf-enter sticky top-0 z-30 flex w-full items-center justify-between border-b border-white/5 bg-background/85 px-6 py-4 backdrop-blur-xl">
+    <header className="lf-enter sticky top-0 z-30 flex w-full flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-white/5 bg-background/85 px-4 py-4 backdrop-blur-xl sm:px-6">
       <div className="flex min-w-0 items-center gap-3">
         {icon && (
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 ring-1 ring-primary/25 shadow-lg shadow-primary/10">
@@ -27,7 +27,7 @@ export function AppPageHeader({ title, subtitle, icon, badge, actions }: AppPage
         </div>
         {badge}
       </div>
-      {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+      {actions && <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>}
     </header>
   );
 }

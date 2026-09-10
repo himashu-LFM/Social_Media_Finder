@@ -1,13 +1,22 @@
 "use client";
 
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
+import { AppMain } from "@/components/AppMain";
 import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppPageHeader } from "@/components/AppPageHeader";
 import { AppSidebar } from "@/components/AppSidebar";
 import { authedFetch } from "@/lib/auth";
 import { getPythonApiUrl } from "@/lib/processing-job";
-import { mapRecordToRow, RESULT_PLATFORMS } from "@/lib/results-mapper";
+import {
+  mapRecordToRow,
+  RESULT_PLATFORMS,
+  STATUS_VERIFIED,
+  STATUS_MANUAL,
+  STATUS_WRONG,
+  STATUS_NOT_FOUND,
+} from "@/lib/results-mapper";
 import type { ResultRow } from "@/types/results";
 
 /**
@@ -17,7 +26,7 @@ import type { ResultRow } from "@/types/results";
  * lives in localStorage and the export files live on the API's disk, not this
  * one's. Client-side loading also makes the static export possible.
  */
-function useAnalysisRows() {
+function useAnalysisRows(jobId: string) {
   const [rows, setRows] = useState<ResultRow[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -34,7 +43,11 @@ function useAnalysisRows() {
         return;
       }
       try {
-        const res = await authedFetch("/api/results/latest", { cache: "no-store" });
+        // Respect the run selected from History; otherwise the latest run.
+        const path = jobId
+          ? `/api/results/latest?job_id=${encodeURIComponent(jobId)}`
+          : "/api/results/latest";
+        const res = await authedFetch(path, { cache: "no-store" });
         if (!alive) return;
         if (!res.ok) {
           setLoadError(`Could not load results (HTTP ${res.status}).`);
@@ -53,39 +66,43 @@ function useAnalysisRows() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [jobId]);
 
   return { rows, loading, loadError };
 }
 
 export function AnalysisClient() {
-  const { rows, loading, loadError } = useAnalysisRows();
-  const platformLinks = rows.flatMap((r) =>
-    RESULT_PLATFORMS.map((p) => ({
-      link: r.platforms[p.key].link,
-      conf: r.platforms[p.key].confidence,
-    })),
-  );
-  const resolvedLinks = platformLinks.filter((x) => x.link && x.link.trim().length > 0);
-  const greenCount = resolvedLinks.filter((x) => x.conf * 100 > 85).length;
-  const yellowCount = resolvedLinks.filter((x) => x.conf * 100 >= 70 && x.conf * 100 <= 85).length;
-  const redCount = resolvedLinks.filter((x) => x.conf * 100 < 70).length;
-  const total = greenCount + yellowCount + redCount;
+  const searchParams = useSearchParams();
+  const jobId = searchParams.get("job") ?? "";
+  const { rows, loading, loadError } = useAnalysisRows(jobId);
+  // Tag by STATUS, not confidence. The three scored buckets (Verified / Needs
+  // Manual Review / Wrong) are the accuracy denominator. Not Found is a real
+  // answer ("account confirmed absent") shown separately and EXCLUDED from the
+  // score; Not Checked (search was unavailable) is ignored entirely.
+  const statuses = rows.flatMap((r) => RESULT_PLATFORMS.map((p) => r.platforms[p.key].status));
+  const verifiedCount = statuses.filter((s) => s === STATUS_VERIFIED).length;
+  const manualCount = statuses.filter((s) => s === STATUS_MANUAL).length;
+  const wrongCount = statuses.filter((s) => s === STATUS_WRONG).length;
+  const notFoundCount = statuses.filter((s) => s === STATUS_NOT_FOUND).length;
 
-  const greenDeg = total ? (greenCount / total) * 360 : 0;
-  const yellowDeg = total ? (yellowCount / total) * 360 : 0;
+  const scored = verifiedCount + manualCount + wrongCount; // accuracy denominator
+  const attempted = scored + notFoundCount; // for the Not Found share only
+
+  const vDeg = scored ? (verifiedCount / scored) * 360 : 0;
+  const mDeg = scored ? (manualCount / scored) * 360 : 0;
   const chartStyle = {
     background:
-      total > 0
+      scored > 0
         ? `conic-gradient(
-          rgba(16,185,129,0.95) 0deg ${greenDeg}deg,
-          rgba(245,158,11,0.95) ${greenDeg}deg ${greenDeg + yellowDeg}deg,
-          rgba(244,63,94,0.95) ${greenDeg + yellowDeg}deg 360deg
+          rgba(16,185,129,0.95) 0deg ${vDeg}deg,
+          rgba(245,158,11,0.95) ${vDeg}deg ${vDeg + mDeg}deg,
+          rgba(244,63,94,0.95) ${vDeg + mDeg}deg 360deg
         )`
         : "conic-gradient(rgba(71,85,105,0.5) 0deg 360deg)",
   };
 
-  const asPct = (v: number) => (total ? `${((v / total) * 100).toFixed(1)}%` : "0.0%");
+  const pctScored = (v: number) => (scored ? `${((v / scored) * 100).toFixed(1)}%` : "0.0%");
+  const notFoundPct = attempted ? `${((notFoundCount / attempted) * 100).toFixed(1)}%` : "0.0%";
 
   return (
     <div className="relative flex min-h-screen flex-col md:flex-row">
@@ -95,13 +112,13 @@ export function AnalysisClient() {
       />
       <AppSidebar />
 
-      <main className="relative z-10 flex-1 p-4 pb-24 md:ml-64 md:p-8 md:pb-8">
+      <AppMain className="relative z-10 flex-1 p-4 pb-24 md:p-8 md:pb-8">
         <AppPageHeader
           title="Analysis"
-          subtitle="Confidence breakdown"
+          subtitle="Status breakdown"
           icon="donut_large"
           actions={
-            <Link href="/results" className="lf-btn-secondary inline-flex items-center gap-2 px-4 py-2.5 text-sm">
+            <Link href={jobId ? `/results?job=${encodeURIComponent(jobId)}` : "/results"} className="lf-btn-secondary inline-flex items-center gap-2 px-4 py-2.5 text-sm">
               <span className="material-symbols-outlined text-base">arrow_back</span>
               Back to Results
             </Link>
@@ -130,9 +147,9 @@ export function AnalysisClient() {
                     <div className="text-center">
                       <div className="inline-flex items-center gap-1 text-xs font-semibold uppercase tracking-widest text-slate-400">
                         <span className="material-symbols-outlined text-sm">link</span>
-                        Total Links
+                        Scored Links
                       </div>
-                      <div className="mt-1 text-4xl font-black text-slate-100">{total}</div>
+                      <div className="mt-1 text-4xl font-black text-slate-100">{scored}</div>
                     </div>
                   </div>
                 </div>
@@ -142,33 +159,41 @@ export function AnalysisClient() {
             <div className="space-y-4">
               <AnalysisRow
                 label="Verified"
-                count={greenCount}
-                pct={asPct(greenCount)}
+                count={verifiedCount}
+                pct={pctScored(verifiedCount)}
                 tone="emerald"
                 icon="check_circle"
               />
               <AnalysisRow
                 label="Need Manual Review"
-                count={yellowCount}
-                pct={asPct(yellowCount)}
+                count={manualCount}
+                pct={pctScored(manualCount)}
                 tone="amber"
                 icon="warning"
               />
               <AnalysisRow
                 label="Wrong"
-                count={redCount}
-                pct={asPct(redCount)}
+                count={wrongCount}
+                pct={pctScored(wrongCount)}
                 tone="rose"
                 icon="cancel"
               />
+              <AnalysisRow
+                label="Not Found"
+                count={notFoundCount}
+                pct={notFoundPct}
+                tone="slate"
+                icon="do_not_disturb_on"
+              />
               <div className="lf-enter lf-enter-delay-2 lf-card mt-4 flex items-start gap-3 px-4 py-4 text-sm text-slate-300">
                 <span className="material-symbols-outlined text-primary">insights</span>
-                This chart includes all resolved platform links from the latest processed workbook.
+                Verified, Needs Manual Review and Wrong are scored out of the resolved links.
+                Not Found (accounts confirmed absent) is shown separately and excluded from the score.
               </div>
             </div>
           </section>
         </div>
-      </main>
+      </AppMain>
 
       <AppMobileNav />
     </div>
@@ -185,7 +210,7 @@ function AnalysisRow({
   label: string;
   count: number;
   pct: string;
-  tone: "emerald" | "amber" | "rose";
+  tone: "emerald" | "amber" | "rose" | "slate";
   icon: string;
 }) {
   const cls =
@@ -193,7 +218,9 @@ function AnalysisRow({
       ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200 lf-stat-glow-emerald"
       : tone === "amber"
         ? "border-amber-500/30 bg-amber-500/10 text-amber-200 lf-stat-glow-amber"
-        : "border-rose-500/30 bg-rose-500/10 text-rose-200";
+        : tone === "rose"
+          ? "border-rose-500/30 bg-rose-500/10 text-rose-200"
+          : "border-slate-500/30 bg-slate-500/10 text-slate-300";
 
   return (
     <div className={`lf-enter lf-card-hover flex items-center justify-between rounded-xl border px-4 py-4 ${cls}`}>

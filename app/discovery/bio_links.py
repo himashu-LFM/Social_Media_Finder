@@ -32,6 +32,7 @@ import threading
 from typing import Dict, List, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+from app.discovery import aggregators
 from app.output import profile_metadata
 from app.platforms import social_urls
 
@@ -222,6 +223,16 @@ def harvest(anchor_url: str, anchor_platform: str) -> Dict[str, str]:
             html_text, exclude_platform=anchor_platform, exclude_url=anchor_url
         ).items():
             found.setdefault(platform, url)
+        # Follow any link-aggregator (Linktree etc.) on this page. Instagram bios
+        # in particular list a Linktree rather than the handles directly, so this
+        # is where most of the non-YouTube coverage comes from. First-found wins,
+        # so a handle the bio states outright is never overwritten by the
+        # aggregator's copy of it.
+        for agg_url in aggregators.aggregator_urls_in(html_text):
+            for platform, url in aggregators.follow(
+                agg_url, exclude_platform=anchor_platform, exclude_url=anchor_url
+            ).items():
+                found.setdefault(platform, url)
         if found:
             break  # the first page that yields anything is the profile's own
 
