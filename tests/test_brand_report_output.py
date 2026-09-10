@@ -44,7 +44,7 @@ def test_brand_report_fill_in_place(tmp_path):
     # Row B -> YouTube Manual Review with two candidates (goes to review columns)
     df.at[1, ex.status_col("YouTube")] = STATUS_MANUAL
     df.at[1, ex.link_col("YouTube")] = "https://www.youtube.com/@camnorrie"
-    df.at[1, ex.reason_col("YouTube")] = ("SerpApi cited multiple candidates — review: "
+    df.at[1, ex.reason_col("YouTube")] = ("Serper cited multiple candidates — review: "
                                           "https://youtube.com/@camnorrie  |  https://youtube.com/@cnorrie")
 
     out_path = ex.save_brand_report(df, output_dir=tmp_path)

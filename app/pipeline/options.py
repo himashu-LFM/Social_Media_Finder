@@ -13,9 +13,9 @@ run Serper/LLM/Apify. Instead:
 
     Phase 0  — first-party bio links from the client's own Instagram/YouTube
                handle (adopted Verified — the account holder published them).
-    SerpApi  — for every platform Phase 0 did not fill, one SerpApi Google-AI-Mode
-               query "<name> [<profession>] <prompt>" returns the links Google
-               cites, tagged Manual Review Needed (no LLM).
+    Serper   — for every platform Phase 0 did not fill, one
+               "<name> [<profession>] site:<domain>" search returns candidate
+               profile links, tagged Manual Review Needed (no LLM).
 
 The analyst supplies a free-text ``prompt`` (e.g. "social media handles") and
 chooses whether the profession pulled from the file is included in the query.
@@ -40,7 +40,7 @@ class SearchOptions:
     """Per-run search configuration. The default instance is Wikipedia mode."""
 
     mode: str = MODE_WIKIPEDIA
-    # Custom-mode SerpApi query suffix — the analyst's free-text prompt, appended
+    # Custom-mode search suffix — the analyst's free-text prompt, appended
     # after "<name> <profession>". Empty is valid (just name + profession).
     prompt: str = ""
     # Whether the file's profession/category is included in the custom query.

@@ -101,7 +101,7 @@ def reason_col(platform: str) -> str:
 
 
 def source_col(platform: str) -> str:
-    """Where the chosen link came from — SerpApi, Phase 0 bio, input file, etc."""
+    """Where the chosen link came from — Serper, Phase 0 bio, input file, etc."""
     return f"{platform} Source"
 
 

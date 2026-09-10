@@ -3,7 +3,7 @@ Phase 3 — the Apify Instagram reader wired into custom-mode's bio-link phase.
 
 Cascade order guarded here:
   trust client link (Verified) → free readers → Apify Instagram (gaps only) → ...
-The SerpApi fallback runs after this phase and is unchanged, so it is not retested.
+The Serper fallback runs after this phase and is unchanged, so it is not retested.
 
 Guards:
   * Apify fills only the gaps the free readers left, and its links are Verified.

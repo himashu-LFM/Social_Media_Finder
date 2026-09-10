@@ -49,7 +49,6 @@ from app.discovery import apify as apify_service
 from app.output import excel as excel_service
 from app.output import profile_metadata
 from app.discovery import serper as serper_service
-from app.discovery import serpapi as serpapi_service
 from app.discovery import bio_links as bio_link_service
 from app.pipeline import options as search_options
 from app.platforms import social_urls
@@ -773,11 +772,11 @@ def _row_bio_link_phase(
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Custom-mode discovery: SerpApi Google AI Mode (no Serper / LLM / Apify)
+#  Custom-mode discovery helpers
 # ────────────────────────────────────────────────────────────────────────────
 
 # Excel columns (case-insensitive) that carry a talent's profession/category,
-# used to build the SerpApi query "<name> <profession> <prompt>". An explicit
+# used to build the custom-mode query "<name> <profession> <prompt>". An explicit
 # ``profession``/``occupation`` column wins when present (cleanest signal);
 # otherwise fall back to the taxonomy columns.
 _PROFESSION_KEYS = (
@@ -809,63 +808,6 @@ def _detect_profession(input_metadata: Optional[Dict[str, str]]) -> str:
     return ""
 
 
-def _row_serpapi_phase(
-    talent: str,
-    input_metadata: Optional[Dict[str, str]],
-    options: search_options.SearchOptions,
-    resolved: Optional[Dict[str, VerificationResult]] = None,
-    platform_progress: Optional[Callable[[str, str], None]] = None,
-) -> Dict[str, VerificationResult]:
-    """
-    Custom-mode discovery for the platforms Phase 0 (bio links) did NOT fill.
-
-    ONE SerpApi Google-AI-Mode query — "<name> [<profession>] <prompt>" — then the
-    links Google AI Mode cites are tagged Manual Review Needed. There is NO LLM,
-    NO Serper and NO Apify for these rows: the links are handed through as-is for
-    a human to review.
-
-    ``resolved`` carries the platforms Phase 0 already confirmed (Verified). Those
-    are kept untouched; only the remaining platforms are filled from SerpApi.
-    """
-    resolved = dict(resolved or {})
-    profession = _detect_profession(input_metadata) if options.include_profession else ""
-    try:
-        handles = serpapi_service.discover_handles(talent, profession, suffix=options.prompt)
-    except Exception as exc:  # noqa: BLE001 — never abort the row on SerpApi failure
-        print(f"  [PIPELINE] SerpApi discovery failed for '{talent}': {exc}")
-        handles = {}
-
-    results: Dict[str, VerificationResult] = dict(resolved)
-    for platform in PLATFORMS:
-        if platform_progress:
-            platform_progress(platform, "start")
-        if platform not in results:  # Phase 0 already confirmed ones stay as-is
-            cands = handles.get(platform, [])
-            urls = [c["url"] for c in cands if c.get("url")]
-            if urls:
-                if len(urls) > 1:
-                    # Ambiguous: list every candidate so the analyst picks the
-                    # right one — this is exactly why it's Manual Review.
-                    reason = ("SerpApi cited multiple candidates — not verified; "
-                              "review which is correct: " + "  |  ".join(urls))
-                else:
-                    reason = ("Link cited by SerpApi Google AI Mode search — not "
-                              "LLM-verified; manual review needed.")
-                results[platform] = VerificationResult(
-                    platform=platform, best_candidate=urls[0],
-                    status=STATUS_MANUAL, confidence=0, decision="manual_review",
-                    source="SerpApi (Google AI Mode)", reason=reason,
-                )
-            else:
-                results[platform] = VerificationResult(
-                    platform=platform, status=STATUS_NOT_FOUND,
-                    reason="No link returned by Google AI Mode search.",
-                )
-        if platform_progress:
-            platform_progress(platform, "done")
-    return results
-
-
 def _row_serper_fallback_phase(
     talent: str,
     input_metadata: Optional[Dict[str, str]],
@@ -878,11 +820,11 @@ def _row_serper_fallback_phase(
     fill. One ``"<name> [<profession>] site:<domain>"`` Serper search per missing
     platform; the top organic profile URL(s) are handed through as Manual Review.
 
-    Replaces the SerpApi Google-AI-Mode fallback: Serper is far cheaper, its
-    results are deterministic, and it returns clean organic profile URLs — and
-    it is the same vendor the Wikipedia flow already uses, so the whole product
-    runs on one search key. There is still NO LLM and NO verification here: these
-    links are candidates for a human, exactly like the SerpApi ones were.
+    Serper rather than a generative search: it is far cheaper, its results are
+    deterministic, it returns clean organic profile URLs, and it is the same
+    vendor the Wikipedia flow already uses — so the whole product runs on one
+    search key. There is NO LLM and NO verification here: these links are
+    candidates for a human to confirm.
     """
     resolved = dict(resolved or {})
     profession = _detect_profession(input_metadata) if options.include_profession else ""
@@ -1382,7 +1324,7 @@ def run_pipeline_on_dataframe(
                 platform_progress(idx, platform, phase)
 
         # Custom (non-Wikipedia) mode skips the Wikipedia lookup entirely — the
-        # SerpApi phase never uses the ground-truth record.
+        # The custom path never uses the ground-truth record.
         if options.is_custom:
             wiki_meta = wikipedia_service.WikiMetadata(talent=talent, name=talent)
         else:
@@ -1426,7 +1368,7 @@ def run_pipeline_on_dataframe(
     stopped = _is_cancelled(should_cancel)
     failing_talents = sorted({
         r["talent"] for r in phase_a
-        if not r.get("cancelled") and not r.get("custom")  # custom rows: SerpApi only
+        if not r.get("cancelled") and not r.get("custom")  # custom rows: no LLM/Apify pass
         and any(v.status not in _GOOD_STATUSES for v in r["phase1"].values())
     })
     if stopped:
@@ -1448,7 +1390,7 @@ def run_pipeline_on_dataframe(
         # Apify/LLM calls — partial results are still saved and viewable.
         if r.get("cancelled") or _is_cancelled(should_cancel):
             return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
-        # Custom rows are already final from Phase 0 + SerpApi — no Apify backup,
+        # Custom rows are already final from Phase 0 + Serper — no Apify backup,
         # no cross-platform corroboration (those belong to the Wikipedia flow).
         if r.get("custom"):
             return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
