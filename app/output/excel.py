@@ -54,6 +54,18 @@ INPUT_META_COL = "_input_metadata"
 # Not part of ``ordered_columns`` so it is dropped before export.
 INPUT_HANDLES_COL = "_input_handles"
 
+# Working-only column holding the ENTIRE original input row as {column: value},
+# in the file's original column order. Kept so the export can write results back
+# into the client's own brand-definition report rather than a separate schema.
+# Not part of ``ordered_columns``; dropped before the tool-schema export.
+SOURCE_ROW_COL = "_source_row"
+
+# Two columns appended to the brand-report export (the only additions):
+#   needs_manual_review  — platforms found but NOT sure (search-fallback links)
+#   manual_review_reason — why, plus every candidate link when it's ambiguous
+MANUAL_REVIEW_COL = "needs_manual_review"
+MANUAL_REASON_COL = "manual_review_reason"
+
 # Input column aliases that carry an existing handle/URL per platform. Matched
 # case-insensitively against the header. Order matters: first hit wins.
 _PLATFORM_HANDLE_COLUMNS: Dict[str, List[str]] = {
@@ -175,10 +187,10 @@ def _new_frame(rows: List[Dict[str, str]]) -> pd.DataFrame:
     for col in ordered_columns():
         if col not in df.columns:
             df[col] = ""
-    for working_col in (INPUT_META_COL, INPUT_HANDLES_COL):
+    for working_col in (INPUT_META_COL, INPUT_HANDLES_COL, SOURCE_ROW_COL):
         if working_col not in df.columns:
             df[working_col] = ""
-    df = df[ordered_columns() + [INPUT_META_COL, INPUT_HANDLES_COL]]
+    df = df[ordered_columns() + [INPUT_META_COL, INPUT_HANDLES_COL, SOURCE_ROW_COL]]
     # Force object dtype so numeric confidences (and the metadata dict) can share
     # columns with strings — some pandas versions infer a strict `str` dtype for
     # all-string columns, which then rejects int/dict assignment.
@@ -249,9 +261,13 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
             if url:
                 known[platform] = url
         handle_hits += len(known)
+        # The full original row, preserved verbatim (order + values) so the
+        # export can fill it in place. Client cells are never modified here.
+        source_row = {str(c): _clean_str(raw.iloc[i][c]) for c in raw.columns}
         rows.append({
             TALENT_COL: name, WIKI_COL: wiki,
             INPUT_META_COL: metadata, INPUT_HANDLES_COL: known,
+            SOURCE_ROW_COL: source_row,
         })
 
     if not rows:
@@ -350,10 +366,139 @@ def save_results(
     return output_path
 
 
+# ────────────────────────────────────────────────────────────────────────────
+#  Brand-report output: fill the client's own file in place
+# ────────────────────────────────────────────────────────────────────────────
+
+def detect_handle_columns(columns) -> Dict[str, str]:
+    """Map each platform to the input header that carries its handle/URL."""
+    cmap = {str(c).strip().lower(): str(c) for c in columns}
+    out: Dict[str, str] = {}
+    for platform, aliases in _PLATFORM_HANDLE_COLUMNS.items():
+        for alias in aliases:
+            if alias.lower() in cmap:
+                out[platform] = cmap[alias.lower()]
+                break
+    return out
+
+
+def _has_source_rows(df: pd.DataFrame) -> bool:
+    if SOURCE_ROW_COL not in df.columns:
+        return False
+    return any(isinstance(r, dict) and r for r in df[SOURCE_ROW_COL].tolist())
+
+
+def _full_profile_url(link: str, platform: str) -> str:
+    """Canonical full profile URL for a discovered link, tolerant of a missing
+    scheme (e.g. ``instagram.com/x`` -> ``https://instagram.com/x`` before
+    normalising). Falls back to the raw link if it can't be resolved, so an
+    odd-but-real candidate still reaches manual review rather than vanishing."""
+    link = str(link).strip()
+    if link and "://" not in link and "." in link.split("/", 1)[0]:
+        link = "https://" + link
+    return social_urls.coerce_profile_url(link, platform) or link
+
+
+def save_brand_report(
+    df: pd.DataFrame,
+    output_dir: Optional[Path] = None,
+    filename_prefix: str = "Talent_Social_Lookup",
+) -> Path:
+    """
+    Write the client's own brand-definition report back, filled in place.
+
+    Rules (agreed with the analyst):
+      * Only BLANK cells among the five platform columns are filled, and only
+        with SURE (Verified) links — written as full URLs. Client values and the
+        ``*_verified`` / other columns are never touched.
+      * Uncertain (search-fallback) links do NOT go in those columns; they go in
+        two appended columns, ``needs_manual_review`` and ``manual_review_reason``
+        (the reason lists every candidate link when more than one was found).
+    """
+    src_rows = [r for r in df[SOURCE_ROW_COL].tolist() if isinstance(r, dict) and r]
+    columns = list(src_rows[0].keys())
+    handle_cols = detect_handle_columns(columns)
+
+    records: List[Dict[str, str]] = []
+    for i in range(len(df)):
+        src = df.iloc[i][SOURCE_ROW_COL]
+        if not isinstance(src, dict) or not src:
+            continue
+        rec: Dict[str, str] = dict(src)  # original row, verbatim
+        manual_bits: List[str] = []
+        reason_bits: List[str] = []
+        for platform in PLATFORM_ORDER:
+            col = handle_cols.get(platform)
+            status = _clean_str(df.iloc[i].get(status_col(platform), ""))
+            link = _clean_str(df.iloc[i].get(link_col(platform), ""))
+            reason = _clean_str(df.iloc[i].get(reason_col(platform), ""))
+            original = _clean_str(src.get(col, "")) if col else ""
+            full_url = _full_profile_url(link, platform) if link else ""
+
+            if status == STATUS_VERIFIED and full_url and col and not original:
+                rec[col] = full_url                     # sure -> fill the blank cell
+            elif status == STATUS_MANUAL and full_url:
+                manual_bits.append(f"{platform}: {full_url}")
+                reason_bits.append(f"{platform} — {reason}" if reason else platform)
+            # Verified-but-already-present, Not Found and Stopped write nothing.
+
+        rec[MANUAL_REVIEW_COL] = " ; ".join(manual_bits)
+        rec[MANUAL_REASON_COL] = "   ||   ".join(reason_bits)
+        records.append(rec)
+
+    out_cols = columns + [MANUAL_REVIEW_COL, MANUAL_REASON_COL]
+    out_df = pd.DataFrame(records).reindex(columns=out_cols)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = Path(output_dir) if output_dir is not None else Path(__file__).resolve().parents[2]
+    base_dir.mkdir(parents=True, exist_ok=True)
+    output_path = base_dir / f"{filename_prefix}_{timestamp}.xlsx"
+
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        out_df.to_excel(output_path, index=False)
+        print(f"\n[EXPORT] Saved brand report (no formatting): {output_path}")
+        return output_path
+
+    out_df.to_excel(output_path, index=False)
+    wb = load_workbook(output_path)
+    ws = wb.active
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    new_fill = PatternFill("solid", fgColor="FFF2CC")  # highlight the 2 new cols
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+    headers = [str(c.value or "") for c in ws[1]]
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    new_idx = {headers.index(c) for c in (MANUAL_REVIEW_COL, MANUAL_REASON_COL) if c in headers}
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        for idx in new_idx:
+            if str(row[idx].value or "").strip():
+                row[idx].fill = new_fill
+    for col_idx in range(1, ws.max_column + 1):
+        max_len = max((len(str(c.value or "")) for r in ws.iter_rows(min_col=col_idx, max_col=col_idx) for c in r), default=0)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 3, 60)
+    ws.freeze_panes = "A2"
+    wb.save(output_path)
+    print(f"\n[EXPORT] Saved brand report: {output_path}")
+    return output_path
+
+
 def save_output(
     df: pd.DataFrame,
     output_dir: Optional[Path] = None,
     filename_prefix: str = "Talent_Social_Lookup",
 ) -> str:
-    """API-compatible wrapper used by api_server.py."""
+    """
+    API-compatible save. Writes the client's brand-definition report filled in
+    place when the input carried one; otherwise the tool's own results schema.
+    """
+    if _has_source_rows(df):
+        return str(save_brand_report(df, output_dir=output_dir, filename_prefix=filename_prefix))
     return str(save_results(df, output_dir=output_dir, filename_prefix=filename_prefix))

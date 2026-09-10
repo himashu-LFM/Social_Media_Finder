@@ -1,3 +1,4 @@
+import { AppMain } from "@/components/AppMain";
 import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppPageHeader } from "@/components/AppPageHeader";
 import { AppSidebar } from "@/components/AppSidebar";
@@ -35,7 +36,7 @@ export default function DiscoveryPage() {
 
       <AppSidebar />
 
-      <main className="relative z-10 min-h-screen flex-1 pb-24 md:ml-64 md:pb-0">
+      <AppMain className="relative z-10 min-h-screen flex-1 pb-24 md:pb-0">
         <AppPageHeader
           title="Discovery"
           subtitle="Talent resolver"
@@ -118,7 +119,7 @@ export default function DiscoveryPage() {
             </div>
           </div>
         </div>
-      </main>
+      </AppMain>
 
       <AppMobileNav />
     </div>

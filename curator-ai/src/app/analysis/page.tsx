@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Suspense } from "react";
 import { AnalysisClient } from "./AnalysisClient";
 
 export const metadata: Metadata = {
@@ -6,8 +7,12 @@ export const metadata: Metadata = {
   description: "Confidence distribution analysis for verified social links.",
 };
 
-// Server shell for `metadata` only. No Suspense needed here — unlike Results
-// and Serper, this view does not read search params.
+// Server shell for `metadata` only. The Suspense boundary is required:
+// AnalysisClient calls useSearchParams() to read the ?job= of the run being viewed.
 export default function AnalysisPage() {
-  return <AnalysisClient />;
+  return (
+    <Suspense fallback={null}>
+      <AnalysisClient />
+    </Suspense>
+  );
 }

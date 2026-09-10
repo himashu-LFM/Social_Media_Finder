@@ -82,6 +82,11 @@ def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
         job["status"] = "cancelled" if was_cancelled else "completed"
         job["output_path"] = out_path
         job["serper_output_path"] = serper_path
+        if rows is not None:
+            # The tool-schema rows the Results/Analysis UI reads. Kept in memory
+            # because the exported .xlsx is now the client's brand-report format,
+            # which cannot be mapped back to the results schema.
+            job["result_rows"] = rows
         for entry in job["names"]:
             entry["status"] = "done"
             entry["current_platform"] = None
@@ -645,6 +650,24 @@ def _resolve_result_paths(job_id: Optional[str], output_key: str, fallback):
     return fallback(), False
 
 
+def _in_memory_result_rows(job_id: Optional[str]) -> Optional[List[dict]]:
+    """Tool-schema result rows kept on the job in memory (single instance / no DB).
+
+    With a ``job_id``, that job's rows; without one (the Analysis page), the most
+    recently finished job that has any. Returns None when there are none.
+    """
+    with _jobs_lock:
+        if job_id:
+            job = _jobs.get(job_id)
+            rows = job.get("result_rows") if job else None
+            return list(rows) if rows else None
+        for job in reversed(list(_jobs.values())):
+            rows = job.get("result_rows")
+            if rows:
+                return list(rows)
+    return None
+
+
 def _read_rows_response(paths: List[Path]) -> dict[str, Any]:
     """Read the first readable workbook in ``paths`` to JSON rows (with retries)."""
     if not paths:
@@ -690,6 +713,14 @@ def api_results_latest(job_id: Optional[str] = None,
     if stored:
         return {"rows": stored, "filename": None, "warning": None,
                 "error": None, "source": "database"}
+    # In-memory tool-schema rows (single instance / no DB). Needed because the
+    # exported workbook is now the client's brand-report format and cannot be
+    # re-parsed into the results schema. The Analysis page calls this without a
+    # job_id, so fall back to the most recent completed job's rows.
+    mem_rows = _in_memory_result_rows(job_id)
+    if mem_rows:
+        return {"rows": mem_rows, "filename": None, "warning": None,
+                "error": None, "source": "memory"}
     paths, pending = _resolve_result_paths(job_id, "output_path", _latest_lookup_paths)
     if pending:
         return {"rows": [], "filename": None, "warning": None, "error": None, "pending": True}

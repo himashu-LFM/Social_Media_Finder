@@ -687,15 +687,33 @@ def _row_bio_link_phase(
     if not options.is_custom or _is_cancelled(should_cancel):
         return {}
 
-    candidates = bio_link_service.anchors(input_handles or {})
-    if not candidates:
-        return {}
+    input_handles = input_handles or {}
+    rejected = {
+        url for url in ((decisions or {}).get("rejected") or {}).values() if url
+    }
+    adopted: Dict[str, VerificationResult] = {}
 
-    # Every client-supplied handle is confirmed on the file's authority, and we
-    # keep reading anchors until one actually yields links — Instagram often
-    # publishes none to an anonymous reader while YouTube publishes them all.
+    # Trust EVERY handle the client supplied — for all five platforms, not just
+    # the Instagram/YouTube anchors we read for bio links. A Facebook/X/TikTok URL
+    # in the file is the client asserting it; re-searching it would waste spend and
+    # would wrongly land a client-supplied profile in Manual Review.
+    for platform, url in input_handles.items():
+        if platform in PLATFORMS and url and url not in rejected:
+            adopted[platform] = VerificationResult(
+                platform=platform, best_candidate=url,
+                status=STATUS_VERIFIED, confidence=100,
+                source="Input file (Phase 0 anchor)",
+                reason="Supplied in the input file by the client.",
+                decision="verified",
+            )
+
+    # Read the anchor profile(s) — Instagram/YouTube — for links to the OTHER
+    # platforms the client did NOT supply. Instagram often publishes nothing to an
+    # anonymous reader while YouTube's About page publishes them all, so we keep
+    # trying anchors until one yields links.
+    candidates = bio_link_service.anchors(input_handles)
     found: Dict[str, str] = {}
-    anchor_platform, anchor_url = candidates[0]
+    anchor_platform, anchor_url = ("", "")
     for platform, url in candidates:
         try:
             harvested = bio_link_service.harvest(url, platform)
@@ -707,27 +725,9 @@ def _row_bio_link_phase(
             found = harvested
             break
 
-    rejected = {
-        url for url in ((decisions or {}).get("rejected") or {}).values() if url
-    }
-    adopted: Dict[str, VerificationResult] = {}
-
-    # The anchor itself is confirmed too: the file asserts it, and every link
-    # below is only as good as that assertion anyway — labelling the source
-    # Manual Review while confirming what it points at would be incoherent.
-    for platform, url in candidates:
-        if platform in PLATFORMS:
-            adopted[platform] = VerificationResult(
-                platform=platform, best_candidate=url,
-                status=STATUS_VERIFIED, confidence=100,
-                source="Input file (Phase 0 anchor)",
-                reason="Supplied in the input file by the client.",
-                decision="verified",
-            )
-
     for platform, url in found.items():
-        if platform not in PLATFORMS:
-            continue
+        if platform not in PLATFORMS or platform in adopted:
+            continue  # a client-supplied handle always wins over the bio's copy
         # An analyst who rejected this URL outranks the bio that published it.
         if url in rejected:
             print(f"  [BIO-LINKS] {platform} {url} skipped — previously rejected by an analyst.")
@@ -737,6 +737,38 @@ def _row_bio_link_phase(
     if adopted:
         print(f"  [BIO-LINKS] '{talent}': {len(adopted)} platform(s) resolved with no "
               f"search or LLM spend -> {', '.join(sorted(adopted))}")
+
+    # Instagram is the column clients fill in, yet an anonymous read of it returns
+    # almost nothing. So when a platform is still missing and the file gave an
+    # Instagram handle, read that profile with the cookie-backed Apify actor. It
+    # is the only reliable Instagram reader — but it is PAID, so it runs last
+    # (after the free YouTube/Instagram reads above) and only for the gaps they
+    # left. Its links are as trustworthy as the client's own Instagram handle,
+    # so they are Verified, exactly like the free bio links.
+    ig_url = (input_handles or {}).get("Instagram", "")
+    missing = [p for p in PLATFORMS if p not in adopted]
+    if ig_url and missing and apify_service.instagram_configured():
+        try:
+            via_apify = apify_service.instagram_bio_links(ig_url)
+        except Exception as exc:  # noqa: BLE001 — a bad read costs spend, not correctness
+            print(f"  [APIFY-IG] read failed for '{talent}': {exc.__class__.__name__}")
+            via_apify = {}
+        added = []
+        for platform, url in via_apify.items():
+            if platform not in PLATFORMS or platform in adopted or url in rejected:
+                continue
+            adopted[platform] = VerificationResult(
+                platform=platform, best_candidate=url,
+                status=STATUS_VERIFIED, confidence=100,
+                source="Apify (Instagram bio)",
+                reason="Published in the client's Instagram bio (read via Apify).",
+                decision="verified",
+            )
+            added.append(platform)
+        if added:
+            print(f"  [APIFY-IG] '{talent}': {len(added)} platform(s) from the "
+                  f"Instagram bio -> {', '.join(sorted(added))}")
+
     return adopted
 
 
@@ -809,18 +841,99 @@ def _row_serpapi_phase(
             platform_progress(platform, "start")
         if platform not in results:  # Phase 0 already confirmed ones stay as-is
             cands = handles.get(platform, [])
-            if cands:
+            urls = [c["url"] for c in cands if c.get("url")]
+            if urls:
+                if len(urls) > 1:
+                    # Ambiguous: list every candidate so the analyst picks the
+                    # right one — this is exactly why it's Manual Review.
+                    reason = ("SerpApi cited multiple candidates — not verified; "
+                              "review which is correct: " + "  |  ".join(urls))
+                else:
+                    reason = ("Link cited by SerpApi Google AI Mode search — not "
+                              "LLM-verified; manual review needed.")
                 results[platform] = VerificationResult(
-                    platform=platform, best_candidate=cands[0]["url"],
+                    platform=platform, best_candidate=urls[0],
                     status=STATUS_MANUAL, confidence=0, decision="manual_review",
-                    source="SerpApi (Google AI Mode)",
-                    reason=("Link cited by SerpApi Google AI Mode search — not "
-                            "LLM-verified; manual review needed."),
+                    source="SerpApi (Google AI Mode)", reason=reason,
                 )
             else:
                 results[platform] = VerificationResult(
                     platform=platform, status=STATUS_NOT_FOUND,
                     reason="No link returned by Google AI Mode search.",
+                )
+        if platform_progress:
+            platform_progress(platform, "done")
+    return results
+
+
+def _row_serper_fallback_phase(
+    talent: str,
+    input_metadata: Optional[Dict[str, str]],
+    options: search_options.SearchOptions,
+    resolved: Optional[Dict[str, VerificationResult]] = None,
+    platform_progress: Optional[Callable[[str, str], None]] = None,
+) -> Dict[str, VerificationResult]:
+    """
+    Custom-mode fallback for the platforms Phase 0 (bio links / Apify) did NOT
+    fill. One ``"<name> [<profession>] site:<domain>"`` Serper search per missing
+    platform; the top organic profile URL(s) are handed through as Manual Review.
+
+    Replaces the SerpApi Google-AI-Mode fallback: Serper is far cheaper, its
+    results are deterministic, and it returns clean organic profile URLs — and
+    it is the same vendor the Wikipedia flow already uses, so the whole product
+    runs on one search key. There is still NO LLM and NO verification here: these
+    links are candidates for a human, exactly like the SerpApi ones were.
+    """
+    resolved = dict(resolved or {})
+    profession = _detect_profession(input_metadata) if options.include_profession else ""
+    # build_query collapses whitespace, so an empty {category} is harmless.
+    template = "{name} {category} site:{domain}"
+
+    results: Dict[str, VerificationResult] = dict(resolved)
+    for platform in PLATFORMS:
+        if platform_progress:
+            platform_progress(platform, "start")
+        if platform not in results:  # Phase 0 already confirmed ones stay as-is
+            searched = serper_service.is_configured()
+            errored = False
+            cands: List[dict] = []
+            if searched:
+                try:
+                    cands = serper_service.discover_by_site(
+                        talent, platform, top_n=SERPER_CANDIDATES_PER_PLATFORM,
+                        query_template=template, category=profession,
+                    )
+                except Exception as exc:  # noqa: BLE001 — never abort the row on Serper failure
+                    print(f"  [PIPELINE] Serper fallback failed for '{talent}'/{platform}: {exc}")
+                    errored = True
+            urls = [c["url"] for c in cands if c.get("url")]
+            if urls:
+                if len(urls) > 1:
+                    reason = ("Serper cited multiple candidates — not verified; "
+                              "review which is correct: " + "  |  ".join(urls))
+                else:
+                    reason = ("Link found by Serper site-search — not verified; "
+                              "manual review needed.")
+                results[platform] = VerificationResult(
+                    platform=platform, best_candidate=urls[0],
+                    status=STATUS_MANUAL, confidence=0, decision="manual_review",
+                    source="Serper (site-search)", reason=reason,
+                )
+            elif errored or not searched:
+                # We could NOT actually run the search (no Serper key / out of
+                # credits / connection), so we cannot assert the account is absent.
+                # Mark Not Checked — excluded from the analysis — never a false Not Found.
+                results[platform] = VerificationResult(
+                    platform=platform, status=STATUS_STOPPED,
+                    reason=("Search unavailable (Serper not configured or out of "
+                            "credits) — existence was not checked."),
+                )
+            else:
+                # A real search ran and returned nothing: as far as the tool can
+                # determine, no such account exists for this subject.
+                results[platform] = VerificationResult(
+                    platform=platform, status=STATUS_NOT_FOUND,
+                    reason="No profile found by a Serper site-search — no such account located.",
                 )
         if platform_progress:
             platform_progress(platform, "done")
@@ -1099,13 +1212,13 @@ def _resolve_row_result(
     """
     decisions = load_decisions([talent]).get(talent.lower(), {})
 
-    # Custom (non-Wikipedia) mode: Phase 0 first-party bio links (Verified), then
-    # SerpApi Google AI Mode for the platforms left over (Manual Review). No
-    # Wikipedia lookup, no Serper, no LLM, no Apify.
+    # Custom (non-Wikipedia) mode: Phase 0 first-party bio links + Apify Instagram
+    # (Verified), then a Serper site-search for the platforms left over (Manual
+    # Review). No Wikipedia lookup, no LLM.
     if options.is_custom:
         resolved = _row_bio_link_phase(talent, input_handles, decisions, options)
-        final = _row_serpapi_phase(talent, input_metadata, options, resolved,
-                                   platform_progress)
+        final = _row_serper_fallback_phase(talent, input_metadata, options, resolved,
+                                           platform_progress)
         return _assemble_row_out(final)
 
     wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
@@ -1277,12 +1390,12 @@ def run_pipeline_on_dataframe(
         try:
             row_decisions = decisions_by_talent.get(talent.lower(), {})
             if options.is_custom:
-                # Phase 0 bio links (Verified) + SerpApi Google AI Mode for the
-                # rest (Manual Review). No Serper / LLM / Apify.
+                # Phase 0 bio links + Apify Instagram (Verified) + a Serper
+                # site-search for the rest (Manual Review). No LLM.
                 resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
                                                options, should_cancel)
-                phase1 = _row_serpapi_phase(talent, input_metadata, options,
-                                            resolved, _pp)
+                phase1 = _row_serper_fallback_phase(talent, input_metadata, options,
+                                                    resolved, _pp)
             else:
                 resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
                                                options, should_cancel)
@@ -1292,7 +1405,7 @@ def run_pipeline_on_dataframe(
                                            options=options, input_metadata=input_metadata,
                                            resolved=resolved)
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
-            print(f"  [PIPELINE] {'SerpApi' if options.is_custom else 'Serper'} "
+            print(f"  [PIPELINE] {'Serper fallback' if options.is_custom else 'Serper'} "
                   f"phase failed for '{talent}': {exc}")
             phase1 = {
                 p: VerificationResult(platform=p, status=STATUS_MANUAL, confidence=0,

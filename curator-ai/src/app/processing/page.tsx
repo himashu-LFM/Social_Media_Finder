@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { AppMain } from "@/components/AppMain";
 import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ProcessingRunner } from "@/components/ProcessingRunner";
@@ -22,7 +23,7 @@ export default function ProcessingPage() {
 
       <AppSidebar />
 
-      <main className="relative z-10 flex min-h-screen flex-1 flex-col pb-24 md:ml-64 md:pb-0">
+      <AppMain className="relative z-10 flex min-h-screen flex-1 flex-col pb-24 md:pb-0">
         <header className="sticky top-0 z-30 flex w-full items-center justify-between border-b border-white/5 bg-background/85 px-6 py-4 backdrop-blur-xl">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 ring-1 ring-primary/25 shadow-lg shadow-primary/10">
@@ -51,7 +52,7 @@ export default function ProcessingPage() {
         <div className="flex flex-1 flex-col">
           <ProcessingRunner />
         </div>
-      </main>
+      </AppMain>
 
       <AppMobileNav />
     </div>

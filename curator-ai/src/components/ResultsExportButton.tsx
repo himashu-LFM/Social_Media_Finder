@@ -1,69 +1,85 @@
 "use client";
 
-import * as XLSX from "xlsx";
+import { useState } from "react";
 import { useToast } from "@/components/ToastProvider";
-import { RESULT_PLATFORMS } from "@/lib/results-mapper";
+import { authedFetch } from "@/lib/auth";
+import { readPythonJobId } from "@/lib/processing-job";
 import type { ResultRow } from "@/types/results";
 
 type Props = {
   rows: ResultRow[];
-  /** e.g. Talent_Social_Lookup_20260409_170736.xlsx — used as download filename */
+  /** Unused now — the file is produced server-side. Kept for API compatibility. */
   sourceFileName: string | null;
 };
 
-/** Confidence is stored normalized (0..1); the workbook schema uses 0-100. */
-function toPercent(value: number): number | "" {
-  return value > 0 ? Math.round(value * 100) : "";
-}
-
-export function ResultsExportButton({ rows, sourceFileName }: Props) {
+/**
+ * Downloads the workbook the BACKEND produced — the client's own brand-definition
+ * report, filled in place (sure links written into the platform columns, uncertain
+ * ones in the appended review columns). We deliberately do NOT rebuild a sheet in
+ * the browser: only the server has the original file to write back into.
+ */
+export function ResultsExportButton({ rows }: Props) {
   const { pushToast } = useToast();
+  const [busy, setBusy] = useState(false);
 
-  function download() {
+  function filenameFrom(res: Response): string {
+    const cd = res.headers.get("content-disposition") || "";
+    const match = /filename\*?=(?:UTF-8'')?"?([^;"]+)"?/i.exec(cd);
+    return match?.[1]?.trim() || `Talent_Social_Lookup_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  }
+
+  async function download() {
     if (rows.length === 0) {
-      pushToast("No rows to export.", "error");
+      pushToast("No results to export yet.", "error");
       return;
     }
+    setBusy(true);
+    try {
+      const jobId = readPythonJobId();
+      const path = jobId
+        ? `/api/export/latest?job_id=${encodeURIComponent(jobId)}`
+        : "/api/export/latest";
+      const res = await authedFetch(path);
 
-    const sheetRows = rows.map((r) => {
-      const row: Record<string, string | number> = {
-        "Talent Name": r.name,
-        "Wikipedia URL": r.wikipediaUrl,
-      };
-      for (const p of RESULT_PLATFORMS) {
-        const cell = r.platforms[p.key];
-        row[p.column] = cell.link;
-        row[`${p.column} Status`] = cell.status;
-        row[`${p.column} Confidence`] = toPercent(cell.confidence);
-        row[`${p.column} Reason`] = cell.reason;
+      if (res.status === 409) {
+        pushToast("That run is still processing — try again in a moment.", "error");
+        return;
       }
-      row["Confidence"] = toPercent(r.confidence);
-      return row;
-    });
+      if (res.status === 404) {
+        pushToast("No export is available for this run yet.", "error");
+        return;
+      }
+      if (!res.ok) {
+        pushToast("Could not download the export. Please try again.", "error");
+        return;
+      }
 
-    const ws = XLSX.utils.json_to_sheet(sheetRows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Social Lookup");
-
-    const fallback = `Talent_Social_Lookup_export_${new Date().toISOString().slice(0, 10)}.xlsx`;
-    const name =
-      sourceFileName && sourceFileName.endsWith(".xlsx")
-        ? sourceFileName.replace(/\.xlsx$/i, "_listenfirst_export.xlsx")
-        : fallback;
-
-    XLSX.writeFile(wb, name);
-    pushToast("Export ready.", "success");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filenameFrom(res);
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      pushToast("Export downloaded.", "success");
+    } catch {
+      pushToast("Could not reach the server to download the export.", "error");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
     <button
       type="button"
-      disabled={rows.length === 0}
+      disabled={rows.length === 0 || busy}
       onClick={download}
       className="lf-btn-primary inline-flex items-center gap-2 px-5 py-3 text-sm disabled:cursor-not-allowed disabled:opacity-50"
     >
       <span className="material-symbols-outlined text-lg">download</span>
-      Export to Excel
+      {busy ? "Preparing…" : "Export to Excel"}
     </button>
   );
 }

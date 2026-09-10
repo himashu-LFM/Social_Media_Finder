@@ -5,7 +5,7 @@ import { fetchAuthStatus, fetchMe, logout, type AuthUser } from "@/lib/auth";
 
 /** Signed-in identity + sign-out, shown at the foot of the sidebar. Renders
  *  nothing when auth is disabled, so it never clutters local dev. */
-export function UserMenu() {
+export function UserMenu({ collapsed = false }: { collapsed?: boolean }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [enforced, setEnforced] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -33,14 +33,23 @@ export function UserMenu() {
     .join("");
 
   return (
-    <div className="mt-3 flex items-center gap-3 rounded-xl border border-white/8 bg-slate-950/40 p-3">
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/15 text-xs font-black text-primary ring-1 ring-primary/25">
+    <div
+      className={`mt-3 flex items-center gap-3 rounded-xl border border-white/8 bg-slate-950/40 p-3 ${
+        collapsed ? "flex-col" : ""
+      }`}
+    >
+      <div
+        title={collapsed ? user.name || user.email : undefined}
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/15 text-xs font-black text-primary ring-1 ring-primary/25"
+      >
         {initials || "?"}
       </div>
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-xs font-bold text-slate-200">{user.name || user.email}</p>
-        <p className="truncate text-[10px] uppercase tracking-wider text-slate-500">{user.role}</p>
-      </div>
+      {!collapsed && (
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-xs font-bold text-slate-200">{user.name || user.email}</p>
+          <p className="truncate text-[10px] uppercase tracking-wider text-slate-500">{user.role}</p>
+        </div>
+      )}
       <button
         type="button"
         disabled={busy}

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppPageHeader } from "@/components/AppPageHeader";
+import { AppMain } from "@/components/AppMain";
 import { AppSidebar } from "@/components/AppSidebar";
 import { authedFetch } from "@/lib/auth";
 import { getPythonApiUrl } from "@/lib/processing-job";
@@ -133,7 +134,7 @@ export function SerperClient() {
       />
       <AppSidebar />
 
-      <main className="relative z-10 flex-1 p-4 pb-32 md:ml-64 md:p-8">
+      <AppMain className="relative z-10 flex-1 p-4 pb-32 md:p-8">
         <AppPageHeader
           title="Serper Result"
           subtitle="Serper + LLM · before Apify backup"
@@ -244,7 +245,7 @@ export function SerperClient() {
             </div>
           </div>
         </div>
-      </main>
+      </AppMain>
 
       <AppMobileNav />
     </div>

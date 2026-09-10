@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { AppMobileNav } from "@/components/AppMobileNav";
 import { AppPageHeader } from "@/components/AppPageHeader";
+import { AppMain } from "@/components/AppMain";
 import { AppSidebar } from "@/components/AppSidebar";
 import { statusTone } from "@/lib/results-mapper";
 import { authedFetch } from "@/lib/auth";
@@ -105,7 +106,7 @@ export default function HistoryPage() {
       />
       <AppSidebar />
 
-      <main className="relative z-10 flex-1 p-4 pb-32 md:ml-64 md:p-8">
+      <AppMain className="relative z-10 flex-1 p-4 pb-32 md:p-8">
         <AppPageHeader title="History" subtitle="Uploads & runs" icon="history" />
 
         <div className="mx-auto max-w-6xl space-y-5">
@@ -256,7 +257,7 @@ export default function HistoryPage() {
             </div>
           </div>
         </div>
-      </main>
+      </AppMain>
 
       <AppMobileNav />
     </div>

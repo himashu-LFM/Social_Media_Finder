@@ -3,19 +3,39 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { MAIN_NAV, isNavActive } from "@/config/navigation";
+import { useSidebarState } from "@/components/SidebarState";
 import { UserMenu } from "@/components/UserMenu";
 
 export function AppSidebar() {
   const pathname = usePathname();
+  const { collapsed, toggle } = useSidebarState();
 
   return (
-    <nav className="fixed left-0 top-0 z-40 hidden h-screen w-64 flex-col gap-1.5 border-r border-white/5 bg-surface/95 p-6 backdrop-blur-xl md:flex">
+    <nav
+      className={`fixed left-0 top-0 z-40 hidden h-screen flex-col gap-1.5 border-r border-white/5 bg-surface/95 p-6 backdrop-blur-xl transition-[width] duration-200 md:flex ${
+        collapsed ? "w-20 items-center px-3" : "w-64"
+      }`}
+    >
+      <button
+        type="button"
+        onClick={toggle}
+        title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        className="lf-card-hover absolute -right-3 top-8 z-50 flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border border-white/10 bg-surface-high text-slate-400 shadow-md transition hover:text-primary"
+      >
+        <span className="material-symbols-outlined text-sm">
+          {collapsed ? "chevron_right" : "chevron_left"}
+        </span>
+      </button>
+
       <Link
         href="/"
-        className="lf-card-hover mb-8 inline-flex cursor-pointer items-center gap-2.5 rounded-xl px-2 py-1 font-[family-name:var(--font-manrope)] text-2xl font-black text-primary"
+        className={`lf-card-hover mb-8 inline-flex cursor-pointer items-center gap-2.5 rounded-xl px-2 py-1 font-[family-name:var(--font-manrope)] text-2xl font-black text-primary ${
+          collapsed ? "justify-center px-0" : ""
+        }`}
       >
-        <span className="inline-block h-2.5 w-2.5 rounded-full bg-primary shadow-[0_0_16px_rgba(242,209,0,0.8)]" />
-        ListenFirst
+        <span className="inline-block h-2.5 w-2.5 shrink-0 rounded-full bg-primary shadow-[0_0_16px_rgba(242,209,0,0.8)]" />
+        {!collapsed && "ListenFirst"}
       </Link>
 
       {MAIN_NAV.map((item) => {
@@ -24,7 +44,10 @@ export function AppSidebar() {
           <Link
             key={item.label}
             href={item.href}
-            className={`lf-card-hover group flex cursor-pointer items-center gap-3 rounded-xl px-4 py-3 text-sm font-medium transition ${
+            title={collapsed ? item.label : undefined}
+            className={`lf-card-hover group flex cursor-pointer items-center gap-3 rounded-xl py-3 text-sm font-medium transition ${
+              collapsed ? "justify-center px-0" : "px-4"
+            } ${
               active
                 ? "bg-primary/10 text-primary shadow-md shadow-primary/10 ring-1 ring-primary/25"
                 : "text-slate-400 hover:bg-white/5 hover:text-slate-100"
@@ -37,30 +60,32 @@ export function AppSidebar() {
             >
               {item.icon}
             </span>
-            <span>{item.label}</span>
-            {active && (
+            {!collapsed && <span>{item.label}</span>}
+            {active && !collapsed && (
               <span className="ml-auto h-1.5 w-1.5 rounded-full bg-primary shadow-[0_0_8px_rgba(242,209,0,0.9)]" />
             )}
           </Link>
         );
       })}
 
-      <div className="mt-auto pt-6">
-        <div className="lf-gradient-border lf-card rounded-xl p-4">
-          <div className="relative z-10">
-            <p className="mb-2 inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-primary">
-              <span className="material-symbols-outlined text-sm">route</span>
-              Pipeline
-            </p>
-            <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
-              <div className="progress-shimmer h-full w-2/3 rounded-full bg-gradient-to-r from-primary-dim to-primary" />
+      <div className="mt-auto w-full pt-6">
+        {!collapsed && (
+          <div className="lf-gradient-border lf-card rounded-xl p-4">
+            <div className="relative z-10">
+              <p className="mb-2 inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-primary">
+                <span className="material-symbols-outlined text-sm">route</span>
+                Pipeline
+              </p>
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                <div className="h-full w-2/3 rounded-full bg-gradient-to-r from-primary-dim to-primary" />
+              </div>
+              <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
+                Search → Validate → Score → Export
+              </p>
             </div>
-            <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
-              Search → Validate → Score → Export
-            </p>
           </div>
-        </div>
-        <UserMenu />
+        )}
+        <UserMenu collapsed={collapsed} />
       </div>
     </nav>
   );
