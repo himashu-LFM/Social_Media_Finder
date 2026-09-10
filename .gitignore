@@ -9,6 +9,12 @@ __pycache__/
 .venv/
 venv/
 
+# Local-only reference material. docs/ holds the deployment runbook and the
+# cost summary; data/ holds sample input workbooks. Neither is needed to build
+# or run the app, and both are kept out of the repo to keep it lean.
+docs/
+data/
+
 # Runtime directories.
 # uploads/ holds uploaded inputs (deleted after each job);
 # exports/ holds generated workbooks — reproduce them by running the pipeline.

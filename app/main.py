@@ -173,7 +173,7 @@ class StartJobBody(BaseModel):
     names: List[str] = Field(..., min_length=1)
     # "wikipedia" (default) or "custom". See search_options for what changes.
     search_mode: str = ""
-    # Custom mode: the free-text SerpApi query prompt + whether to include the
+    # Custom mode: the free-text search prompt + whether to include the
     # file's profession in the query "<name> [<profession>] <prompt>".
     prompt: str = ""
     include_profession: bool = True
@@ -519,7 +519,7 @@ async def start_job_from_upload(file: UploadFile = File(...),
 
     Custom (non-Wikipedia) mode form fields:
       * ``search_mode`` — "wikipedia" (default) or "custom".
-      * ``prompt`` — free-text SerpApi query suffix ("<name> [<profession>] <prompt>").
+      * ``prompt`` — free-text search suffix ("<name> [<profession>] <prompt>").
       * ``include_profession`` — "true"/"false"; include the file's profession in the query.
 
     Use POST /api/upload or POST /api/jobs/upload (both work). The /api/jobs/upload path is

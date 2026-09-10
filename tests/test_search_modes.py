@@ -6,7 +6,7 @@ The load-bearing test in this file is the first one: the user's constraint was
 must render the same query string and apply the same gate it did before custom
 mode existed.
 
-Custom mode itself was redesigned to the SerpApi Google-AI-Mode approach: the
+Custom mode itself was redesigned to the prompt-driven approach: the
 analyst supplies a free-text ``prompt`` and a profession toggle (not a Serper
 query template), and the query built per talent is "<name> [<profession>]
 <prompt>". Serper's own ``build_query`` / template machinery is retained and
@@ -64,7 +64,7 @@ def test_missing_taxonomy_collapses_whitespace():
                           "Instagram", "instagram.com") == "Kako x"
 
 
-# ── custom mode: prompt + profession toggle (the SerpApi approach) ──────────
+# ── custom mode: prompt + profession toggle ────────────────────────────────
 
 def test_custom_mode_carries_prompt_and_profession_flag():
     opts = so.from_request("custom", "  social media handles  ", True)
