@@ -141,7 +141,10 @@ export async function fetchMe(): Promise<AuthUser | null> {
   try {
     const res = await authedFetch("/api/auth/me");
     if (!res.ok) return null;
-    return ((await res.json()) as { user: AuthUser | null }).user;
+    // `?? null` matters: callers distinguish null ("no session") from a user,
+    // and a response without a `user` key would otherwise hand back undefined
+    // — which reads as neither, leaving the rail stuck on its loading dots.
+    return ((await res.json()) as { user?: AuthUser | null }).user ?? null;
   } catch {
     return null;
   }

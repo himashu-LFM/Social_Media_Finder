@@ -76,10 +76,12 @@ export function ResultsExportButton({ rows }: Props) {
       type="button"
       disabled={rows.length === 0 || busy}
       onClick={download}
-      className="lf-btn-primary inline-flex items-center gap-2 px-5 py-3 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+      className="sc-btn accent"
     >
-      <span className="material-symbols-outlined text-lg">download</span>
-      {busy ? "Preparing…" : "Export to Excel"}
+      <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+        download
+      </span>
+      {busy ? "Preparing…" : "Export XLSX"}
     </button>
   );
 }

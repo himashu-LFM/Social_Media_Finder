@@ -1,109 +1,124 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { MAIN_NAV, isNavActive } from "@/config/navigation";
-import { fetchMe } from "@/lib/auth";
-import { useSidebarState } from "@/components/SidebarState";
-import { UserMenu } from "@/components/UserMenu";
+import { fetchMe, logout, type AuthUser } from "@/lib/auth";
 
+/**
+ * The 232px navigation rail, from the Claude Design handoff.
+ *
+ * Differences from the old sidebar, all from the design: it no longer
+ * collapses (the rail is already narrow, and a collapse toggle was one more
+ * piece of state to keep in sync with the main column), the account card is
+ * pinned to the bottom with its own change-password and sign-out buttons, and
+ * the active row is a yellow tint plus a trailing dot rather than a bar.
+ *
+ * Admin-only links are hidden from analysts. That is presentation only — the
+ * API returns 403 to a non-admin whatever the rail shows.
+ */
 export function AppSidebar() {
-  const pathname = usePathname();
-  const { collapsed, toggle } = useSidebarState();
+  const pathname = usePathname() ?? "";
+  const router = useRouter();
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [authOff, setAuthOff] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
 
-  // Admin-only links are hidden from analysts. This is presentation only: the
-  // API returns 403 to a non-admin whatever the sidebar shows.
-  const [isAdmin, setIsAdmin] = useState(false);
   useEffect(() => {
     let alive = true;
     void fetchMe().then((me) => {
-      // null means auth is switched off entirely (local dev) — show everything.
-      if (alive) setIsAdmin(me === null || me.role?.toLowerCase() === "admin");
+      if (!alive) return;
+      // null means auth is switched off entirely (local dev with no database).
+      setAuthOff(me === null);
+      setUser(me);
     });
     return () => {
       alive = false;
     };
   }, []);
 
+  const isAdmin = authOff || user?.role?.toLowerCase() === "admin";
   const items = MAIN_NAV.filter((item) => !item.adminOnly || isAdmin);
 
-  return (
-    <nav
-      className={`fixed left-0 top-0 z-40 hidden h-screen flex-col gap-1.5 border-r border-white/5 bg-surface/95 p-6 backdrop-blur-xl transition-[width] duration-200 md:flex ${
-        collapsed ? "w-20 items-center px-3" : "w-64"
-      }`}
-    >
-      <button
-        type="button"
-        onClick={toggle}
-        title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        className="lf-card-hover absolute -right-3 top-8 z-50 flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border border-white/10 bg-surface-high text-slate-400 shadow-md transition hover:text-primary"
-      >
-        <span className="material-symbols-outlined text-sm">
-          {collapsed ? "chevron_right" : "chevron_left"}
-        </span>
-      </button>
+  const label = user?.name || user?.email || (authOff ? "Local session" : "…");
+  const initials =
+    (user?.name || user?.email || "?")
+      .split(/[\s@._-]+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((p) => p[0]?.toUpperCase())
+      .join("") || "?";
 
-      <Link
-        href="/"
-        className={`lf-card-hover mb-8 inline-flex cursor-pointer items-center gap-2.5 rounded-xl px-2 py-1 font-[family-name:var(--font-manrope)] text-2xl font-black text-primary ${
-          collapsed ? "justify-center px-0" : ""
-        }`}
-      >
-        <span className="inline-block h-2.5 w-2.5 shrink-0 rounded-full bg-primary shadow-[0_0_16px_rgba(242,209,0,0.8)]" />
-        {!collapsed && "ListenFirst"}
+  return (
+    <nav className="sc-rail" aria-label="Main">
+      <Link href="/discovery" className="sc-rail-brand">
+        <span className="sc-rail-dot" aria-hidden />
+        <span className="sc-rail-name">ListenFirst</span>
+        <span className="sc-rail-sub">Scout</span>
       </Link>
 
       {items.map((item) => {
         const active = isNavActive(pathname, item.href);
         return (
           <Link
-            key={item.label}
+            key={item.href}
             href={item.href}
-            title={collapsed ? item.label : undefined}
-            className={`lf-card-hover group flex cursor-pointer items-center gap-3 rounded-xl py-3 text-sm font-medium transition ${
-              collapsed ? "justify-center px-0" : "px-4"
-            } ${
-              active
-                ? "bg-primary/10 text-primary shadow-md shadow-primary/10 ring-1 ring-primary/25"
-                : "text-slate-400 hover:bg-white/5 hover:text-slate-100"
-            }`}
+            className="sc-nav-item"
+            aria-current={active ? "page" : undefined}
           >
-            <span
-              className={`material-symbols-outlined text-[22px] transition-transform group-hover:scale-110 ${
-                active ? "text-primary" : ""
-              }`}
-            >
+            <span className="material-symbols-outlined" style={{ fontSize: 19 }}>
               {item.icon}
             </span>
-            {!collapsed && <span>{item.label}</span>}
-            {active && !collapsed && (
-              <span className="ml-auto h-1.5 w-1.5 rounded-full bg-primary shadow-[0_0_8px_rgba(242,209,0,0.9)]" />
-            )}
+            {item.label}
+            {active ? (
+              <span className="sc-nav-active-dot" aria-hidden />
+            ) : item.adminOnly ? (
+              <span className="sc-nav-tag">Admin</span>
+            ) : null}
           </Link>
         );
       })}
 
-      <div className="mt-auto w-full pt-6">
-        {!collapsed && (
-          <div className="lf-gradient-border lf-card rounded-xl p-4">
-            <div className="relative z-10">
-              <p className="mb-2 inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-primary">
-                <span className="material-symbols-outlined text-sm">route</span>
-                Pipeline
-              </p>
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
-                <div className="h-full w-2/3 rounded-full bg-gradient-to-r from-primary-dim to-primary" />
-              </div>
-              <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
-                Search → Validate → Score → Export
-              </p>
-            </div>
-          </div>
-        )}
-        <UserMenu collapsed={collapsed} />
+      <div className="sc-rail-user">
+        <span className="sc-avatar" aria-hidden>
+          {initials}
+        </span>
+        <span style={{ minWidth: 0, flex: 1 }}>
+          <span className="sc-rail-user-name">{label}</span>
+          <span className="sc-rail-user-role">
+            {authOff ? "No auth" : user?.role || "—"}
+          </span>
+        </span>
+        <Link
+          href="/account/password"
+          aria-label="Change password"
+          title="Change password"
+          className="sc-icon-btn"
+        >
+          <span className="material-symbols-outlined" style={{ fontSize: 17 }}>
+            lock_reset
+          </span>
+        </Link>
+        <button
+          type="button"
+          aria-label="Sign out"
+          title="Sign out"
+          disabled={signingOut}
+          className="sc-icon-btn danger"
+          onClick={async () => {
+            setSigningOut(true);
+            await logout();
+            router.replace("/login");
+          }}
+        >
+          <span
+            className={`material-symbols-outlined${signingOut ? " animate-spin" : ""}`}
+            style={{ fontSize: 17 }}
+          >
+            {signingOut ? "progress_activity" : "logout"}
+          </span>
+        </button>
       </div>
     </nav>
   );

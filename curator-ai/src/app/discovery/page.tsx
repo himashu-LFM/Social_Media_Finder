@@ -1,11 +1,14 @@
-import { AppMain } from "@/components/AppMain";
-import { AppMobileNav } from "@/components/AppMobileNav";
-import { AppPageHeader } from "@/components/AppPageHeader";
-import { AppSidebar } from "@/components/AppSidebar";
+import type { Metadata } from "next";
+import { AppShell, StageStrip } from "@/components/AppShell";
 import { DiscoveryWorkspace } from "@/components/DiscoveryWorkspace";
 import { SearchModeCard } from "@/components/SearchModeCard";
 
-const outputColumns = [
+export const metadata: Metadata = {
+  title: "Discovery | Social Scout",
+  description: "Upload a talent list and start a verification run.",
+};
+
+const OUTPUT_COLUMNS = [
   { label: "Talent Name", icon: "person" },
   { label: "Wikipedia URL", icon: "link" },
   { label: "Instagram", icon: "photo_camera" },
@@ -18,110 +21,170 @@ const outputColumns = [
   { label: "+ Reason (each)", icon: "notes" },
 ];
 
-const pipelineSteps = [
-  { step: "01", text: "Build a rich Wikipedia/Wikidata ground-truth profile (no full page sent to the LLM).", icon: "menu_book" },
-  { step: "02", text: "Apify Social Media Finder discovers Instagram, Facebook, YouTube, TikTok links.", icon: "hub" },
-  { step: "03", text: "Serper extracts context for each link, and finds missing platforms (incl. X).", icon: "travel_explore" },
-  { step: "04", text: "LLM verifies each profile: Verified / Wrong / Manual Review Needed.", icon: "neurology" },
-  { step: "05", text: "Link + status + confidence + reason written to the XLSX export.", icon: "description" },
+const PIPELINE = [
+  "Build a rich Wikipedia/Wikidata ground-truth profile (no full page sent to the LLM).",
+  "Apify Social Media Finder discovers Instagram, Facebook, YouTube, TikTok links.",
+  "Serper extracts context for each link, and finds missing platforms (incl. X).",
+  "LLM verifies each profile: Verified / Wrong / Manual Review Needed.",
+  "Link + status + confidence + reason written to the XLSX export.",
 ];
 
 export default function DiscoveryPage() {
   return (
-    <div className="relative flex min-h-screen flex-col md:flex-row">
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_10%_0%,rgba(242,209,0,0.07),transparent_32%),radial-gradient(circle_at_90%_20%,rgba(56,189,248,0.06),transparent_28%)]"
-      />
-
-      <AppSidebar />
-
-      <AppMain className="relative z-10 min-h-screen flex-1 pb-24 md:pb-0">
-        <AppPageHeader
-          title="Discovery"
-          subtitle="Talent resolver"
-          icon="dashboard"
-          badge={
-            <span className="absolute top-6 right-6 hidden rounded-full border border-primary/35 bg-primary/10 px-3 py-1 text-xs font-semibold text-primary sm:inline-flex">
-              ListenFirst Workspace
+    <AppShell
+      icon="dashboard"
+      eyebrow="Talent resolver"
+      title="Discovery"
+      stages={<StageStrip current="search" note="No run in progress" />}
+      actions={
+        <>
+          <span className="sc-pill">
+            <span
+              className="material-symbols-outlined"
+              style={{ fontSize: 14, color: "#34d399" }}
+            >
+              bolt
             </span>
-       
-          }
-        />
-
-        <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
-          <section className="lf-enter mb-10">
-            <span className="inline-flex items-center gap-2 rounded-full border border-primary/25 bg-primary/10 px-3 py-1 text-xs font-bold uppercase tracking-widest text-primary">
-              <span className="material-symbols-outlined text-sm">auto_awesome</span>
-              AI social resolver
+            API connected
+          </span>
+          <a href="/history" className="sc-btn">
+            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+              history
             </span>
-            <h2 className="mt-4 text-4xl font-extrabold tracking-tight text-slate-50 md:text-5xl">
-               <span className="block text-primary">Find Official Profiles</span>
-            </h2>
-            <p className="mt-4 max-w-2xl text-sm leading-relaxed text-slate-400 md:text-base">
-              Upload a spreadsheet of talent names and Wikipedia URLs. ListenFirst pulls structured
-              identity metadata, finds candidate profiles via Apify (Serper as fallback), verifies
-              each with an LLM, and exports a status- and confidence-scored workbook.
+            Recent runs
+          </a>
+        </>
+      }
+    >
+      <div className="sc-page">
+        <div className="sc-col">
+          <SearchModeCard />
+          <DiscoveryWorkspace />
+
+          <section className="sc-card" style={{ overflow: "hidden" }}>
+            <div className="sc-card-head">
+              <span className="material-symbols-outlined">table_view</span>
+              <h3 className="sc-card-title">Spreadsheet format</h3>
+              <span className="sc-card-note">Row 1 = headers · one talent per row</span>
+            </div>
+            <div className="sc-table-scroll">
+              <table className="sc-table">
+                <thead>
+                  <tr>
+                    <th>Column</th>
+                    <th style={{ padding: "8px 12px" }}>Example</th>
+                    <th>Notes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td style={{ whiteSpace: "nowrap" }}>
+                      <code>Talent Name</code>
+                      <span className="sc-tag-required">required</span>
+                    </td>
+                    <td style={{ padding: "11px 12px", fontWeight: 600, color: "#e2e8f0" }}>
+                      Jake Thompson
+                    </td>
+                    <td>
+                      One person per row. Also accepts: Talent, Name, Title (or first
+                      column).
+                    </td>
+                  </tr>
+                  <tr>
+                    <td style={{ whiteSpace: "nowrap" }}>
+                      <code>Wikipedia URL</code>
+                      <span className="sc-tag-optional">optional</span>
+                    </td>
+                    <td
+                      style={{
+                        padding: "11px 12px",
+                        wordBreak: "break-all",
+                        fontFamily: "ui-monospace, Menlo, monospace",
+                        fontSize: 11,
+                        color: "#cbd5e1",
+                      }}
+                    >
+                      https://en.wikipedia.org/wiki/Jake_Thompson
+                    </td>
+                    <td>
+                      Recommended. Structured identity metadata (profession, nationality,
+                      aliases, known works) is extracted from it to verify each profile.
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section className="sc-card">
+            <div className="sc-card-head">
+              <span className="material-symbols-outlined">view_column</span>
+              <h3 className="sc-card-title">Expected output columns</h3>
+            </div>
+            <div className="sc-card-body sc-chip-row">
+              {OUTPUT_COLUMNS.map((c) => (
+                <span key={c.label} className="sc-chip-lg">
+                  <span className="material-symbols-outlined">{c.icon}</span>
+                  {c.label}
+                </span>
+              ))}
+            </div>
+          </section>
+        </div>
+
+        <aside className="sc-aside">
+          <section className="sc-card">
+            <div className="sc-card-head" style={{ padding: "12px 14px" }}>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+                account_tree
+              </span>
+              <span
+                style={{
+                  fontSize: 10,
+                  fontWeight: 800,
+                  letterSpacing: "0.14em",
+                  textTransform: "uppercase",
+                  color: "#f2d100",
+                }}
+              >
+                Pipeline logic
+              </span>
+            </div>
+            <ol className="sc-steps">
+              {PIPELINE.map((text, i) => (
+                <li key={text}>
+                  <span className="sc-step-n">{String(i + 1).padStart(2, "0")}</span>
+                  <span className="sc-step-text">{text}</span>
+                </li>
+              ))}
+            </ol>
+          </section>
+
+          <section className="sc-note good">
+            <span className="sc-note-label">
+              <span className="material-symbols-outlined" style={{ fontSize: 15 }}>
+                bolt
+              </span>
+              Bio links run first
+            </span>
+            <p>
+              If a row has an Instagram or YouTube handle in the file, that profile is
+              read once and any platform it links to is confirmed straight away — no
+              search, no cost.
             </p>
           </section>
 
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-            <div className="space-y-6 lg:col-span-2">
-              <SearchModeCard />
-
-              <DiscoveryWorkspace />
-
-              <div className="lf-enter lf-enter-delay-1 lf-card lf-card-hover p-6">
-                <div className="mb-4 flex items-center gap-2">
-                  <span className="material-symbols-outlined text-primary">view_column</span>
-                  <h3 className="text-lg font-bold text-slate-100">Expected Output Columns</h3>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {outputColumns.map((col) => (
-                    <span key={col.label} className="lf-chip">
-                      <span className="material-symbols-outlined text-sm text-primary/80">
-                        {col.icon}
-                      </span>
-                      {col.label}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            <div className="space-y-6">
-              <div className="lf-enter lf-enter-delay-2 lf-card lf-card-hover p-6">
-                <div className="mb-4 flex items-center gap-2">
-                  <span className="material-symbols-outlined text-primary">account_tree</span>
-                  <span className="text-xs font-bold uppercase tracking-widest text-primary">
-                    Pipeline Logic
-                  </span>
-                </div>
-                <ul className="space-y-3">
-                  {pipelineSteps.map((item) => (
-                    <li
-                      key={item.step}
-                      className="flex items-start gap-3 rounded-xl bg-slate-950/50 p-3 ring-1 ring-white/5"
-                    >
-                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-xs font-extrabold text-primary ring-1 ring-primary/20">
-                        {item.step}
-                      </span>
-                      <div>
-                        <span className="material-symbols-outlined mb-1 text-base text-primary/80">
-                          {item.icon}
-                        </span>
-                        <p className="text-sm leading-relaxed text-slate-300">{item.text}</p>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-          </div>
-        </div>
-      </AppMain>
-
-      <AppMobileNav />
-    </div>
+          <section className="sc-note">
+            <span className="sc-note-label">Tip</span>
+            <p>
+              A <code className="sc-code">Wikipedia URL</code> greatly improves accuracy —
+              its structured metadata anchors identity so each candidate profile is
+              verified against the right person. Without it, the pipeline falls back to a
+              best-effort name search.
+            </p>
+          </section>
+        </aside>
+      </div>
+    </AppShell>
   );
 }
