@@ -145,6 +145,10 @@ PUBLIC_ROUTES = {
     "/api/auth/login",
     "/api/auth/google",
     "/api/auth/logout",
+    # The reset flow must work for someone who cannot sign in — that is the
+    # whole point of it. Both are rate-limited by the attempt cap on the code.
+    "/api/auth/forgot-password",
+    "/api/auth/reset-password",
 }
 
 
@@ -158,13 +162,57 @@ def test_no_route_is_accidentally_public():
         path = getattr(route, "path", "")
         if not path.startswith("/api") or path in PUBLIC_ROUTES:
             continue
-        params = getattr(getattr(route, "dependant", None), "dependencies", [])
-        names = {getattr(d.call, "__name__", "") for d in params}
-        if "current_user" not in names:
+        if "current_user" not in _dependency_names(getattr(route, "dependant", None)):
             unguarded.append(f"{sorted(route.methods)} {path}")
     assert not unguarded, f"Unauthenticated API routes: {unguarded}"
 
 
+def _dependency_names(dependant) -> set:
+    """
+    Every dependency on a route, including nested ones.
+
+    require_admin depends on current_user rather than repeating its logic, so a
+    check that only looked one level deep would report the admin routes as
+    unauthenticated — and, worse, would miss a genuinely open route hidden
+    behind any other wrapper dependency.
+    """
+    names: set = set()
+    if dependant is None:
+        return names
+    for dep in getattr(dependant, "dependencies", []):
+        name = getattr(dep.call, "__name__", "")
+        if name:
+            names.add(name)
+        names |= _dependency_names(dep)
+    return names
+
+
 def test_the_public_list_has_not_quietly_grown():
     """Adding a route to PUBLIC_ROUTES should be a deliberate, reviewed act."""
-    assert len(PUBLIC_ROUTES) == 5
+    assert len(PUBLIC_ROUTES) == 7
+
+
+def test_there_is_no_public_signup_route():
+    """
+    Accounts are created by an admin, never self-served. A signup endpoint
+    would make the login page an open door to anyone who finds the URL.
+    """
+    paths = {getattr(r, "path", "") for r in api_server.app.routes}
+    for banned in ("/api/auth/signup", "/api/auth/register", "/api/users"):
+        assert banned not in paths
+
+
+def test_every_admin_route_is_behind_the_admin_gate():
+    """
+    current_user alone is not enough on these: any signed-in analyst would be
+    able to create accounts and reset other people's passwords.
+    """
+    ungated = []
+    for route in api_server.app.routes:
+        path = getattr(route, "path", "")
+        if not path.startswith("/api/admin"):
+            continue
+        deps = getattr(getattr(route, "dependant", None), "dependencies", [])
+        if "require_admin" not in {getattr(d.call, "__name__", "") for d in deps}:
+            ungated.append(path)
+    assert not ungated, f"Admin routes without require_admin: {ungated}"

@@ -21,10 +21,11 @@ cheap, a confidently wrong profile in a client dataset is not.
 2. [Running it locally](#2-running-it-locally)
 3. [Environment variables](#3-environment-variables)
 4. [Input format](#4-input-format)
-5. [Code layout](#5-code-layout)
-6. [Guards](#6-guards-that-can-only-downgrade)
-7. [Deployment](#7-deployment)
-8. [Known limitations](#8-known-limitations)
+5. [Accounts and sign-in](#5-accounts-and-sign-in)
+6. [Code layout](#6-code-layout)
+7. [Guards](#7-guards-that-can-only-downgrade)
+8. [Deployment](#8-deployment)
+9. [Known limitations](#9-known-limitations)
 
 ---
 
@@ -156,6 +157,10 @@ Without any LLM key, Wikipedia mode falls back to Manual Review everywhere.
 | `MAX_ROWS_PER_JOB` | `5000` | Upper bound on one run |
 | `AMBIGUITY_GUARD` | on | Set `0` to disable the same-name guard |
 | `THIN_EVIDENCE_MIN_CONFIDENCE` | `85` | Bar for confirming without a Wikipedia record |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | — | Emails reset codes. Without these the flow degrades, never crashes |
+| `APP_BASE_URL` | — | Sign-in link included in emails |
+| `RESET_CODE_TTL_MINUTES` | `10` | How long a reset code lives |
+| `RESET_MAX_ATTEMPTS` | `5` | Wrong guesses before a code is burned |
 
 ### Production only
 
@@ -186,7 +191,62 @@ Any `.xlsx` / `.xls` / `.csv`. Headers are detected rather than fixed:
 
 ---
 
-## 5. Code layout
+## 5. Accounts and sign-in
+
+**There is no public sign-up.** An admin creates every account from
+**Users** in the sidebar; the API has no registration endpoint at all, and a
+test fails the build if one appears. An internal tool with open registration is
+an open door to anyone who finds the URL, and "we'll lock it down later" never
+happens.
+
+### Creating an account
+
+Users → *Create an account* → email + role. The server generates a temporary
+password and shows it **once** — it is stored only as an Argon2id hash, so
+nobody, including the admin, can read it back. Lost it? *Reset password* issues
+a new one.
+
+The holder signs in with that temporary password and is sent straight to
+*Choose your password* with no way past it. That is what stops a temporary
+password quietly becoming a permanent one that two people know.
+
+### Forgotten passwords
+
+Self-service, from the sign-in page: request a **6-digit code by email**, then
+enter it with a new password. Six digits is only a million possibilities, so
+three rules do the real work — the code **expires in 10 minutes**, dies after
+**5 wrong attempts**, and is **deleted on use** so it cannot be replayed. Only
+its SHA-256 is stored.
+
+Without SMTP configured the flow still works: in development the code is
+printed to the server log (never in production), and an admin can always issue
+a fresh temporary password instead.
+
+### The first account
+
+Chicken and egg — only an admin can create accounts, so the first one is made
+on the command line:
+
+```bash
+python scripts/create_user.py --admin
+```
+
+It prompts for the email and password (with `getpass`, so the password never
+reaches your shell history) and checks the migrations are in place first. With
+no admin in the database yet it defaults to `admin` even without the flag —
+an analyst could not create anyone else, so the tool would have no way to grow.
+
+Everyone after that is created in the app.
+
+### Roles
+
+`analyst` runs the pipeline and records decisions. `admin` also manages
+accounts. The API enforces this — hiding the sidebar link is a courtesy, and a
+`curl` with an analyst's token gets `403`.
+
+---
+
+## 6. Code layout
 
 Grouped by responsibility, so new work has an obvious home.
 
@@ -203,7 +263,7 @@ Grouped by responsibility, so new work has an obvious home.
 | `app/common/` | shared HTTP retry/session | cross-cutting utils |
 | `scripts/` | admin CLI (`create_user.py`) | admin scripts |
 | `sql/` | schema, run in numeric order | |
-| `tests/` | 177 tests, no network | |
+| `tests/` | 197 tests, no network | |
 | `curator-ai/` | Next.js 16 UI — discovery, live progress, results, analysis | |
 
 **Start at `app/pipeline/orchestrator.py`** — it routes the two workflows and
@@ -235,7 +295,7 @@ Frontend:
 
 ---
 
-## 6. Guards that can only downgrade
+## 7. Guards that can only downgrade
 
 The LLM never has the last word on a `Verified`. Each guard can move a verdict to
 Manual Review, **never the reverse** — so a guard misfiring costs coverage but
@@ -258,7 +318,7 @@ assert "this belongs to someone else" from a name and a category alone.
 
 ---
 
-## 7. Deployment
+## 8. Deployment
 
 - **Frontend** — AWS Amplify, static export (`output: "export"`). The Amplify app
   platform must be `WEB`, not `WEB_COMPUTE`: Amplify's compute service supports
@@ -274,7 +334,7 @@ Full runbook, including the outbound-scraping caveat on AWS IPs, is in
 
 ---
 
-## 8. Known limitations
+## 9. Known limitations
 
 - **Instagram, TikTok and X expose almost no metadata** to an anonymous fetch, so
   those columns carry more Manual Reviews. The Apify Instagram reader covers the

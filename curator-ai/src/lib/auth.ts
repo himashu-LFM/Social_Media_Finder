@@ -3,7 +3,22 @@ import { getPythonApiUrl } from "@/lib/processing-job";
 
 const TOKEN_KEY = "curator-ai-auth-token-v1";
 
-export type AuthUser = { id: number; email: string; name: string; role: string };
+export type AuthUser = {
+  id: number;
+  email: string;
+  name: string;
+  role: string;
+  /** Set on an admin-issued temporary password. The app is unusable until the
+   *  holder replaces it — otherwise a temp password is just a password, known
+   *  to whoever typed it. */
+  must_change_password?: boolean;
+};
+
+export type AdminUser = AuthUser & {
+  is_active: boolean;
+  last_login_at: string | null;
+  created_at: string;
+};
 export type AuthStatus = {
   auth_available: boolean;
   auth_required: boolean;
@@ -129,5 +144,122 @@ export async function fetchMe(): Promise<AuthUser | null> {
     return ((await res.json()) as { user: AuthUser | null }).user;
   } catch {
     return null;
+  }
+}
+
+// ── password reset ──────────────────────────────────────────────────────────
+//
+// These two are public by necessity: someone who cannot sign in has to be able
+// to use them. Both go through the API directly rather than authedFetch, which
+// would attach a token they do not have.
+
+async function publicPost<T>(path: string, body: unknown): Promise<T> {
+  const api = getPythonApiUrl();
+  if (!api) throw new Error("NEXT_PUBLIC_PYTHON_API_URL is not set.");
+  const res = await fetch(`${api}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = `Request failed (${res.status})`;
+    try {
+      detail = ((await res.json()) as { detail?: string }).detail ?? detail;
+    } catch {
+      /* non-JSON */
+    }
+    throw new Error(detail);
+  }
+  return (await res.json()) as T;
+}
+
+/** Ask for a 6-digit code by email. Throws with the server's message. */
+export function requestPasswordCode(email: string) {
+  return publicPost<{ ok: boolean; emailed: boolean; expires_in_minutes: number }>(
+    "/api/auth/forgot-password",
+    { email: email.trim().toLowerCase() },
+  );
+}
+
+/** Redeem the code and set a new password. */
+export function resetPassword(email: string, code: string, newPassword: string) {
+  return publicPost<{ ok: boolean; detail: string }>("/api/auth/reset-password", {
+    email: email.trim().toLowerCase(),
+    code: code.trim(),
+    new_password: newPassword,
+  });
+}
+
+/**
+ * Change your own password — also how a temporary one is retired.
+ *
+ * The server ends every session on success, including this one, so the caller
+ * must send the user back to sign in rather than carrying on.
+ */
+export async function changePassword(currentPassword: string, newPassword: string) {
+  const res = await authedFetch("/api/auth/change-password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  });
+  if (!res.ok) {
+    let detail = `Could not change the password (${res.status}).`;
+    try {
+      detail = ((await res.json()) as { detail?: string }).detail ?? detail;
+    } catch {
+      /* non-JSON */
+    }
+    throw new Error(detail);
+  }
+  setToken(null);   // the server revoked every session, this one included
+  return (await res.json()) as { ok: boolean; detail: string };
+}
+
+// ── admin ───────────────────────────────────────────────────────────────────
+// The server enforces the admin role; hiding the UI is only courtesy.
+
+export async function adminListUsers(): Promise<AdminUser[]> {
+  const res = await authedFetch("/api/admin/users");
+  if (!res.ok) throw new Error(await detailOf(res, "Could not load users."));
+  return ((await res.json()) as { users: AdminUser[] }).users ?? [];
+}
+
+export async function adminCreateUser(input: {
+  email: string;
+  name?: string;
+  role?: string;
+  temp_password?: string;
+}): Promise<{ user: AdminUser; temp_password: string; emailed: boolean }> {
+  const res = await authedFetch("/api/admin/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await detailOf(res, "Could not create the account."));
+  return (await res.json()) as { user: AdminUser; temp_password: string; emailed: boolean };
+}
+
+export async function adminResetPassword(userId: number): Promise<string> {
+  const res = await authedFetch(`/api/admin/users/${userId}/reset-password`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(await detailOf(res, "Could not reset the password."));
+  return ((await res.json()) as { temp_password: string }).temp_password;
+}
+
+export async function adminSetActive(userId: number, isActive: boolean): Promise<void> {
+  const res = await authedFetch(`/api/admin/users/${userId}/active`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ is_active: isActive }),
+  });
+  if (!res.ok) throw new Error(await detailOf(res, "Could not update the account."));
+}
+
+async function detailOf(res: Response, fallback: string): Promise<string> {
+  try {
+    return ((await res.json()) as { detail?: string }).detail ?? fallback;
+  } catch {
+    return fallback;
   }
 }

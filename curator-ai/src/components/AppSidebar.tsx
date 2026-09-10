@@ -2,13 +2,31 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
 import { MAIN_NAV, isNavActive } from "@/config/navigation";
+import { fetchMe } from "@/lib/auth";
 import { useSidebarState } from "@/components/SidebarState";
 import { UserMenu } from "@/components/UserMenu";
 
 export function AppSidebar() {
   const pathname = usePathname();
   const { collapsed, toggle } = useSidebarState();
+
+  // Admin-only links are hidden from analysts. This is presentation only: the
+  // API returns 403 to a non-admin whatever the sidebar shows.
+  const [isAdmin, setIsAdmin] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    void fetchMe().then((me) => {
+      // null means auth is switched off entirely (local dev) — show everything.
+      if (alive) setIsAdmin(me === null || me.role?.toLowerCase() === "admin");
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const items = MAIN_NAV.filter((item) => !item.adminOnly || isAdmin);
 
   return (
     <nav
@@ -38,7 +56,7 @@ export function AppSidebar() {
         {!collapsed && "ListenFirst"}
       </Link>
 
-      {MAIN_NAV.map((item) => {
+      {items.map((item) => {
         const active = isNavActive(pathname, item.href);
         return (
           <Link

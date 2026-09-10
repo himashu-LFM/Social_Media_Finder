@@ -73,12 +73,16 @@ export function GoogleSignInButton({
       },
       cancel_on_tap_outside: true,
     });
+    // Google renders this button itself and permits only these knobs, so it
+    // cannot match the mock exactly. Squared corners and the card's own width
+    // get it close; Google's branding terms want their button to look like
+    // their button, so this is the right place to stop.
     api.renderButton(target.current, {
       theme: "filled_black",
       size: "large",
-      shape: "pill",
+      shape: "rectangular",
       text: "signin_with",
-      width: 320,
+      width: 372,
     });
   }, [clientId]);
 

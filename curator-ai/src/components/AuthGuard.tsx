@@ -2,7 +2,9 @@
 
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
+import Image from "next/image";
 import { fetchAuthStatus, fetchMe, getToken, type AuthUser } from "@/lib/auth";
+import "@/app/auth-design.css";
 
 /**
  * Gates the app behind sign-in when the backend enforces auth. If auth is off
@@ -48,21 +50,39 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     };
   }, [router, pathname, isPublic]);
 
-  // Public routes render immediately — no session check, no spinner.
+  // Public routes render immediately — no session check, no splash.
   if (!isPublic && (!ready || !allowed)) {
-    return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="flex flex-col items-center gap-4">
-          <div className="relative h-12 w-12">
-            <div className="absolute inset-0 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
-            <span className="material-symbols-outlined absolute inset-0 flex items-center justify-center text-primary">
-              lock
-            </span>
-          </div>
-          <p className="text-sm font-semibold text-slate-500">Checking your session…</p>
-        </div>
-      </div>
-    );
+    return <SessionSplash />;
   }
   return <>{children}</>;
+}
+
+/**
+ * Shown while the session is being confirmed, before every protected page.
+ *
+ * This is on screen for a few hundred milliseconds, so it has to read as
+ * "loading" instantly. The mark at the centre does that work — a bare spinner
+ * on a dark page looks like something has gone wrong, whereas the logo makes
+ * the same wait look intentional. Styles live in auth-design.css so it shares
+ * the sign-in screen's palette rather than being a third look.
+ */
+function SessionSplash() {
+  return (
+    <div className="ss-splash" role="status" aria-live="polite">
+      <div className="ss-splash-inner">
+        <div className="ss-splash-ring">
+          <div className="ss-splash-mark">
+            <Image src="/listenfirst-mark.jpg" alt="" width={48} height={48} priority />
+          </div>
+        </div>
+        <p className="ss-splash-text">Checking your session</p>
+        <div className="ss-splash-dots" aria-hidden>
+          <i />
+          <i />
+          <i />
+        </div>
+      </div>
+      <span className="sr-only">Loading</span>
+    </div>
+  );
 }

@@ -30,7 +30,8 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
 
-from app.persistence import auth as auth_service  # noqa: E402  — after dotenv so DATABASE_URL loads
+from app.persistence import auth as auth_service
+from app.persistence import emailer  # noqa: E402  — after dotenv so DATABASE_URL loads
 from app.persistence import db as db_service  # noqa: E402  — after dotenv so DATABASE_URL loads
 from app.pipeline import options as search_options  # noqa: E402
 from app.pipeline import orchestrator as testing  # noqa: E402  — after dotenv so keys load
@@ -123,6 +124,7 @@ async def _lifespan(app: FastAPI):
         )
 
     purged = auth_service.purge_expired_sessions()
+    auth_service.purge_expired_reset_codes()
     if purged:
         print(f"[api_server] Purged {purged} expired session(s).")
     if auth_service.enforced():
@@ -436,6 +438,88 @@ def auth_login(body: LoginBody, request: Request) -> dict[str, Any]:
     return {"user": user, **session}
 
 
+class ForgotPasswordBody(BaseModel):
+    email: str = Field(..., min_length=3)
+
+
+class ResetPasswordBody(BaseModel):
+    email: str = Field(..., min_length=3)
+    code: str = Field(..., min_length=4, max_length=10)
+    new_password: str = Field(..., min_length=1)
+
+
+class ChangePasswordBody(BaseModel):
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=1)
+
+
+@app.post("/api/auth/forgot-password")
+def auth_forgot_password(body: ForgotPasswordBody) -> dict[str, Any]:
+    """
+    Email a 6-digit reset code.
+
+    This tells the caller when an address is not registered. That is an email
+    enumeration leak, and it is a deliberate trade for an internal tool where
+    accounts are created by an admin: an analyst mistyping their own address
+    should be told so, not left waiting for an email that will never arrive.
+    Returning 200 unconditionally would be the right call for a public product.
+    """
+    if not auth_service.is_available():
+        raise HTTPException(status_code=503, detail="Accounts are unavailable.")
+    email = body.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
+    code = auth_service.create_reset_code(email)
+    if not code:
+        raise HTTPException(status_code=404, detail="That email is not registered.")
+
+    # Best-effort: the code is already stored, so a mail failure must not read
+    # as "no reset in progress". Without SMTP configured in development the
+    # emailer logs the code instead so the flow stays testable.
+    emailed = emailer.send_reset_code(email, code, auth_service.RESET_CODE_TTL_MINUTES)
+    return {"ok": True, "emailed": emailed,
+            "expires_in_minutes": auth_service.RESET_CODE_TTL_MINUTES}
+
+
+@app.post("/api/auth/reset-password")
+def auth_reset_password(body: ResetPasswordBody) -> dict[str, Any]:
+    """Verify the emailed code and set a new password."""
+    ok, message, status = auth_service.redeem_reset_code(
+        body.email, body.code, body.new_password)
+    if not ok:
+        raise HTTPException(status_code=status, detail=message)
+    return {"ok": True, "detail": message}
+
+
+@app.post("/api/auth/change-password")
+def auth_change_password(body: ChangePasswordBody,
+                         user: Optional[Dict[str, Any]] = Depends(current_user)
+                         ) -> dict[str, Any]:
+    """
+    Change your own password. This is also how a temporary password is retired.
+
+    The current password is re-checked here even though the caller already holds
+    a valid session: a session left open on a shared machine should not be
+    enough to lock the real owner out of their account.
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
+    if not auth_service.authenticate(user["email"], body.current_password):
+        raise HTTPException(status_code=400, detail="Your current password is not correct.")
+    try:
+        changed = auth_service.set_password(int(user["id"]), body.new_password,
+                                            must_change=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not changed:
+        raise HTTPException(status_code=500, detail="Could not update the password.")
+    # set_password revoked every session, including this one, so the client must
+    # sign in again with the new password.
+    return {"ok": True, "detail": "Password changed. Please sign in again.",
+            "signed_out": True}
+
+
 @app.post("/api/auth/logout")
 def auth_logout(authorization: Optional[str] = Header(default=None)) -> dict[str, str]:
     auth_service.end_session(_bearer(authorization))
@@ -445,6 +529,131 @@ def auth_logout(authorization: Optional[str] = Header(default=None)) -> dict[str
 @app.get("/api/auth/me")
 def auth_me(user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     return {"user": user}
+
+
+# ── admin: accounts ─────────────────────────────────────────────────────────
+#
+# There is no public sign-up endpoint anywhere in this API. Accounts exist only
+# because an admin created them here. That is the answer to "who may sign up?",
+# decided up front rather than left to be locked down later.
+
+
+def require_admin(user: Optional[Dict[str, Any]] = Depends(current_user)
+                  ) -> Optional[Dict[str, Any]]:
+    """
+    Admin gate. Depends on current_user, so it inherits the 401 and the
+    production fail-closed behaviour rather than re-implementing them.
+
+    Returns None when auth is not enforced at all (local development with no
+    database) — the same convention current_user uses, so the admin screens are
+    usable on a laptop without a Postgres instance.
+    """
+    if not auth_service.enforced():
+        return None
+    if not auth_service.is_admin(user):
+        # 403, not 401: the caller IS signed in, they simply are not an admin.
+        # Returning 401 would bounce them to the login page in a loop.
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    return user
+
+
+class CreateUserBody(BaseModel):
+    email: str = Field(..., min_length=3)
+    name: str = ""
+    role: str = "analyst"
+    # Optional. Left empty, the server generates one — which is the better path,
+    # because an admin choosing passwords tends to choose the same one twice.
+    temp_password: str = ""
+
+
+class SetActiveBody(BaseModel):
+    is_active: bool
+
+
+@app.get("/api/admin/users")
+def admin_list_users(user: Optional[Dict[str, Any]] = Depends(require_admin)
+                     ) -> dict[str, Any]:
+    return {"users": auth_service.list_users()}
+
+
+@app.post("/api/admin/users")
+def admin_create_user(body: CreateUserBody,
+                      user: Optional[Dict[str, Any]] = Depends(require_admin)
+                      ) -> dict[str, Any]:
+    """
+    Create an account with a temporary password.
+
+    The temporary password is returned in this response ONCE, because with no
+    SMTP configured it is the only way the admin can pass it on. It is never
+    stored in readable form and never appears again — a second look means
+    issuing a new one.
+    """
+    if not auth_service.is_available():
+        raise HTTPException(status_code=503, detail="Accounts are unavailable.")
+    email = body.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
+    temp_password = body.temp_password.strip() or auth_service.generate_temp_password()
+    try:
+        created = auth_service.create_user(
+            email=email, password=temp_password, name=body.name.strip(),
+            role=body.role.strip().lower() or "analyst",
+            must_change_password=True,      # a temp password must not become permanent
+            created_by=_uid(user),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502,
+                            detail=f"{exc.__class__.__name__}: {exc}") from exc
+
+    emailed = emailer.send_account_created(
+        email, temp_password if emailer.is_configured() else None)
+    return {"ok": True, "user": created, "temp_password": temp_password,
+            "emailed": emailed}
+
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+def admin_reset_password(user_id: int,
+                         user: Optional[Dict[str, Any]] = Depends(require_admin)
+                         ) -> dict[str, Any]:
+    """
+    Issue a fresh temporary password for someone who cannot get in.
+
+    This is the path that works with no SMTP at all, which is why it exists
+    alongside the emailed-code flow: the admin reads the new password off the
+    screen and hands it over.
+    """
+    temp_password = auth_service.generate_temp_password()
+    try:
+        ok = auth_service.set_password(user_id, temp_password, must_change=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not ok:
+        raise HTTPException(status_code=404, detail="No such account.")
+    return {"ok": True, "temp_password": temp_password}
+
+
+@app.post("/api/admin/users/{user_id}/active")
+def admin_set_active(user_id: int, body: SetActiveBody,
+                     user: Optional[Dict[str, Any]] = Depends(require_admin)
+                     ) -> dict[str, Any]:
+    """Enable or disable an account. Disabling revokes its sessions immediately."""
+    if user and int(user.get("id", 0)) == user_id and not body.is_active:
+        raise HTTPException(status_code=400,
+                            detail="You cannot deactivate your own account.")
+    # Refuse the change that would leave the tool with no way back in.
+    if not body.is_active and auth_service.admin_count() <= 1:
+        target = next((u for u in auth_service.list_users()
+                       if int(u["id"]) == user_id), None)
+        if target and str(target.get("role", "")).lower() == "admin":
+            raise HTTPException(status_code=400,
+                                detail="This is the last active admin — promote "
+                                       "someone else first.")
+    if not auth_service.set_active(user_id, body.is_active):
+        raise HTTPException(status_code=404, detail="No such account.")
+    return {"ok": True, "is_active": body.is_active}
 
 
 # ── history ─────────────────────────────────────────────────────────────────

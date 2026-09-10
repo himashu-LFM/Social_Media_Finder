@@ -113,33 +113,48 @@ def _token_hash(token: str) -> str:
 
 # ── accounts ────────────────────────────────────────────────────────────────
 
-def create_user(email: str, password: str, name: str = "", role: str = "analyst") -> Dict[str, Any]:
+MIN_PASSWORD_LENGTH = 10
+
+
+def create_user(email: str, password: str, name: str = "", role: str = "analyst",
+                must_change_password: bool = False,
+                created_by: Optional[int] = None) -> Dict[str, Any]:
     """
     Create an account. The password is hashed here and immediately discarded —
     it is never written to the database, a log, or the return value.
+
+    ``must_change_password`` is what makes an admin-issued temporary password
+    temporary: the holder cannot use the application until they replace it.
+    Without it, whoever typed the temp password can sign in as that person for
+    as long as the account exists.
     """
     if _hasher is None:
         raise RuntimeError("argon2-cffi is not installed — cannot hash passwords.")
     email = (email or "").strip().lower()
     if not email or "@" not in email:
         raise ValueError("A valid email address is required.")
-    if len(password or "") < 10:
-        raise ValueError("Password must be at least 10 characters.")
+    if len(password or "") < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+    if role not in ("analyst", "admin"):
+        raise ValueError("Role must be 'analyst' or 'admin'.")
 
     digest = _hasher.hash(password)
     with db_service._connection() as conn, conn.cursor(row_factory=db_service.dict_row) as cur:
         cur.execute(
             """
-            INSERT INTO app_user (email, name, password_hash, role)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO app_user (email, name, password_hash, role,
+                                  must_change_password, created_by)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (lower(email)) DO UPDATE
-                SET password_hash = EXCLUDED.password_hash,
-                    name          = COALESCE(NULLIF(EXCLUDED.name, ''), app_user.name),
-                    role          = EXCLUDED.role,
-                    is_active     = TRUE
-            RETURNING id, email, name, role
+                SET password_hash        = EXCLUDED.password_hash,
+                    name                 = COALESCE(NULLIF(EXCLUDED.name, ''), app_user.name),
+                    role                 = EXCLUDED.role,
+                    must_change_password = EXCLUDED.must_change_password,
+                    is_active            = TRUE
+            RETURNING id, email, name, role, must_change_password
             """,
-            (email, (name or "").strip(), digest, role),
+            (email, (name or "").strip(), digest, role,
+             bool(must_change_password), created_by),
         )
         return dict(cur.fetchone())
 
@@ -152,8 +167,8 @@ def authenticate(email: str, password: str) -> Optional[Dict[str, Any]]:
     try:
         with db_service._connection() as conn, conn.cursor(row_factory=db_service.dict_row) as cur:
             cur.execute(
-                "SELECT id, email, name, role, password_hash, is_active "
-                "FROM app_user WHERE lower(email) = %s", (email,))
+                "SELECT id, email, name, role, password_hash, is_active, "
+                "must_change_password FROM app_user WHERE lower(email) = %s", (email,))
             row = cur.fetchone()
     except Exception as exc:  # noqa: BLE001
         print(f"  [AUTH] lookup failed: {exc.__class__.__name__}")
@@ -182,7 +197,9 @@ def authenticate(email: str, password: str) -> Optional[Dict[str, Any]]:
             cur.execute("UPDATE app_user SET last_login_at = now() WHERE id = %s", (row["id"],))
     except Exception:  # noqa: BLE001 — a stamp failure must not block sign-in
         pass
-    return {"id": row["id"], "email": row["email"], "name": row["name"], "role": row["role"]}
+    return {"id": row["id"], "email": row["email"], "name": row["name"],
+            "role": row["role"],
+            "must_change_password": bool(row.get("must_change_password"))}
 
 
 # ── sessions ────────────────────────────────────────────────────────────────
@@ -207,7 +224,7 @@ def user_for_token(token: str) -> Optional[Dict[str, Any]]:
         with db_service._connection() as conn, conn.cursor(row_factory=db_service.dict_row) as cur:
             cur.execute(
                 """
-                SELECT u.id, u.email, u.name, u.role
+                SELECT u.id, u.email, u.name, u.role, u.must_change_password
                 FROM user_session s JOIN app_user u ON u.id = s.user_id
                 WHERE s.token_hash = %s AND s.expires_at > now() AND u.is_active
                 """, (_token_hash(token),))
@@ -349,6 +366,232 @@ def google_sign_in(id_token_str: str) -> tuple[Optional[Dict[str, Any]], str]:
     # through Argon2 verify, which rejects an empty hash — so a Google account
     # cannot be signed into with a password. That is intentional.
     return user, ""
+
+
+# ── admin: managing accounts from the portal ────────────────────────────────
+#
+# There is no public sign-up. Someone with the `admin` role creates accounts,
+# and every new account starts with a temporary password it must replace. That
+# is deliberate: an internal tool with an open registration endpoint is an open
+# door, and "we'll lock it down later" never happens.
+
+
+def is_admin(user: Optional[Dict[str, Any]]) -> bool:
+    return bool(user) and str(user.get("role", "")).lower() == "admin"
+
+
+def generate_temp_password(length: int = 14) -> str:
+    """
+    A readable one-time password.
+
+    Deliberately drops characters that get misread when someone copies a
+    password off a screen or out of an email — no O/0, no l/1/I. The password is
+    long enough that losing them costs nothing, and it is replaced on first
+    sign-in anyway.
+    """
+    alphabet = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet)
+                   for _ in range(max(MIN_PASSWORD_LENGTH, length)))
+
+
+def list_users() -> list:
+    """Every account, for the admin screen. Never returns a password hash."""
+    if not is_available():
+        return []
+    try:
+        with db_service._connection() as conn, conn.cursor(row_factory=db_service.dict_row) as cur:
+            cur.execute(
+                "SELECT id, email, name, role, is_active, must_change_password, "
+                "last_login_at, created_at FROM app_user "
+                "ORDER BY created_at DESC, id DESC")
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [AUTH] list_users failed: {exc.__class__.__name__}")
+        return []
+
+
+def set_password(user_id: int, new_password: str, must_change: bool = False) -> bool:
+    """
+    Replace an account's password, and end every session that account has.
+
+    Signing the other sessions out is the point: if the reason for changing the
+    password is that someone else knows the old one, leaving their session alive
+    achieves nothing.
+    """
+    if _hasher is None or not is_available():
+        return False
+    if len(new_password or "") < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+    digest = _hasher.hash(new_password)
+    try:
+        with db_service._connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE app_user SET password_hash = %s, must_change_password = %s "
+                "WHERE id = %s", (digest, bool(must_change), user_id))
+            changed = cur.rowcount or 0
+            cur.execute("DELETE FROM user_session WHERE user_id = %s", (user_id,))
+        return changed > 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [AUTH] set_password failed: {exc.__class__.__name__}")
+        return False
+
+
+def set_active(user_id: int, active: bool) -> bool:
+    """Enable or disable an account. Disabling also revokes its sessions."""
+    if not is_available():
+        return False
+    try:
+        with db_service._connection() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE app_user SET is_active = %s WHERE id = %s",
+                        (bool(active), user_id))
+            changed = cur.rowcount or 0
+            if not active:
+                cur.execute("DELETE FROM user_session WHERE user_id = %s", (user_id,))
+        return changed > 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [AUTH] set_active failed: {exc.__class__.__name__}")
+        return False
+
+
+def admin_count() -> int:
+    """Used to refuse any change that would leave nobody able to administer."""
+    if not is_available():
+        return 0
+    try:
+        with db_service._connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM app_user WHERE is_active AND role = 'admin'")
+            return int(cur.fetchone()[0])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+# ── password reset by emailed code ──────────────────────────────────────────
+#
+# Six digits is a million possibilities, which sounds like plenty and is not:
+# unthrottled it falls in minutes. The attempt cap is what makes this safe, not
+# the length of the code. Three rules are load-bearing — expiry, the cap, and
+# deleting the record on success so a code cannot be replayed.
+
+RESET_CODE_TTL_MINUTES = max(1, int(os.environ.get("RESET_CODE_TTL_MINUTES", "10")))
+RESET_MAX_ATTEMPTS = max(1, int(os.environ.get("RESET_MAX_ATTEMPTS", "5")))
+
+
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def create_reset_code(email: str) -> Optional[str]:
+    """
+    Issue a reset code for a registered address, or None if it is not one.
+
+    Returns the plaintext code for the caller to email; only its hash is stored.
+    The primary key on email means a new request REPLACES any live code, so
+    nobody can bank valid codes by requesting repeatedly.
+    """
+    email = (email or "").strip().lower()
+    if not email or not is_available():
+        return None
+    if not _existing_user(email):
+        return None
+
+    code = f"{secrets.randbelow(1_000_000):06d}"      # CSPRNG, not random.randint
+    expires = datetime.now(timezone.utc) + timedelta(minutes=RESET_CODE_TTL_MINUTES)
+    try:
+        with db_service._connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pw_reset_codes (email, code_hash, expires_at, attempts)
+                VALUES (%s, %s, %s, 0)
+                ON CONFLICT (email) DO UPDATE
+                    SET code_hash  = EXCLUDED.code_hash,
+                        expires_at = EXCLUDED.expires_at,
+                        attempts   = 0,
+                        created_at = now()
+                """, (email, _code_hash(code), expires))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [AUTH] could not store reset code: {exc.__class__.__name__}")
+        return None
+    return code
+
+
+def _delete_reset_code(email: str) -> None:
+    try:
+        with db_service._connection() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM pw_reset_codes WHERE email = %s", (email,))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def redeem_reset_code(email: str, code: str, new_password: str) -> tuple:
+    """
+    Verify a code and set the new password.
+
+    Returns ``(ok, message, status)``. The status separates the cases a client
+    must handle differently: 429 means the code was burned by too many wrong
+    guesses and a fresh one is needed; 400 means try again.
+    """
+    # Normalise on read AND write, or a capitalised retry silently misses the row.
+    email = (email or "").strip().lower()
+    code = (code or "").strip()
+    if not is_available():
+        return False, "Accounts are unavailable.", 503
+    if len(new_password or "") < MIN_PASSWORD_LENGTH:
+        return False, f"Password must be at least {MIN_PASSWORD_LENGTH} characters.", 400
+
+    try:
+        with db_service._connection() as conn, conn.cursor(row_factory=db_service.dict_row) as cur:
+            cur.execute("SELECT code_hash, expires_at, attempts FROM pw_reset_codes "
+                        "WHERE email = %s", (email,))
+            row = cur.fetchone()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [AUTH] reset lookup failed: {exc.__class__.__name__}")
+        return False, "Could not verify that code. Please try again.", 500
+
+    if not row:
+        return False, "No reset in progress for that address. Request a new code.", 400
+    if row["expires_at"] <= datetime.now(timezone.utc):
+        _delete_reset_code(email)
+        return False, "That code has expired. Request a new one.", 400
+    if int(row["attempts"]) >= RESET_MAX_ATTEMPTS:
+        _delete_reset_code(email)
+        return False, "Too many incorrect attempts. Request a new code.", 429
+
+    if not secrets.compare_digest(row["code_hash"], _code_hash(code)):
+        # The record SURVIVES a wrong guess — only the counter moves. Deleting
+        # here would let anyone cancel someone else's reset with one bad guess.
+        try:
+            with db_service._connection() as conn, conn.cursor() as cur:
+                cur.execute("UPDATE pw_reset_codes SET attempts = attempts + 1 "
+                            "WHERE email = %s", (email,))
+        except Exception:  # noqa: BLE001
+            pass
+        left = RESET_MAX_ATTEMPTS - int(row["attempts"]) - 1
+        if left > 0:
+            return False, f"That code is not correct. {left} attempt(s) left.", 400
+        return False, "Too many incorrect attempts. Request a new code.", 400
+
+    user = _existing_user(email)
+    if not user:
+        _delete_reset_code(email)
+        return False, "That account no longer exists.", 404
+    if not set_password(int(user["id"]), new_password, must_change=False):
+        return False, "Could not update the password. Please try again.", 500
+
+    # Single use: without this delete, the same code resets the account again.
+    _delete_reset_code(email)
+    return True, "Password updated. You can sign in now.", 200
+
+
+def purge_expired_reset_codes() -> int:
+    """Housekeeping at startup, mirroring purge_expired_sessions()."""
+    if not is_available():
+        return 0
+    try:
+        with db_service._connection() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM pw_reset_codes WHERE expires_at < now()")
+            return cur.rowcount or 0
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def user_count() -> int:

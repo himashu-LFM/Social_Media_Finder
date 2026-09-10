@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+
 import { useEffect, useState } from "react";
 import { fetchAuthStatus, fetchMe, logout, type AuthUser } from "@/lib/auth";
 
@@ -50,6 +52,14 @@ export function UserMenu({ collapsed = false }: { collapsed?: boolean }) {
           <p className="truncate text-[10px] uppercase tracking-wider text-slate-500">{user.role}</p>
         </div>
       )}
+      <Link
+        href="/account/password"
+        aria-label="Change password"
+        title="Change password"
+        className="cursor-pointer rounded-lg p-1.5 text-slate-500 transition hover:bg-white/5 hover:text-primary"
+      >
+        <span className="material-symbols-outlined text-lg">lock_reset</span>
+      </Link>
       <button
         type="button"
         disabled={busy}
