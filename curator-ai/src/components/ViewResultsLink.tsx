@@ -1,8 +1,16 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { readPythonJobId } from "@/lib/processing-job";
+
+/** sessionStorage is written elsewhere in the tab and never changes while this
+ *  link is mounted, so there is nothing to subscribe to — but going through
+ *  useSyncExternalStore is what makes reading it safe across the static
+ *  prerender: the server snapshot is null, and the client's real value is
+ *  picked up during hydration rather than in an effect that re-renders. */
+const subscribe = () => () => {};
+const serverSnapshot = () => null;
 
 /**
  * "View Results" link that scopes the Results page to the CURRENT job.
@@ -21,12 +29,8 @@ export function ViewResultsLink({
   children: React.ReactNode;
   base?: string;
 }) {
-  const [href, setHref] = useState(base);
-
-  useEffect(() => {
-    const jid = readPythonJobId();
-    setHref(jid ? `${base}?job=${encodeURIComponent(jid)}` : base);
-  }, [base]);
+  const jobId = useSyncExternalStore(subscribe, readPythonJobId, serverSnapshot);
+  const href = jobId ? `${base}?job=${encodeURIComponent(jobId)}` : base;
 
   return (
     <Link href={href} className={className}>

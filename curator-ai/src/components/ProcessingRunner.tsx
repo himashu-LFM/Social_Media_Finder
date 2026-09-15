@@ -1,9 +1,9 @@
 "use client";
 
-import type { CSSProperties } from "react";
 import { authedFetch } from "@/lib/auth";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { AppShell, StageStrip } from "@/components/AppShell";
 import { useToast } from "@/components/ToastProvider";
 import { ViewResultsLink } from "@/components/ViewResultsLink";
 import {
@@ -36,6 +36,23 @@ const SOCIAL_PLATFORM_STEPS = [
   { label: "TikTok", short: "TT", icon: "music_note", color: "from-cyan-400/20 to-teal-600/5" },
   { label: "X", short: "X", icon: "alternate_email", color: "from-slate-400/20 to-slate-600/5" },
 ] as const;
+
+/** Row lifecycle → the badge in the tracker's Status column. */
+const ROW_TONE: Record<RowStatus, string> = {
+  done: "sc-tone-good",
+  processing: "sc-tone-live",
+  queued: "sc-tone-mute",
+};
+const ROW_LABEL: Record<RowStatus, string> = {
+  done: "Done",
+  processing: "Processing",
+  queued: "Queued",
+};
+
+/** Per-platform cell: colour, glyph, and what the title attribute says. */
+const CELL_COLOR = { done: "#34d399", active: "#f2d100", queued: "#475569" } as const;
+const CELL_ICON = { done: "check_circle", active: "sync", queued: "schedule" } as const;
+const CELL_TITLE = { done: "done", active: "checking now", queued: "queued" } as const;
 
 const LIVE_MESSAGES = [
   "The backend is still working. You can leave this page open while it checks each profile.",
@@ -93,9 +110,6 @@ function getPlatformState(
 
   return "queued";
 }
-
-const RING_RADIUS = 88;
-const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
 
 export function ProcessingRunner() {
   const { pushToast } = useToast();
@@ -353,62 +367,18 @@ export function ProcessingRunner() {
       pushToast("Could not reach the API to stop the run.", "error");
     }
   }
-
-  if (!mounted) {
-    return (
-      <div className="flex min-h-[50vh] flex-col items-center justify-center gap-5 px-6">
-        <div className="relative flex h-20 w-20 items-center justify-center">
-          <div className="absolute inset-0 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
-          <div
-            className="absolute inset-2 animate-spin rounded-full border-2 border-primary/10 border-b-primary/60"
-            style={{ animationDirection: "reverse", animationDuration: "1.4s" }}
-          />
-          <span className="material-symbols-outlined text-2xl text-primary ai-pulse">radar</span>
-        </div>
-        <p className="text-sm font-semibold text-slate-400">Loading pipeline status…</p>
-      </div>
-    );
-  }
-
-  if (names === null) {
-    return null;
-  }
-
-  if (names.length === 0) {
-    return (
-      <div className="proc-enter mx-auto w-full max-w-2xl px-4 py-10">
-        <div className="relative overflow-hidden rounded-[2rem] border border-white/10 bg-slate-900/80 p-10 text-center shadow-2xl shadow-black/40 ring-1 ring-white/5">
-          <div className="absolute -left-16 -top-16 h-48 w-48 rounded-full bg-primary/10 blur-3xl" />
-          <div className="absolute -bottom-20 -right-10 h-56 w-56 rounded-full bg-violet-500/10 blur-3xl" />
-          <div className="relative z-10">
-            <div className="proc-float mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-2xl bg-slate-950/70 ring-1 ring-primary/20 shadow-xl shadow-primary/10">
-              <span className="material-symbols-outlined text-5xl text-slate-500">folder_open</span>
-            </div>
-            <h2 className="text-2xl font-extrabold text-slate-100">No names to process</h2>
-            <p className="mx-auto mt-4 max-w-md text-sm leading-relaxed text-slate-400">
-              Go to Discovery, enter talent names (or upload a file when that is wired), then choose{" "}
-              <strong className="text-primary">Run Discovery</strong>. You will land here while each
-              name is searched and scored in the background.
-            </p>
-            <Link
-              href="/discovery"
-              className="proc-btn-glow mt-10 inline-flex cursor-pointer items-center gap-2 rounded-xl bg-primary px-7 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-primary/25"
-            >
-              <span className="material-symbols-outlined text-lg">arrow_back</span>
-              Back to Discovery
-            </Link>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  /* ── render ─────────────────────────────────────────────────────────────
+     The Claude Design handoff's Processing page: a run summary naming the row
+     being worked on, the four pipeline phases, and a platform-wise tracker.
+     The chrome comes from AppShell so the rail, header and stage strip match
+     every other page. */
 
   const pct = total ? Math.round((doneCount / total) * 100) : 0;
-  const ringOffset = RING_CIRCUMFERENCE - (pct / 100) * RING_CIRCUMFERENCE;
-  const activeName =
-    currentNameIndex >= 0 ? names[currentNameIndex] : names[names.length - 1];
+  const activeName = currentNameIndex >= 0 ? names?.[currentNameIndex] : undefined;
   const liveMessage = LIVE_MESSAGES[currentStepIndex % LIVE_MESSAGES.length];
   const isWaitingForFirstRow = !allDone && doneCount === 0 && currentNameIndex < 0;
+  const activeStep = currentStepIndex % PIPELINE_STEPS.length;
+
   const statusLabel = runCancelled
     ? "Stopped"
     : stopRequested
@@ -419,663 +389,291 @@ export function ProcessingRunner() {
           ? "Needs attention"
           : "Live processing";
   const statusTone = backendError
-    ? "border-rose-400/30 bg-rose-500/10 text-rose-200"
+    ? "sc-tone-bad"
     : runCancelled || stopRequested
-      ? "border-sky-400/30 bg-sky-500/10 text-sky-200"
+      ? "sc-tone-info"
       : allDone
-        ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
-        : "border-primary/30 bg-primary/10 text-primary";
-  const statusDot = backendError
-    ? "bg-rose-300"
-    : runCancelled || stopRequested
-      ? "bg-sky-300"
-      : allDone
-        ? "bg-emerald-300"
-        : "bg-primary";
-  // Stop is offered while a run is genuinely in progress.
-  const canStop = !allDone && !runCancelled && !backendError && total > 0;
-  const activeStep = currentStepIndex % PIPELINE_STEPS.length;
+        ? "sc-tone-good"
+        : "sc-tone-live";
+  const running = !allDone && !runCancelled && !backendError && total > 0;
+  // Stop is offered only while a run is genuinely in progress.
+  const canStop = running && !stopRequested;
 
-  return (
-    <div className="mx-auto w-full max-w-6xl space-y-6 px-4 py-6 sm:px-6 lg:py-8">
+  /** Every state of this page wears the same chrome, so it is built once. */
+  const shell = (children: React.ReactNode) => (
+    <AppShell
+      icon="sync"
+      spinIcon={running}
+      eyebrow="Live pipeline"
+      title="Processing"
+      stages={
+        total > 0 ? (
+          <StageStrip
+            current={allDone ? "export" : "validate"}
+            pulse={running}
+            noteStrong
+            note={`${doneCount} of ${total} rows · ${pct}%`}
+          />
+        ) : (
+          <StageStrip current="search" note="No run in progress" />
+        )
+      }
+      actions={
+        <>
+          <span className={`sc-pill ${statusTone}`} style={{ color: "var(--tone)" }}>
+            <span className={`sc-dot${running ? " sc-pulse" : ""}`} />
+            {statusLabel}
+          </span>
+          {canStop && (
+            <button type="button" className="sc-btn danger" onClick={() => void handleStop()}>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+                stop_circle
+              </span>
+              Stop run
+            </button>
+          )}
+          <ViewResultsLink className="sc-btn">
+            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+              table_chart
+            </span>
+            View Results
+          </ViewResultsLink>
+        </>
+      }
+    >
+      {children}
+    </AppShell>
+  );
+
+  if (!mounted) {
+    return shell(
+      <div className="sc-stack">
+        <div className="sc-empty" aria-busy="true">
+          <span className="material-symbols-outlined sc-spin">progress_activity</span>
+          Loading pipeline status…
+        </div>
+      </div>,
+    );
+  }
+
+  if (names === null) return shell(<div className="sc-stack" />);
+
+  if (names.length === 0) {
+    return shell(
+      <div className="sc-stack">
+        <section className="sc-drop" style={{ borderStyle: "solid" }}>
+          <span className="sc-drop-icon">
+            <span className="material-symbols-outlined" style={{ fontSize: 22 }}>
+              folder_open
+            </span>
+          </span>
+          <h2>No names to process</h2>
+          <p>
+            Go to Discovery, upload a talent list or enter names, then start the run. You land
+            here while each name is searched and scored in the background.
+          </p>
+          <Link href="/discovery" className="sc-btn-primary" style={{ marginTop: 16 }}>
+            <span className="material-symbols-outlined" style={{ fontSize: 18 }}>
+              arrow_back
+            </span>
+            Back to Discovery
+          </Link>
+        </section>
+      </div>,
+    );
+  }
+
+  return shell(
+    <div className="sc-stack" style={{ gap: 16 }}>
       {backendError && (
-        <div
-          className="proc-enter flex items-start gap-3 rounded-2xl border border-rose-500/40 bg-rose-950/50 px-4 py-3 text-sm text-rose-100 shadow-xl shadow-rose-950/20 ring-1 ring-white/5"
-          role="alert"
-        >
-          <span className="material-symbols-outlined mt-0.5 animate-pulse text-rose-300">error</span>
-          <div>
-            <p className="font-bold">Processing connection needs attention</p>
-            <p className="mt-1 text-rose-200/85">{backendError}</p>
-          </div>
+        <div className="sc-banner sc-tone-bad" role="alert">
+          <span className="material-symbols-outlined">error</span>
+          <span>
+            <strong>Processing connection needs attention</strong> — {backendError}
+          </span>
         </div>
       )}
 
-      <section className="grid gap-5 xl:grid-cols-[1.25fr_0.95fr]">
-        <div
-          className={`proc-enter proc-enter-delay-1 relative overflow-hidden rounded-[2rem] border border-primary/25 bg-[radial-gradient(circle_at_20%_20%,rgba(242,209,0,0.16),transparent_28%),linear-gradient(135deg,rgba(15,23,42,0.96),rgba(2,6,23,0.92))] p-5 shadow-2xl shadow-black/40 ring-1 ring-white/10 sm:p-6 lg:p-8 ${allDone ? "proc-glow-card" : ""}`}
-        >
-          <div className="proc-border-animated absolute inset-x-8 top-0 h-px opacity-60" />
-          <div className="absolute -right-20 -top-20 h-64 w-64 rounded-full bg-primary/10 blur-3xl" />
-          <div className="absolute -bottom-24 left-1/3 h-56 w-56 rounded-full bg-sky-500/10 blur-3xl" />
-
-          {allDone && (
-            <>
-              <span className="proc-spark absolute right-8 top-8 material-symbols-outlined text-primary/70">
-                auto_awesome
+      <section className="sc-card" style={{ overflow: "hidden" }}>
+        <div className="sc-hero-head">
+          <span style={{ minWidth: 0 }}>
+            <span className="sc-metric-label">Working on</span>
+            <span className="sc-hero-name">
+              {allDone
+                ? "Finished"
+                : runCancelled
+                  ? "Stopped"
+                  : (activeName ?? "Waiting for the first row…")}
+            </span>
+          </span>
+          <span className="sc-metrics">
+            <span className="sc-metric">
+              <span className="sc-metric-label">Progress</span>
+              <span className="sc-metric-value">{pct}%</span>
+            </span>
+            <span className="sc-metric good">
+              <span className="sc-metric-label">Done</span>
+              <span className="sc-metric-value">{doneCount}</span>
+            </span>
+            <span className="sc-metric">
+              <span className="sc-metric-label">Remaining</span>
+              <span className="sc-metric-value">{remainingCount}</span>
+            </span>
+            <span className="sc-metric">
+              <span className="sc-metric-label">Workbook</span>
+              <span className="sc-metric-text">
+                {allDone ? "Ready to view" : "Building export"}
               </span>
-              <span
-                className="proc-spark absolute right-16 top-20 material-symbols-outlined text-emerald-300/80"
-                style={{ animationDelay: "0.6s" }}
-              >
-                celebration
-              </span>
-            </>
-          )}
-
-          <div className="relative z-10 flex flex-col gap-7 lg:flex-row lg:items-center">
-            <div className="relative mx-auto flex h-48 w-48 shrink-0 items-center justify-center sm:h-52 sm:w-52 lg:mx-0">
-              <svg
-                className="absolute inset-0 h-full w-full -rotate-90"
-                viewBox="0 0 200 200"
-                aria-hidden
-              >
-                <defs>
-                  <linearGradient id="proc-ring-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" stopColor="#f2d100" />
-                    <stop offset="100%" stopColor="#d5b700" />
-                  </linearGradient>
-                </defs>
-                <circle className="proc-ring-track" cx="100" cy="100" r={RING_RADIUS} />
-                <circle
-                  className="proc-ring-progress"
-                  cx="100"
-                  cy="100"
-                  r={RING_RADIUS}
-                  strokeDasharray={RING_CIRCUMFERENCE}
-                  strokeDashoffset={ringOffset}
-                />
-              </svg>
-
-              {!allDone && (
-                <>
-                  <div className="proc-scan-beam absolute inset-3 rounded-full" />
-                  <div
-                    className="proc-orbit-dot"
-                    style={{ "--orbit-radius": "78px", "--orbit-duration": "7s" } as CSSProperties}
-                  />
-                  <div
-                    className="proc-orbit-dot"
-                    style={
-                      {
-                        "--orbit-radius": "62px",
-                        "--orbit-duration": "5s",
-                        animationDirection: "reverse",
-                      } as CSSProperties
-                    }
-                  />
-                  <div
-                    className="proc-orbit-dot h-1.5 w-1.5 opacity-60"
-                    style={{ "--orbit-radius": "92px", "--orbit-duration": "11s" } as CSSProperties}
-                  />
-                </>
-              )}
-
-              <div className="absolute inset-8 rounded-full border border-primary/15 bg-slate-950/50 shadow-inner shadow-black/40" />
-              <div className="relative flex flex-col items-center gap-1">
-                <span
-                  className={`material-symbols-outlined text-4xl text-primary sm:text-5xl ${allDone ? "proc-celebrate" : "ai-pulse"}`}
-                >
-                  {allDone ? "check_circle" : "radar"}
-                </span>
-                <span className="text-2xl font-extrabold tabular-nums text-slate-50">{pct}%</span>
-              </div>
-            </div>
-
-            <div className="min-w-0 flex-1">
-              <div
-                className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-bold shadow-lg ${statusTone}`}
-              >
-                <span className={`h-2 w-2 rounded-full ${statusDot} ${allDone ? "" : "animate-pulse"}`} />
-                {statusLabel}
-              </div>
-              <h2
-                className={`max-w-xl text-3xl font-extrabold tracking-tight text-slate-50 sm:text-4xl ${allDone ? "proc-celebrate" : ""}`}
-              >
-                {runCancelled
-                  ? "Run stopped"
-                  : allDone
-                    ? "Your export is ready"
-                    : backendError
-                      ? "Processing is paused"
-                      : "We are still searching"}
-              </h2>
-              <p
-                key={liveMessage}
-                className="proc-message-swap mt-3 max-w-2xl text-sm leading-6 text-slate-300 sm:text-base"
-              >
-                {runCancelled
-                  ? "Everything checked before you stopped has been saved and is ready to open. Platforms that were never reached are marked “Not Checked” — that is not the same as “no profile”."
-                  : stopRequested
-                    ? "Finishing the checks already in flight, then saving what completed. Nothing verified so far will be lost."
-                    : allDone
-                  ? "All names have been processed. Open Results to review confidence scores and social links."
-                  : backendError
-                    ? "The job status could not be found. If the Python server restarted, start Discovery again to create a fresh job."
-                    : isWaitingForFirstRow
-                      ? "The Python job has started and is warming up the first row. This can take a moment on larger uploads."
-                      : liveMessage}
-              </p>
-
-              {!allDone && !backendError && (
-                <div className="mt-5 flex flex-wrap gap-2">
-                  {["Wikipedia", "Apify", "Verify", "Export"].map((chip, i) => (
-                    <span
-                      key={chip}
-                      className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold ring-1 transition-all duration-300 ${
-                        i === activeStep
-                          ? "bg-primary/15 text-primary ring-primary/30 shadow-md shadow-primary/10"
-                          : "bg-slate-950/60 text-slate-500 ring-white/10"
-                      }`}
-                    >
-                      <span className="material-symbols-outlined text-sm">
-                        {PIPELINE_STEPS[i]?.icon}
-                      </span>
-                      {chip}
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              <div className="mt-6 flex flex-wrap items-center gap-3">
-                {(allDone || runCancelled) && (
-                  <ViewResultsLink
-                    className="proc-btn-glow inline-flex items-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-bold text-slate-950 shadow-lg shadow-primary/30"
-                  >
-                    <span className="material-symbols-outlined text-lg">table_chart</span>
-                    {runCancelled ? "Open partial results" : "Open Results"}
-                    <span className="material-symbols-outlined text-lg">arrow_forward</span>
-                  </ViewResultsLink>
-                )}
-
-                {canStop && (
-                  <button
-                    type="button"
-                    onClick={() => void handleStop()}
-                    disabled={stopRequested}
-                    aria-label="Stop this run and keep whatever has been verified so far"
-                    className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-rose-400/40 bg-rose-500/10 px-5 py-3 text-sm font-bold text-rose-200 shadow-lg shadow-rose-950/20 transition hover:bg-rose-500/20 hover:text-rose-100 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    <span
-                      className={`material-symbols-outlined text-lg ${stopRequested ? "animate-spin" : ""}`}
-                    >
-                      {stopRequested ? "progress_activity" : "stop_circle"}
-                    </span>
-                    {stopRequested ? "Stopping…" : "Stop run"}
-                  </button>
-                )}
-              </div>
-
-              {canStop && !stopRequested && (
-                <p className="mt-2 text-xs text-slate-500">
-                  Stopping keeps every profile verified so far and saves the export.
-                </p>
-              )}
-            </div>
-          </div>
+            </span>
+          </span>
         </div>
-
-        <aside className="proc-enter proc-enter-delay-2 proc-card-hover rounded-[2rem] border border-white/10 bg-slate-900/80 p-5 shadow-2xl shadow-black/25 ring-1 ring-white/5 sm:p-6">
-          <RunProgressPanel
-            activeName={allDone ? "Finished" : activeName}
-            doneCount={doneCount}
-            remainingCount={remainingCount}
-            total={total}
-            workbookStatus={allDone ? "Ready to view" : "Building export"}
-            pct={pct}
-            allDone={allDone}
-          />
-        </aside>
+        <div className="sc-progress">
+          <span style={{ width: `${pct}%` }} />
+        </div>
+        <p className="sc-hero-note">
+          <span className="material-symbols-outlined">info</span>
+          {allDone
+            ? "Every row is done. Open Results to review and export the workbook."
+            : runCancelled
+              ? "The run was stopped. Partial results were saved — open Results to review them."
+              : isWaitingForFirstRow
+                ? "Waiting for the backend to pick up the first row…"
+                : liveMessage}
+        </p>
       </section>
 
-      <div className="proc-enter proc-enter-delay-3 relative overflow-hidden rounded-[2rem] border border-white/10 bg-slate-900/80 p-6 shadow-2xl shadow-black/30 ring-1 ring-white/5 md:p-10">
-        <div className="absolute -right-24 -top-24 h-64 w-64 rounded-full bg-primary/10 blur-3xl" />
-        <div className="absolute -bottom-24 -left-24 h-64 w-64 rounded-full bg-violet-500/10 blur-3xl" />
-
-        <div className="relative z-10">
-          <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <p className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-primary">
-                <span className="material-symbols-outlined text-sm">
-                  {source === "python" ? "terminal" : "preview"}
-                </span>
-                {source === "python" ? "Python backend" : "Preview mode"}
-              </p>
-              <h2 className="mt-2 text-2xl font-extrabold tracking-tight text-slate-50 md:text-3xl">
-                Name-by-name discovery
-              </h2>
-              <p className="mt-2 max-w-xl text-sm text-slate-400">
-                {source === "python" ? (
-                  <>
-                    Status comes from the FastAPI service in{" "}
-                    <code className="rounded bg-slate-950/80 px-1.5 py-0.5 text-slate-500 ring-1 ring-white/10">
-                      C:\Testing
-                    </code>{" "}
-                    — Serper, URL filtering, and scoring run in Python.
-                  </>
-                ) : (
-                  <>
-                    Connect{" "}
-                    <code className="rounded bg-slate-950/80 px-1.5 py-0.5 text-slate-500 ring-1 ring-white/10">
-                      NEXT_PUBLIC_PYTHON_API_URL
-                    </code>{" "}
-                    and start{" "}
-                    <code className="rounded bg-slate-950/80 px-1.5 py-0.5 text-slate-500 ring-1 ring-white/10">
-                      uvicorn
-                    </code>{" "}
-                    for live jobs.
-                  </>
-                )}
-              </p>
-            </div>
-            <div className="flex shrink-0 flex-col items-end gap-2">
-              {allDone ? (
-                <ViewResultsLink
-                  className="proc-btn-glow inline-flex cursor-pointer items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-sm font-bold text-slate-950 shadow-lg shadow-primary/25"
+      <section className="sc-row" style={{ gap: 8 }}>
+        {PIPELINE_STEPS.map((step, i) => {
+          const state =
+            allDone || i < activeStep ? "done" : i === activeStep && running ? "active" : "";
+          return (
+            <span key={step.label} className={`sc-phase${state ? ` ${state}` : ""}`}>
+              <span className="material-symbols-outlined">{step.icon}</span>
+              <span style={{ minWidth: 0 }}>
+                <span className="sc-phase-name">{step.label}</span>
+                <span className="sc-phase-sub">{step.detail}</span>
+              </span>
+              {state === "done" && (
+                <span
+                  className="material-symbols-outlined sc-phase-mark"
+                  style={{ fontSize: 16, color: "#34d399" }}
                 >
-                  View Results
-                  <span className="material-symbols-outlined text-lg">table_chart</span>
-                </ViewResultsLink>
-              ) : (
-                <span className="inline-flex items-center gap-2 rounded-full border border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs font-semibold text-amber-200 shadow-lg shadow-amber-950/20">
-                  <span className="material-symbols-outlined text-sm">hourglass_top</span>
-                  {doneCount} / {total} complete
+                  check_circle
                 </span>
               )}
-            </div>
-          </div>
-
-          <div className="mb-8">
-            <div className="mb-3 flex items-center justify-between text-sm">
-              <span className="inline-flex items-center gap-2 font-semibold text-slate-300">
-                <span className="material-symbols-outlined text-base text-primary">
-                  {allDone ? "task_alt" : "person_search"}
-                </span>
-                {allDone ? (
-                  "All names processed"
-                ) : (
-                  <>
-                    Working on: <span className="text-primary">{activeName}</span>
-                  </>
-                )}
-              </span>
-              <span className="rounded-full bg-slate-950/70 px-2.5 py-0.5 text-xs font-extrabold tabular-nums text-primary ring-1 ring-primary/20">
-                {pct}%
-              </span>
-            </div>
-            <div className="relative h-3.5 w-full overflow-hidden rounded-full bg-slate-800/90 ring-1 ring-white/5">
-              <div
-                className="relative h-full rounded-full bg-gradient-to-r from-primary-dim via-primary to-amber-200 transition-all duration-700 ease-out"
-                style={{ width: `${pct}%` }}
-              >
-                <div className="progress-shimmer absolute inset-0 rounded-full" />
-              </div>
-            </div>
-          </div>
-
-          <div className="mb-8 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            {PIPELINE_STEPS.map((step, i) => {
-              const isStageActive = !allDone && i === activeStep;
-              const isStageComplete =
-                allDone || (!isStageActive && i < activeStep);
-              return (
-                <div
-                  key={step.label}
-                  className={`proc-step-connector proc-card-hover group relative overflow-hidden rounded-xl px-4 py-3 ring-1 transition-all duration-500 ${
-                    isStageActive
-                      ? "bg-primary/15 ring-primary/35 shadow-lg shadow-primary/15"
-                      : isStageComplete
-                        ? "bg-emerald-500/10 ring-emerald-500/25"
-                        : "bg-slate-950/60 ring-white/10"
-                  }`}
-                >
-                  {isStageActive && (
-                    <div className="progress-shimmer absolute inset-0 opacity-40" aria-hidden />
-                  )}
-                  <div className="relative z-10 flex items-start gap-3">
-                    <div
-                      className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ring-1 transition-transform duration-300 group-hover:scale-110 ${
-                        isStageComplete
-                          ? "bg-emerald-500/15 text-emerald-400 ring-emerald-400/25"
-                          : isStageActive
-                            ? "bg-primary/20 text-primary ring-primary/30"
-                            : "bg-slate-900/80 text-slate-500 ring-white/10"
-                      }`}
-                    >
-                      <span className="material-symbols-outlined text-lg">{step.icon}</span>
-                    </div>
-                    <div className="min-w-0">
-                      <p className="text-xs font-bold text-slate-200">{step.label}</p>
-                      <p className="mt-0.5 text-[10px] text-slate-500">{step.detail}</p>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          <div className="overflow-hidden rounded-2xl border border-white/10 bg-slate-950/50 shadow-inner shadow-black/20">
-            <div className="flex flex-col gap-2 border-b border-white/10 bg-slate-900/40 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
-              <div>
-                <span className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-primary">
-                  <span className="material-symbols-outlined text-sm">hub</span>
-                  Platform-wise tracker
-                </span>
-                <p className="mt-1 text-sm text-slate-400">
-                  Each row moves through Facebook, Instagram, X, TikTok, and YouTube.
-                </p>
-              </div>
-              <span className="inline-flex w-fit items-center gap-2 rounded-full border border-white/10 bg-slate-900/80 px-3 py-1.5 text-xs font-bold text-slate-300 shadow-md">
-                <span className="relative flex h-2 w-2">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-40" />
-                  <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
-                </span>
-                Live platform scan
-              </span>
-            </div>
-            <ul className="max-h-[min(560px,62vh)] space-y-3 overflow-y-auto p-3 sm:p-4">
-              {names.map((name, i) => {
-                const s = statuses[i] ?? "queued";
-                const platformProgress = rowPlatformProgress[i] ?? EMPTY_PLATFORM_PROGRESS;
-                return (
-                  <PlatformProgressRow
-                    key={`${name}-${i}`}
-                    name={name}
-                    rowNumber={i + 1}
-                    status={s}
-                    platformProgress={platformProgress}
-                    index={i}
-                  />
-                );
-              })}
-            </ul>
-          </div>
-        </div>
-      </div>
-
-      <p className="proc-enter proc-enter-delay-4 flex items-center justify-center gap-2 text-center text-xs uppercase tracking-[0.15em] text-slate-500">
-        <span className="material-symbols-outlined text-sm text-primary/70">description</span>
-        Export: Talent_Social_Lookup_*.xlsx in C:\Testing
-      </p>
-    </div>
-  );
-}
-
-function StatusBadge({ status }: { status: RowStatus }) {
-  if (status === "done") {
-    return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2.5 py-1 text-xs font-bold text-emerald-300 ring-1 ring-emerald-500/30 shadow-sm shadow-emerald-950/30">
-        <span className="material-symbols-outlined text-sm">check</span>
-        Done
-      </span>
-    );
-  }
-  if (status === "processing") {
-    return (
-      <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/15 px-2.5 py-1 text-xs font-bold text-primary ring-1 ring-primary/30 shadow-sm shadow-primary/10">
-        <span className="relative flex h-2 w-2">
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-50" />
-          <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
-        </span>
-        Processing
-      </span>
-    );
-  }
-  return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-slate-800/80 px-2.5 py-1 text-xs font-semibold text-slate-500 ring-1 ring-white/10">
-      <span className="material-symbols-outlined text-sm opacity-60">schedule</span>
-      Queued
-    </span>
-  );
-}
-
-function PlatformProgressRow({
-  name,
-  rowNumber,
-  status,
-  platformProgress,
-  index,
-}: {
-  name: string;
-  rowNumber: number;
-  status: RowStatus;
-  platformProgress: RowPlatformProgress;
-  index: number;
-}) {
-  const isDone = status === "done";
-  const isProcessing = status === "processing";
-  const rowTone = isDone
-    ? "border-emerald-500/25 bg-emerald-500/[0.07] shadow-emerald-950/20"
-    : isProcessing
-      ? "border-primary/35 bg-primary/[0.08] shadow-primary/15"
-      : "border-white/10 bg-slate-900/60";
-
-  return (
-    <li
-      className={`proc-row-enter proc-card-hover rounded-2xl border p-4 shadow-lg transition-all duration-300 ${rowTone}`}
-      style={{ animationDelay: `${Math.min(index * 0.06, 0.48)}s` }}
-    >
-      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div className="flex min-w-0 items-start gap-3">
-          <div
-            className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-xs font-extrabold ring-1 transition-transform duration-300 hover:scale-105 ${
-              isDone
-                ? "bg-emerald-500/15 text-emerald-300 ring-emerald-400/25"
-                : isProcessing
-                  ? "bg-primary/15 text-primary ring-primary/30"
-                  : "bg-slate-950/70 text-slate-500 ring-white/10"
-            }`}
-          >
-            {isDone ? (
-              <span className="material-symbols-outlined text-lg">verified</span>
-            ) : (
-              rowNumber.toString().padStart(2, "0")
-            )}
-          </div>
-          <div className="min-w-0">
-            <p className="truncate text-sm font-extrabold text-slate-100">{name}</p>
-            <p className="mt-1 inline-flex items-center gap-1 text-xs text-slate-500">
-              <span className="material-symbols-outlined text-sm">
-                {isDone ? "done_all" : isProcessing ? "sync" : "pending"}
-              </span>
-              {isDone
-                ? "All platform checks completed"
-                : isProcessing
-                  ? "Resolving links platform by platform"
-                  : "Waiting for backend worker"}
-            </p>
-          </div>
-        </div>
-        <StatusBadge status={status} />
-      </div>
-
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-        {SOCIAL_PLATFORM_STEPS.map((platform) => {
-          const platformState = getPlatformState(platform.label, status, platformProgress);
-          return (
-            <PlatformStepPill
-              key={platform.label}
-              label={platform.label}
-              short={platform.short}
-              icon={platform.icon}
-              color={platform.color}
-              state={platformState}
-            />
+              {state === "active" && (
+                <span className="sc-dot sc-pulse sc-phase-mark sc-tone-live" />
+              )}
+            </span>
           );
         })}
-      </div>
-    </li>
-  );
-}
+      </section>
 
-function PlatformStepPill({
-  label,
-  short,
-  icon,
-  color,
-  state,
-}: {
-  label: string;
-  short: string;
-  icon: string;
-  color: string;
-  state: "done" | "active" | "queued";
-}) {
-  const tone =
-    state === "done"
-      ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
-      : state === "active"
-        ? "border-primary/45 bg-primary/15 text-primary shadow-lg shadow-primary/15"
-        : "border-white/10 bg-slate-950/55 text-slate-500";
-
-  return (
-    <div
-      className={`group/pill relative overflow-hidden rounded-xl border bg-gradient-to-br px-3 py-2.5 ring-1 ring-white/5 transition-all duration-300 hover:-translate-y-0.5 ${tone} ${state !== "queued" ? color : ""}`}
-    >
-      {state === "active" && (
-        <div className="progress-shimmer absolute inset-0 opacity-50" aria-hidden />
-      )}
-      <div className="relative z-10 flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <span
-            className={`material-symbols-outlined text-base transition-transform duration-300 group-hover/pill:scale-110 ${state === "active" ? "animate-pulse" : ""}`}
-          >
-            {icon}
+      <section className="sc-card" style={{ overflow: "hidden" }}>
+        <div className="sc-card-head">
+          <span className="material-symbols-outlined">hub</span>
+          <h3 className="sc-card-title">Platform-wise tracker</h3>
+          <span className="sc-card-note">
+            Each row moves through Instagram, Facebook, YouTube, TikTok, and X.
           </span>
-          <span className="hidden truncate text-xs font-bold sm:inline">{label}</span>
-          <span className="text-xs font-bold sm:hidden">{short}</span>
+          {running && (
+            <span className="sc-pill sc-tone-live" style={{ marginLeft: "auto", height: 26 }}>
+              <span className="sc-dot sc-pulse" />
+              Live platform scan
+            </span>
+          )}
         </div>
-        {state === "done" ? (
-          <span className="material-symbols-outlined text-sm text-emerald-300">check_circle</span>
-        ) : state === "active" ? (
-          <span className="relative flex h-2 w-2 shrink-0">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-60" />
-            <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
+
+        <div className="sc-data-wrap tall">
+          <table className="sc-data" style={{ minWidth: 720 }}>
+            <thead>
+              <tr>
+                <th className="num" style={{ width: 34 }}>
+                  #
+                </th>
+                <th>Talent</th>
+                <th>Status</th>
+                {SOCIAL_PLATFORM_STEPS.map((p) => (
+                  <th key={p.short} className="mid" style={{ width: 62 }}>
+                    {p.short}
+                  </th>
+                ))}
+                <th>Note</th>
+              </tr>
+            </thead>
+            <tbody>
+              {names.map((name, i) => {
+                const status = statuses[i] ?? "queued";
+                const progress = rowPlatformProgress[i] ?? EMPTY_PLATFORM_PROGRESS;
+                return (
+                  <tr
+                    key={`${name}-${i}`}
+                    className={status === "processing" ? "sc-row-active" : ""}
+                  >
+                    <td className="num" style={{ fontSize: 11, color: "#64748b" }}>
+                      {String(i + 1).padStart(2, "0")}
+                    </td>
+                    <td className="name" style={{ fontSize: 12.5 }}>
+                      {name}
+                    </td>
+                    <td style={{ whiteSpace: "nowrap" }}>
+                      <span className={`sc-badge ${ROW_TONE[status]}`}>{ROW_LABEL[status]}</span>
+                    </td>
+                    {SOCIAL_PLATFORM_STEPS.map((p) => {
+                      const cell = getPlatformState(p.label, status, progress);
+                      return (
+                        <td key={p.short} className="mid">
+                          <span
+                            className={`material-symbols-outlined${cell === "active" ? " sc-spin" : ""}`}
+                            style={{ fontSize: 17, color: CELL_COLOR[cell] }}
+                            title={`${p.label}: ${CELL_TITLE[cell]}`}
+                          >
+                            {CELL_ICON[cell]}
+                          </span>
+                        </td>
+                      );
+                    })}
+                    <td style={{ fontSize: 11.5, color: "#64748b" }}>
+                      {status === "done"
+                        ? "All platform checks completed"
+                        : status === "processing"
+                          ? `Resolving ${progress.currentPlatform ?? "links"} platform by platform`
+                          : "Waiting for backend worker"}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="sc-foot">
+          <span className="sc-foot-item">
+            <span className="material-symbols-outlined" style={{ color: "#34d399" }}>
+              check_circle
+            </span>
+            Done
           </span>
-        ) : (
-          <span className="h-2 w-2 shrink-0 rounded-full bg-slate-700" />
-        )}
-      </div>
-    </div>
-  );
-}
-
-function RunProgressPanel({
-  activeName,
-  doneCount,
-  remainingCount,
-  total,
-  workbookStatus,
-  pct,
-  allDone,
-}: {
-  activeName: string;
-  doneCount: number;
-  remainingCount: number;
-  total: number;
-  workbookStatus: string;
-  pct: number;
-  allDone: boolean;
-}) {
-  return (
-    <div className="w-full">
-      <div className="mb-5 flex items-center justify-between gap-3">
-        <div>
-          <p className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-[0.18em] text-slate-500">
-            <span className="material-symbols-outlined text-sm text-primary">analytics</span>
-            Run progress
-          </p>
-          <p className="mt-1 text-sm font-semibold text-slate-200">
-            {doneCount} of {total} rows completed
-          </p>
+          <span className="sc-foot-item">
+            <span className="material-symbols-outlined" style={{ color: "#f2d100" }}>
+              sync
+            </span>
+            Checking now
+          </span>
+          <span className="sc-foot-item">
+            <span className="material-symbols-outlined" style={{ color: "#475569" }}>
+              schedule
+            </span>
+            Queued
+          </span>
+          <span className="sc-foot-item" style={{ marginLeft: "auto" }}>
+            <span className="material-symbols-outlined" style={{ color: "rgba(242,209,0,0.7)" }}>
+              description
+            </span>
+            Export: Talent_Social_Lookup_*.xlsx
+          </span>
         </div>
-        <span
-          className={`shrink-0 rounded-full border px-3 py-1 text-xs font-extrabold shadow-md ${
-            allDone
-              ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
-              : "border-primary/25 bg-primary/10 text-primary"
-          }`}
-        >
-          {allDone ? "Complete" : `${remainingCount} left`}
-        </span>
-      </div>
-
-      <div className="mb-5 rounded-xl bg-slate-950/60 p-3 ring-1 ring-white/10">
-        <div className="mb-2 flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-500">
-          <span>Overall</span>
-          <span className="text-primary">{pct}%</span>
-        </div>
-        <div className="h-2 overflow-hidden rounded-full bg-slate-800">
-          <div
-            className="h-full rounded-full bg-gradient-to-r from-primary-dim to-primary transition-all duration-700"
-            style={{ width: `${pct}%` }}
-          />
-        </div>
-      </div>
-
-      <div className="grid gap-3">
-        <ProgressTile
-          marker="01"
-          icon="person"
-          label="Current row"
-          value={activeName}
-          highlight={!allDone}
-        />
-        <ProgressTile
-          marker="02"
-          icon="verified"
-          label="Verified rows"
-          value={`${doneCount}/${total}`}
-        />
-        <ProgressTile marker="03" icon="description" label="Workbook" value={workbookStatus} />
-      </div>
-    </div>
-  );
-}
-
-function ProgressTile({
-  label,
-  value,
-  marker,
-  icon,
-  highlight = false,
-}: {
-  label: string;
-  value: string;
-  marker: string;
-  icon: string;
-  highlight?: boolean;
-}) {
-  return (
-    <div
-      className={`proc-tile-hover flex h-full min-w-0 items-start gap-3 rounded-xl p-3 ring-1 ${
-        highlight
-          ? "bg-primary/[0.06] ring-primary/20"
-          : "bg-slate-900/70 ring-white/10"
-      }`}
-    >
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary ring-1 ring-primary/20">
-        <span className="material-symbols-outlined text-lg">{icon}</span>
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">
-            {label}
-          </p>
-          <span className="text-[10px] font-extrabold text-primary/60">{marker}</span>
-        </div>
-        <p className="mt-0.5 truncate text-sm font-extrabold text-slate-100">{value}</p>
-      </div>
-    </div>
+      </section>
+    </div>,
   );
 }

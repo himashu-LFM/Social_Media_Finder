@@ -1,24 +1,65 @@
 "use client";
 
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
+import { ArrowRight, Eye, EyeOff, LoaderCircle, LockKeyhole, KeyRound, Mail } from "lucide-react";
+import { AuthLayout, AuthMessage } from "@/components/AuthLayout";
 import { GoogleSignInButton } from "@/components/GoogleSignInButton";
-import { fetchAuthStatus, getToken, login } from "@/lib/auth";
+import {
+  fetchAuthStatus,
+  getToken,
+  login,
+  requestPasswordCode,
+  resetPassword,
+} from "@/lib/auth";
+import "../auth-design.css";
+
+/**
+ * Sign in, and reset a forgotten password.
+ *
+ * Three panels swapped in place inside the one card. There is deliberately
+ * **no sign-up panel**: accounts are created by an admin under Users, because
+ * a public registration form on an internal tool is an open door to anyone who
+ * finds the URL.
+ */
+type Panel = "login" | "forgot" | "reset";
+
+const COPY: Record<Panel, { heading: string; subtitle: string }> = {
+  login: { heading: "Sign in", subtitle: "Sign in to the verification workspace" },
+  forgot: {
+    heading: "Reset password",
+    subtitle: "We'll email you a code to reset your password",
+  },
+  reset: { heading: "Enter your code", subtitle: "Enter the code we emailed you" },
+};
 
 function LoginForm() {
   const router = useRouter();
   const params = useSearchParams();
   const next = params.get("next") || "/discovery";
 
+  const [panel, setPanel] = useState<Panel>("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [showPw, setShowPw] = useState(false);
+  const [code, setCode] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(
+    params.get("changed") === "1" ? "Password changed. Sign in with your new one." : null,
+  );
   const [googleClientId, setGoogleClientId] = useState("");
+  const firstField = useRef<HTMLInputElement>(null);
 
-  // Already signed in, or auth is off → skip the form entirely.
+  // Focus the first field on desktop only. `autoFocus` on a phone scrolls the
+  // browser straight past the hero to the form, so the page appears to open
+  // half-way down on an empty stretch of the illustration.
+  useEffect(() => {
+    if (window.innerWidth >= 980) firstField.current?.focus();
+  }, [panel]);
+
+  // Already signed in, or auth is off → never show a login form.
   useEffect(() => {
     let alive = true;
     void (async () => {
@@ -33,7 +74,10 @@ function LoginForm() {
           setGoogleClientId(status.google_client_id);
         }
         if (!status.has_accounts) {
-          setNotice("No accounts exist yet. Ask an administrator to run create_user.py.");
+          setNotice(
+            "No accounts exist yet. An administrator creates the first one with " +
+              "python scripts/create_user.py --admin.",
+          );
         }
       }
     })();
@@ -42,141 +86,222 @@ function LoginForm() {
     };
   }, [router, next]);
 
-  async function onSubmit(e: React.FormEvent) {
+  function go(to: Panel) {
+    setPanel(to);
+    setError(null);
+    setNotice(null);
+  }
+
+  async function onSignIn(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
     try {
-      await login(email.trim(), password);
-      router.replace(next);
+      const user = await login(email.trim(), password);
+      // A temporary password is not a password until it has been replaced.
+      router.replace(user.must_change_password ? "/account/password?forced=1" : next);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sign-in failed.");
       setBusy(false);
     }
   }
 
+  async function onRequestCode(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const { emailed, expires_in_minutes } = await requestPasswordCode(email);
+      setNotice(
+        emailed
+          ? `A ${expires_in_minutes}-minute code is on its way to ${email.trim()}.`
+          : "Email is not configured on this server — ask an administrator for the " +
+              "code, or for a new temporary password.",
+      );
+      setPanel("reset");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not send a code.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onReset(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      await resetPassword(email, code, newPassword);
+      setPassword("");
+      setNewPassword("");
+      setCode("");
+      setPanel("login");
+      setNotice("Password updated. Sign in with your new password.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not reset the password.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const eye = (
+    <button
+      type="button"
+      className="eye"
+      aria-label={showPassword ? "Hide password" : "Show password"}
+      onClick={() => setShowPassword((v) => !v)}
+    >
+      {showPassword ? <EyeOff size={21} /> : <Eye size={21} />}
+    </button>
+  );
+
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden px-4">
-      {/* Ambient brand glow — the one place a flourish belongs. */}
-      <div aria-hidden className="lf-login-orb lf-login-orb-a" />
-      <div aria-hidden className="lf-login-orb lf-login-orb-b" />
+    <AuthLayout heading={COPY[panel].heading} subtitle={COPY[panel].subtitle}>
+      {error && <AuthMessage tone="error">{error}</AuthMessage>}
+      {notice && <AuthMessage tone="info">{notice}</AuthMessage>}
 
-      <div className="lf-login-card relative z-10 w-full max-w-[400px]">
-        <div className="mb-8 text-center">
-          <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-primary/15 ring-1 ring-primary/30">
-            <span className="material-symbols-outlined text-3xl text-primary">verified_user</span>
-          </div>
-          <h1 className="text-2xl font-black tracking-tight text-slate-50">Curator AI</h1>
-          <p className="mt-1.5 text-sm text-slate-400">Sign in to the verification workspace</p>
-        </div>
-
-        {notice && (
-          <div className="mb-5 rounded-xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-xs text-sky-200">
-            {notice}
-          </div>
-        )}
-
-        {googleClientId && (
-          <div className="mb-6 space-y-5">
-            <GoogleSignInButton
-              clientId={googleClientId}
-              onSignedIn={() => router.replace(next)}
-              onError={(message) => setError(message)}
-            />
-            <div className="flex items-center gap-3" aria-hidden>
-              <span className="h-px flex-1 bg-slate-800" />
-              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-600">
-                or with a password
-              </span>
-              <span className="h-px flex-1 bg-slate-800" />
+      {panel === "login" && (
+        <>
+          {googleClientId && (
+            <div style={{ marginBottom: 26 }}>
+              <GoogleSignInButton
+                clientId={googleClientId}
+                onSignedIn={() => router.replace(next)}
+                onError={(message) => setError(message)}
+              />
             </div>
-          </div>
-        )}
+          )}
 
-        <form onSubmit={onSubmit} className="space-y-4">
-          <label className="block">
-            <span className="mb-1.5 block text-xs font-bold uppercase tracking-wider text-slate-400">
-              Email
-            </span>
-            <div className="lf-field">
-              <span className="material-symbols-outlined text-lg text-slate-500">mail</span>
+          <form onSubmit={onSignIn}>
+            <label htmlFor="ss-email">EMAIL</label>
+            <div className="input-wrap">
+              <Mail size={22} />
               <input
+                id="ss-email"
+                ref={firstField}
                 type="email"
                 required
-                autoFocus
                 autoComplete="username"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="you@listenfirstmedia.com"
-                className="w-full bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-600"
               />
             </div>
-          </label>
 
-          <label className="block">
-            <span className="mb-1.5 block text-xs font-bold uppercase tracking-wider text-slate-400">
-              Password
-            </span>
-            <div className="lf-field">
-              <span className="material-symbols-outlined text-lg text-slate-500">lock</span>
+            <div className="password-label">
+              <label htmlFor="ss-password">PASSWORD</label>
+              <button type="button" className="forgot" onClick={() => go("forgot")}>
+                Forgot?
+              </button>
+            </div>
+            <div className="input-wrap">
+              <LockKeyhole size={22} />
               <input
-                type={showPw ? "text" : "password"}
+                id="ss-password"
+                type={showPassword ? "text" : "password"}
                 required
                 autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••••"
-                className="w-full bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-600"
               />
-              <button
-                type="button"
-                onClick={() => setShowPw((v) => !v)}
-                aria-label={showPw ? "Hide password" : "Show password"}
-                className="cursor-pointer text-slate-500 transition hover:text-slate-300"
-              >
-                <span className="material-symbols-outlined text-lg">
-                  {showPw ? "visibility_off" : "visibility"}
-                </span>
-              </button>
+              {eye}
             </div>
-          </label>
 
-          {error && (
-            <div
-              role="alert"
-              className="flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs font-medium text-rose-200"
-            >
-              <span className="material-symbols-outlined text-base">error</span>
-              {error}
-            </div>
-          )}
+            <Submit busy={busy} idle="Sign in" busyLabel="Signing in…" />
+          </form>
+        </>
+      )}
 
-          <button
-            type="submit"
-            disabled={busy}
-            className="lf-login-btn group flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl bg-primary px-4 py-3 text-sm font-bold text-slate-950 transition disabled:cursor-wait disabled:opacity-70"
-          >
-            {busy ? (
-              <>
-                <span className="material-symbols-outlined animate-spin text-lg">progress_activity</span>
-                Signing in…
-              </>
-            ) : (
-              <>
-                Sign in
-                <span className="material-symbols-outlined text-lg transition-transform group-hover:translate-x-0.5">
-                  arrow_forward
-                </span>
-              </>
-            )}
+      {panel === "forgot" && (
+        <form onSubmit={onRequestCode}>
+          <label htmlFor="ss-forgot-email">EMAIL</label>
+          <div className="input-wrap">
+            <Mail size={22} />
+            <input
+              id="ss-forgot-email"
+              ref={firstField}
+              type="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@listenfirstmedia.com"
+            />
+          </div>
+
+          <Submit busy={busy} idle="Email me a code" busyLabel="Sending…" />
+          <button type="button" className="link-btn block" onClick={() => go("login")}>
+            Back to sign in
           </button>
         </form>
+      )}
 
-        <p className="mt-6 text-center text-[11px] text-slate-600">
-          ListenFirst · authorized access only
-        </p>
-      </div>
-    </div>
+      {panel === "reset" && (
+        <form onSubmit={onReset}>
+          <label htmlFor="ss-code">6-DIGIT CODE</label>
+          <div className="input-wrap code">
+            <KeyRound size={22} />
+            <input
+              id="ss-code"
+              ref={firstField}
+              type="text"
+              required
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={6}
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+              placeholder="123456"
+            />
+          </div>
+
+          <div className="password-label">
+            <label htmlFor="ss-new-password">NEW PASSWORD</label>
+          </div>
+          <div className="input-wrap">
+            <LockKeyhole size={22} />
+            <input
+              id="ss-new-password"
+              type={showPassword ? "text" : "password"}
+              required
+              minLength={10}
+              autoComplete="new-password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder="At least 10 characters"
+            />
+            {eye}
+          </div>
+
+          <Submit busy={busy} idle="Set new password" busyLabel="Updating…" />
+          <div className="link-row">
+            <button type="button" className="link-btn" onClick={() => go("forgot")}>
+              Send another code
+            </button>
+            <button type="button" className="link-btn" onClick={() => go("login")}>
+              Back to sign in
+            </button>
+          </div>
+        </form>
+      )}
+    </AuthLayout>
+  );
+}
+
+function Submit({
+  busy,
+  idle,
+  busyLabel,
+}: {
+  busy: boolean;
+  idle: string;
+  busyLabel: string;
+}) {
+  return (
+    <button type="submit" className="signin" disabled={busy}>
+      <span>{busy ? busyLabel : idle}</span>
+      {busy ? <LoaderCircle size={23} className="spin" /> : <ArrowRight size={23} />}
+    </button>
   );
 }
 

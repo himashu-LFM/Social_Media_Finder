@@ -63,6 +63,49 @@ export function mapRecordToRow(r: Record<string, unknown>): ResultRow {
   };
 }
 
+/**
+ * `sc-tone-*` class for a verification label.
+ *
+ * The redesigned surfaces set one tone class on an ancestor and every child —
+ * pill, dot, confidence bar, cell icon — reads its colour from it, which is
+ * how the handoff derives all of them from a single hex.
+ */
+export function statusToneClass(status: string): string {
+  switch (status) {
+    case STATUS_VERIFIED:
+      return "sc-tone-good";
+    case STATUS_MANUAL:
+      return "sc-tone-warn";
+    case STATUS_WRONG:
+      return "sc-tone-bad";
+    case STATUS_STOPPED:
+      return "sc-tone-info";
+    default:
+      return "sc-tone-mute";
+  }
+}
+
+/** Material symbol paired with a verification label. */
+export function statusIcon(status: string): string {
+  switch (status) {
+    case STATUS_VERIFIED:
+      return "verified";
+    case STATUS_MANUAL:
+      return "help";
+    case STATUS_WRONG:
+      return "cancel";
+    case STATUS_STOPPED:
+      return "pause_circle";
+    default:
+      return "search_off";
+  }
+}
+
+/** Confidence tone: the design's >0.8 good, >=0.5 warn, else bad. */
+export function confidenceToneClass(value: number): string {
+  return value > 0.8 ? "sc-tone-good" : value >= 0.5 ? "sc-tone-warn" : "sc-tone-bad";
+}
+
 /** Tailwind classes for a status badge, keyed by verification label. */
 export function statusTone(status: string): string {
   switch (status) {

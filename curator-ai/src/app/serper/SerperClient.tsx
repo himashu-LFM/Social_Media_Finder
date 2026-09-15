@@ -1,19 +1,21 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { AppMobileNav } from "@/components/AppMobileNav";
-import { AppPageHeader } from "@/components/AppPageHeader";
-import { AppMain } from "@/components/AppMain";
-import { AppSidebar } from "@/components/AppSidebar";
+import { AppShell } from "@/components/AppShell";
 import { authedFetch } from "@/lib/auth";
 import { getPythonApiUrl } from "@/lib/processing-job";
 import {
+  confidenceToneClass,
   mapRecordToRow,
   RESULT_PLATFORMS,
-  statusTone,
+  statusToneClass,
+  STATUS_MANUAL,
+  STATUS_NOT_FOUND,
+  STATUS_VERIFIED,
 } from "@/lib/results-mapper";
-import type { PlatformResult, ResultRow } from "@/types/results";
+import type { PlatformKey, ResultRow } from "@/types/results";
 
 /**
  * The Serper-only (Phase A) export — what Serper + the LLM produced BEFORE the
@@ -86,168 +88,263 @@ function useSerperRows(jobId: string) {
   return { rows, latestFileName, loadError, loadWarning, loading };
 }
 
-function PlatformCell({ result }: { result: PlatformResult }) {
-  const pct = Math.round(result.confidence * 100);
-  const tone = statusTone(result.status);
-  return (
-    <div className="min-w-[160px] space-y-1.5">
-      <div className="flex items-center gap-2">
-        <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ring-1 ${tone}`}>
-          {result.status || "—"}
-        </span>
-        {result.link && <span className="text-[10px] font-semibold text-slate-400">{pct}%</span>}
-      </div>
-      {result.link ? (
-        <a
-          href={result.link}
-          target="_blank"
-          rel="noreferrer"
-          className="block cursor-pointer text-xs break-all text-slate-300 underline-offset-2 transition hover:text-primary hover:underline"
-        >
-          {result.link}
-        </a>
-      ) : (
-        <span className="text-xs text-slate-600">No profile</span>
-      )}
-      {result.reason && (
-        <p className="text-[10px] leading-snug text-slate-500" title={result.reason}>
-          {result.reason.length > 140 ? `${result.reason.slice(0, 140)}…` : result.reason}
-        </p>
-      )}
-    </div>
-  );
-}
+/** One talent × platform candidate — the unit this page lists. */
+type Candidate = {
+  key: string;
+  name: string;
+  platform: string;
+  platformKey: PlatformKey;
+  icon: string;
+  status: string;
+  link: string;
+  confidence: number;
+  reason: string;
+};
 
 export function SerperClient() {
   const searchParams = useSearchParams();
-  const { rows, latestFileName, loadError, loadWarning, loading } =
-    useSerperRows(searchParams.get("job") ?? "");
-  const verifiedCount = rows.filter((r) =>
-    RESULT_PLATFORMS.some((p) => r.platforms[p.key].status === "Verified"),
-  ).length;
+  const jobId = searchParams.get("job") ?? "";
+  const { rows, latestFileName, loadError, loadWarning, loading } = useSerperRows(jobId);
+  const [query, setQuery] = useState("");
+
+  // The export is a grid of talents × platforms; this page reads it as a flat
+  // list of candidates, which is how it is actually reviewed. Cells with no
+  // candidate link carry no information here, so they are left out.
+  const candidates = useMemo<Candidate[]>(
+    () =>
+      rows.flatMap((r) =>
+        RESULT_PLATFORMS.filter((p) => r.platforms[p.key].link).map((p) => ({
+          key: `${r.name}|${p.key}`,
+          name: r.name,
+          platform: p.label,
+          platformKey: p.key,
+          icon: p.icon,
+          status: r.platforms[p.key].status,
+          link: r.platforms[p.key].link,
+          confidence: r.platforms[p.key].confidence,
+          reason: r.platforms[p.key].reason,
+        })),
+      ),
+    [rows],
+  );
+
+  const totalCells = rows.length * RESULT_PLATFORMS.length;
+  const counts = useMemo(() => {
+    const all = rows.flatMap((r) => RESULT_PLATFORMS.map((p) => r.platforms[p.key].status));
+    return {
+      verified: all.filter((s) => s === STATUS_VERIFIED).length,
+      review: all.filter((s) => s === STATUS_MANUAL).length,
+      notFound: all.filter((s) => s === STATUS_NOT_FOUND).length,
+    };
+  }, [rows]);
+
+  const q = query.trim().toLowerCase();
+  const visible = q ? candidates.filter((c) => c.name.toLowerCase().includes(q)) : candidates;
 
   return (
-    <div className="relative flex min-h-screen flex-col md:flex-row">
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_100%_0%,rgba(242,209,0,0.06),transparent_30%)]"
-      />
-      <AppSidebar />
-
-      <AppMain className="relative z-10 flex-1 p-4 pb-32 md:p-8">
-        <AppPageHeader
-          title="Serper Result"
-          subtitle="Serper + LLM · before Apify backup"
-          icon="travel_explore"
-        />
-
-        <div className="mx-auto max-w-7xl space-y-6">
-          <div className="lf-enter lf-card p-4 sm:p-5">
-            <div className="flex flex-wrap items-start gap-3">
-              <span className="material-symbols-outlined text-primary">travel_explore</span>
-              <div className="min-w-0 flex-1">
-                <p className="text-sm text-slate-300">
-                  This is the <span className="font-semibold text-primary">first pass only</span>:
-                  what the Serper <code className="text-primary">site:</code> search + LLM
-                  verification produced, <span className="font-semibold">before</span> the Apify
-                  backup and cross-platform corroboration. Compare with{" "}
-                  <span className="font-semibold">Results</span> to see what the backup changed.
-                </p>
-                <p className="mt-2 text-xs text-slate-500">
-                  {loading ? "Loading…" : `Latest export: ${latestFileName ?? "none yet"}`}
-                </p>
-                {loadWarning && <p className="mt-1 text-xs text-sky-400">{loadWarning}</p>}
-                {loadError && (
-                  <p className="mt-1 text-xs text-amber-400" role="alert">
-                    {loadError}
-                  </p>
-                )}
-              </div>
-            </div>
-          </div>
-
-          <div className="lf-enter lf-enter-delay-1 lf-card overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[1400px] border-collapse text-left">
-                <thead>
-                  <tr className="border-b border-white/10 bg-slate-950/70">
-                    {["Talent Name", "Wikipedia URL", ...RESULT_PLATFORMS.map((p) => p.label), "Confidence"].map(
-                      (h) => (
-                        <th
-                          key={h}
-                          className="px-4 py-4 text-xs font-bold uppercase tracking-wider text-slate-500"
-                        >
-                          {h}
-                        </th>
-                      ),
-                    )}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/8">
-                  {rows.map((r, i) => (
-                    <tr
-                      key={`${r.name}-${i}`}
-                      className="align-top transition-colors hover:bg-primary/[0.03]"
-                    >
-                      <td className="px-4 py-4 font-semibold text-slate-100">{r.name}</td>
-                      <td className="px-4 py-4 text-sm">
-                        {r.wikipediaUrl ? (
-                          <a
-                            href={r.wikipediaUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="cursor-pointer break-all text-xs text-slate-400 underline-offset-2 hover:text-primary hover:underline"
-                          >
-                            {r.wikipediaUrl}
-                          </a>
-                        ) : (
-                          <span className="text-slate-600">-</span>
-                        )}
-                      </td>
-                      {RESULT_PLATFORMS.map((p) => (
-                        <td key={p.key} className="px-4 py-4">
-                          <PlatformCell result={r.platforms[p.key]} />
-                        </td>
-                      ))}
-                      <td className="px-4 py-4 text-sm font-bold text-slate-200">
-                        {Math.round(r.confidence * 100)}%
-                      </td>
-                    </tr>
-                  ))}
-                  {rows.length === 0 && (
-                    <tr>
-                      <td
-                        colSpan={RESULT_PLATFORMS.length + 3}
-                        className="px-6 py-10 text-center text-sm text-slate-500"
-                      >
-                        No Serper output yet. Run the pipeline to generate a
-                        `Talent_Social_Serper_*.xlsx` file.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div className="lf-enter lf-enter-delay-2 lf-card p-6">
-              <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Talent rows
-              </div>
-              <div className="mt-2 text-4xl font-black text-slate-100">{rows.length}</div>
-            </div>
-            <div className="lf-enter lf-enter-delay-2 lf-card lf-stat-glow-emerald p-6">
-              <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Rows with a Serper-Verified platform
-              </div>
-              <div className="mt-2 text-4xl font-black text-emerald-400">{verifiedCount}</div>
-            </div>
-          </div>
+    <AppShell
+      icon="travel_explore"
+      eyebrow="Phase A export"
+      title="Serper only"
+      actions={
+        <>
+          <span className="sc-pill mono">
+            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>
+              description
+            </span>
+            {loading ? "Loading…" : (latestFileName ?? "no export yet")}
+          </span>
+          <Link
+            href={jobId ? `/results?job=${encodeURIComponent(jobId)}` : "/results"}
+            className="sc-btn"
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+              compare_arrows
+            </span>
+            Compare with final
+          </Link>
+        </>
+      }
+      stages={
+        <div className="sc-subbar">
+          <span className="sc-foot-item" style={{ whiteSpace: "normal" }}>
+            <span
+              className="material-symbols-outlined"
+              style={{ fontSize: 16, color: "rgba(242,209,0,0.85)" }}
+            >
+              info
+            </span>
+            <span>
+              What Serper and the LLM produced{" "}
+              <strong style={{ color: "#e2e8f0" }}>before</strong> the Apify backup and
+              cross-platform corroboration.
+            </span>
+          </span>
+          <span
+            style={{
+              marginLeft: "auto",
+              display: "inline-flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: 12,
+              whiteSpace: "nowrap",
+            }}
+          >
+            <span>{rows.length} rows</span>
+            <span className="sc-foot-item sc-tone-good">
+              <span className="sc-dot" />
+              {counts.verified} verified
+            </span>
+            <span className="sc-foot-item sc-tone-warn">
+              <span className="sc-dot" />
+              {counts.review} review
+            </span>
+            <span className="sc-foot-item sc-tone-mute">
+              <span className="sc-dot" />
+              {counts.notFound} not found
+            </span>
+          </span>
         </div>
-      </AppMain>
+      }
+    >
+      <div className="sc-stack">
+        {(loadError || loadWarning) && (
+          <div
+            className={`sc-banner ${loadError ? "sc-tone-warn" : "sc-tone-info"}`}
+            role={loadError ? "alert" : undefined}
+          >
+            <span className="material-symbols-outlined">{loadError ? "warning" : "info"}</span>
+            {loadError ?? loadWarning}
+          </div>
+        )}
 
-      <AppMobileNav />
-    </div>
+        <section className="sc-banner sc-tone-info">
+          <span className="sc-foot-item" style={{ whiteSpace: "normal" }}>
+            <span className="material-symbols-outlined">layers</span>
+            <span>
+              Phase A resolved <strong>{candidates.length}</strong> of {totalCells} cells. The
+              Apify backup and cross-platform corroboration run after this — compare with the
+              final export to see what they changed.
+            </span>
+          </span>
+          <Link
+            href={jobId ? `/results?job=${encodeURIComponent(jobId)}` : "/results"}
+            className="sc-link"
+            style={{ marginLeft: "auto" }}
+          >
+            See the final export
+            <span className="material-symbols-outlined" style={{ fontSize: 15 }}>
+              arrow_forward
+            </span>
+          </Link>
+        </section>
+
+        <section className="sc-card" style={{ overflow: "hidden" }}>
+          <div className="sc-card-head">
+            <span className="material-symbols-outlined">table_chart</span>
+            <h3 className="sc-card-title">Serper candidates</h3>
+            <span className="sc-card-note">
+              Read-only — no decisions are recorded on this view
+            </span>
+            <span className="sc-search" style={{ marginLeft: "auto" }}>
+              <span className="material-symbols-outlined">search</span>
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search talent name…"
+                aria-label="Search talent name"
+                style={{ width: 190, height: 28 }}
+              />
+            </span>
+          </div>
+
+          <div className="sc-data-wrap">
+            <table className="sc-data" style={{ minWidth: 900 }}>
+              <thead>
+                <tr>
+                  <th>Talent</th>
+                  <th style={{ width: 110 }}>Platform</th>
+                  <th style={{ width: 132 }}>Status</th>
+                  <th>Candidate link</th>
+                  <th className="num" style={{ width: 96 }}>
+                    Confidence
+                  </th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visible.map((c) => (
+                  <tr key={c.key}>
+                    <td className="name">{c.name}</td>
+                    <td style={{ whiteSpace: "nowrap" }}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "#cbd5e1" }}>
+                        <span
+                          className="material-symbols-outlined"
+                          style={{ fontSize: 15, color: "#64748b" }}
+                        >
+                          {c.icon}
+                        </span>
+                        {c.platform}
+                      </span>
+                    </td>
+                    <td>
+                      <span className={`sc-status ${statusToneClass(c.status)}`}>
+                        {c.status || "—"}
+                      </span>
+                    </td>
+                    <td>
+                      <a
+                        href={c.link}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="url"
+                        title={c.link}
+                      >
+                        {c.link.replace(/^https?:\/\/(www\.)?/, "")}
+                      </a>
+                    </td>
+                    <td className={confidenceToneClass(c.confidence)}>
+                      <span className="sc-conf">
+                        <span className="sc-conf-track">
+                          <span
+                            className="sc-conf-fill"
+                            style={{ width: `${Math.round(c.confidence * 100)}%` }}
+                          />
+                        </span>
+                        <span className="sc-conf-pct">{Math.round(c.confidence * 100)}%</span>
+                      </span>
+                    </td>
+                    <td className="why" title={c.reason}>
+                      {c.reason}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+
+            {loading && <div className="sc-empty">Loading the Serper export…</div>}
+            {!loading && visible.length === 0 && (
+              <div className="sc-empty">
+                <span className="material-symbols-outlined">
+                  {candidates.length === 0 ? "inbox" : "filter_alt_off"}
+                </span>
+                {candidates.length === 0
+                  ? "No Serper output yet. Run the pipeline to generate a Talent_Social_Serper_*.xlsx file."
+                  : `No candidate matches “${query.trim()}”.`}
+              </div>
+            )}
+          </div>
+
+          <div className="sc-foot">
+            <span style={{ whiteSpace: "nowrap" }}>
+              Showing <strong>{visible.length}</strong> of {totalCells} cells
+            </span>
+            <span style={{ whiteSpace: "nowrap" }}>
+              Cells with no candidate link are omitted from this export
+            </span>
+          </div>
+        </section>
+      </div>
+    </AppShell>
   );
 }

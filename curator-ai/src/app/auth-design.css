@@ -1,0 +1,763 @@
+/* ===========================================================================
+   Social Scout — sign-in visual design
+   Ported verbatim from the `social-scout-login` handoff (src/index.css).
+
+   EVERY selector is namespaced under .ss-auth. The original uses names like
+   .page, .hero, .feature and .verified, which would collide with the rest of
+   the app the moment this file loaded — CSS in the app router is global no
+   matter which page imports it.
+
+   The illustration is entirely CSS: the ListenFirst mark, the orbit rings, the
+   profile card and the social bubbles are all shapes and gradients. There are
+   no image assets to ship. Icons come from lucide-react, as in the handoff.
+   =========================================================================== */
+
+.ss-auth {
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #fff;
+  background: #0f1012;
+  font-synthesis: none;
+}
+
+.ss-auth * { box-sizing: border-box; }
+
+.ss-auth {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: #0f1012;
+}
+
+.ss-auth button, .ss-auth input { font: inherit; }
+
+.ss-auth {
+  position: relative;
+  min-height: 100vh;
+  overflow-x: clip;
+  display: grid;
+  grid-template-columns: minmax(0, 60%) minmax(460px, 40%);
+  background:
+    radial-gradient(circle at 8% 0%, rgba(242,209,0,.22), transparent 24%),
+    radial-gradient(circle at 46% 64%, rgba(242,209,0,.07), transparent 38%),
+    radial-gradient(circle at 88% 12%, rgba(255,255,255,.05), transparent 36%),
+    linear-gradient(120deg, #0f1012 0%, #17181d 52%, #101114 100%);
+}
+
+/* The glows bleed past every edge by design. They live in their own clipped
+   layer so they cannot invent scrollbars: the orb at bottom:-170px was adding
+   exactly 170px of empty scroll to the page. Clipping the whole page instead
+   would stop it scrolling when the content genuinely is taller than the
+   viewport, which is the bug this replaced. */
+.ss-auth .ambient-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.ss-auth .ambient {
+  position: absolute;
+  border-radius: 999px;
+  filter: blur(60px);
+  pointer-events: none;
+}
+
+.ss-auth .ambient-one { width: 280px; height: 280px; left: -110px; top: -110px; background: rgba(242,209,0,.26); }
+
+.ss-auth .ambient-two { width: 500px; height: 260px; left: 32%; bottom: -170px; background: rgba(242,209,0,.08); }
+
+.ss-auth .ambient-three { width: 260px; height: 260px; right: -100px; bottom: 30px; background: rgba(242,209,0,.16); }
+
+.ss-auth .hero {
+  position: relative;
+  min-height: 100vh;
+  padding: 34px 8% 30px;
+  display: flex;
+  flex-direction: column;
+  z-index: 2;
+}
+
+.ss-auth .brand {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 2px;
+}
+
+.ss-auth .brand-mark {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  position: relative;
+  overflow: hidden;
+  /* The real mark is dark-on-white, so it sits on a white disc rather than
+     the handoff's dark one. */
+  background: #fff;
+  box-shadow: 0 0 25px rgba(242,209,0,.18);
+}
+
+.ss-auth .brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ss-auth .brand-mark.small { width: 48px; height: 48px; }
+
+.ss-auth .hero-copy {
+  margin-top: 52px;
+  width: min(550px, 56%);
+  position: relative;
+  z-index: 5;
+}
+
+.ss-auth .eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #f2d100;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  padding: 9px 14px;
+  border: 1px solid rgba(242,209,0,.7);
+  border-radius: 999px;
+  background: rgba(242,209,0,.06);
+  box-shadow: inset 0 0 20px rgba(242,209,0,.05);
+}
+
+.ss-auth h1 {
+  white-space: nowrap;
+  margin: 14px 0 0;
+  font-size: clamp(58px, 5.2vw, 84px);
+  line-height: .98;
+  letter-spacing: -4px;
+  font-weight: 800;
+}
+
+.ss-auth h1 em {
+  font-style: normal;
+  color: #f2d100;
+  text-shadow: 0 0 35px rgba(242,209,0,.22);
+}
+
+.ss-auth .headline-line {
+  width: 250px;
+  height: 2px;
+  margin: 25px 0;
+  background: linear-gradient(90deg, #f2d100, rgba(242,209,0,0));
+}
+
+.ss-auth .tagline {
+  margin: 0;
+  color: #cbd5e1;
+  font-size: 20px;
+  line-height: 1.55;
+}
+
+.ss-auth .features {
+  display: grid;
+  gap: 19px;
+  margin-top: 30px;
+}
+
+.ss-auth .feature {
+  display: grid;
+  grid-template-columns: 58px 1fr;
+  gap: 17px;
+  align-items: start;
+}
+
+.ss-auth .feature-icon {
+  width: 58px;
+  height: 58px;
+  border-radius: 15px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: 0 10px 35px rgba(0,0,0,.25);
+}
+
+.ss-auth .feature-icon.blue { color:#f2d100; background:linear-gradient(145deg, #3a3214, #1b1a12); }
+
+.ss-auth .feature-icon.cyan { color:#e8eaed; background:linear-gradient(145deg, #33353c, #191a1e); }
+
+.ss-auth .feature-icon.purple { color:#ffdf6b; background:linear-gradient(145deg, #4a3d0e, #221d09); }
+
+.ss-auth .feature h3 {
+  margin: 2px 0 6px;
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.ss-auth .feature p {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 13.5px;
+  line-height: 1.55;
+  max-width: 470px;
+}
+
+.ss-auth .platform-row {
+  display: flex;
+  gap: 9px;
+  flex-wrap: wrap;
+  margin-top: 24px;
+}
+
+.ss-auth .platform {
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 13px;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 999px;
+  background: rgba(255,255,255,.04);
+  backdrop-filter: blur(10px);
+}
+
+.ss-auth .tiktok { font-size:18px; line-height:0; }
+
+.ss-auth .verification {
+  position: absolute;
+  width: 520px;
+  height: 500px;
+  right: 2%;
+  top: 27%;
+  z-index: 1;
+  transform: scale(.9);
+}
+
+.ss-auth .orbit {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  border-radius: 50%;
+  transform: translate(-50%, -50%) rotate(-14deg);
+  border: 2px solid transparent;
+}
+
+.ss-auth .orbit-a {
+  width: 430px; height: 145px;
+  border-top-color: #f2d100;
+  border-bottom-color: rgba(255,255,255,.55);
+  box-shadow: 0 0 22px rgba(242,209,0,.45);
+}
+
+.ss-auth .orbit-b {
+  width: 470px; height: 165px;
+  border-left-color: rgba(242,209,0,.7);
+  border-right-color: rgba(255,255,255,.4);
+  transform: translate(-50%, -50%) rotate(24deg);
+  opacity: .8;
+}
+
+.ss-auth .orbit-c {
+  width: 380px; height: 125px;
+  border-top-color: rgba(255,255,255,.3);
+  transform: translate(-50%, -50%) rotate(62deg);
+  opacity: .55;
+}
+
+.ss-auth .profile-card {
+  position: absolute;
+  width: 210px;
+  height: 265px;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%) rotate(10deg);
+  padding: 28px 23px;
+  border-radius: 19px;
+  border: 1px solid rgba(242,209,0,.35);
+  background: linear-gradient(145deg, rgba(58,54,32,.75), rgba(16,17,20,.94));
+  box-shadow: -25px 30px 70px rgba(0,0,0,.45), 0 0 45px rgba(242,209,0,.18);
+  backdrop-filter: blur(14px);
+}
+
+.ss-auth .profile-card::before {
+  content:"";
+  position:absolute;
+  inset:0;
+  border-radius:inherit;
+  background: linear-gradient(135deg, rgba(255,255,255,.16), transparent 32%, rgba(242,209,0,.08));
+}
+
+.ss-auth .profile-avatar {
+  position:relative;
+  width:68px; height:68px;
+  display:grid; place-items:center;
+  border-radius:50%;
+  color:#1a1b1f;
+  background:linear-gradient(145deg,#f2d100,#b39a00);
+  margin-bottom:22px;
+}
+
+.ss-auth .profile-lines { position:relative; display:grid; gap:14px; }
+
+.ss-auth .profile-lines i {
+  display:block; height:10px; border-radius:99px;
+  background:linear-gradient(90deg, rgba(242,209,0,.85), rgba(242,209,0,.25));
+}
+
+.ss-auth .profile-lines i:nth-child(1) {width:120px}
+
+.ss-auth .profile-lines i:nth-child(2) {width:150px}
+
+.ss-auth .profile-lines i:nth-child(3) {width:105px}
+
+.ss-auth .profile-lines i:nth-child(4) {width:138px}
+
+.ss-auth .verified {
+  position:absolute; right:-20px; top:100px;
+  width:54px; height:54px; display:grid; place-items:center;
+  border-radius:50%; color:white; background:#18dc8c;
+  box-shadow:0 0 30px rgba(24,220,140,.65);
+}
+
+.ss-auth .social-bubble {
+  position:absolute;
+  z-index:5;
+  width:56px; height:56px;
+  display:grid; place-items:center;
+  border-radius:16px;
+  color:white;
+  box-shadow:0 12px 35px rgba(0,0,0,.35);
+  border:1px solid rgba(255,255,255,.15);
+}
+
+.ss-auth .instagram-b { left:80px; top:62px; background:linear-gradient(145deg,#f42ca5,#633cff); }
+
+.ss-auth .youtube-b { right:50px; top:68px; background:#fa2f24; }
+
+.ss-auth .facebook-b { left:52px; bottom:102px; background:#287be8; }
+
+.ss-auth .x-b { right:58px; bottom:180px; background:#05070d; font-size:25px; }
+
+.ss-auth .tiktok-b { right:110px; bottom:72px; background:#060a14; font-size:30px; }
+
+.ss-auth .dot-grid {
+  position:absolute;
+  width:420px; height:170px;
+  left:50%; top:76%;
+  transform:translateX(-50%);
+  opacity:.45;
+  background-image:radial-gradient(rgba(242,209,0,.55) 1px, transparent 1px);
+  background-size:14px 14px;
+  mask-image:linear-gradient(to bottom, black, transparent);
+}
+
+.ss-auth .hero-footer {
+  margin-top: auto;
+  display:flex;
+  align-items:center;
+  gap:22px;
+  color:#8b8f98;
+  font-size:12px;
+  position:relative;
+  z-index:6;
+}
+
+.ss-auth .hero-footer span { display:inline-flex; align-items:center; gap:8px; }
+
+.ss-auth .footer-divider { height:22px; width:1px; background:rgba(255,255,255,.12); }
+
+.ss-auth .auth-side {
+  min-height:100vh;
+  display:grid;
+  place-items:center;
+  padding:45px;
+  position:relative;
+  z-index:10;
+  border-left:1px solid rgba(255,255,255,.07);
+  background:rgba(15,16,18,.45);
+  backdrop-filter:blur(16px);
+}
+
+.ss-auth .auth-card {
+  width:min(100%, 630px);
+  min-height:690px;
+  position:relative;
+  overflow:hidden;
+  padding:52px 76px;
+  border-radius:20px;
+  border:1px solid rgba(255,255,255,.1);
+  background:linear-gradient(145deg, rgba(31,33,39,.82), rgba(13,14,17,.94));
+  box-shadow:0 35px 100px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.12);
+  backdrop-filter:blur(25px);
+}
+
+.ss-auth .auth-card::before {
+  content:"";
+  position:absolute;
+  inset:-2px;
+  border-radius:inherit;
+  background:linear-gradient(135deg, rgba(242,209,0,.6), transparent 26%, transparent 72%, rgba(255,255,255,.35));
+  opacity:.45;
+  pointer-events:none;
+  mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite:exclude;
+  padding:1px;
+}
+
+.ss-auth .auth-logo { margin-bottom:26px; }
+
+.ss-auth .auth-card h2 {
+  margin:0;
+  font-size:34px;
+  letter-spacing:-1.5px;
+}
+
+.ss-auth .auth-subtitle {
+  margin:8px 0 38px;
+  color:#94a3b8;
+  font-size:14px;
+}
+
+.ss-auth .auth-card label {
+  display:block;
+  color:#94a3b8;
+  font-size:11px;
+  letter-spacing:1.5px;
+  font-weight:800;
+  margin-bottom:10px;
+}
+
+.ss-auth .input-wrap {
+  height:57px;
+  display:flex;
+  align-items:center;
+  gap:13px;
+  padding:0 17px;
+  border:1px solid rgba(255,255,255,.12);
+  border-radius:13px;
+  background:rgba(8,9,11,.72);
+  color:#71757e;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.03);
+  transition:.2s ease;
+}
+
+.ss-auth .input-wrap:focus-within {
+  border-color:#f2d100;
+  box-shadow:0 0 0 3px rgba(242,209,0,.14), 0 0 25px rgba(242,209,0,.10);
+}
+
+.ss-auth .input-wrap input {
+  min-width:0;
+  width:100%;
+  border:0;
+  outline:0;
+  color:#f1f5f9;
+  background:transparent;
+  font-size:14px;
+}
+
+.ss-auth .eye {
+  display:grid;
+  place-items:center;
+  padding:3px;
+  border:0;
+  color:#8b8f98;
+  background:none;
+  cursor:pointer;
+}
+
+.ss-auth .password-label {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-top:24px;
+}
+
+.ss-auth .password-label label { margin:0; }
+
+.ss-auth .forgot {
+  border:0;
+  background:none;
+  color:#f2d100;
+  font-size:12px;
+  cursor:pointer;
+}
+
+.ss-auth .signin {
+  width:100%;
+  height:57px;
+  margin-top:28px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:15px;
+  border:0;
+  border-radius:14px;
+  color:#101016;
+  background:linear-gradient(90deg,#f2d100,#d5b700);
+  font-weight:800;
+  cursor:pointer;
+  box-shadow:0 13px 35px rgba(242,209,0,.28);
+  transition:transform .18s ease, box-shadow .18s ease;
+}
+
+.ss-auth .signin:hover {
+  transform:translateY(-2px);
+  box-shadow:0 17px 45px rgba(242,209,0,.4);
+}
+
+.ss-auth .or {
+  display:flex;
+  align-items:center;
+  gap:14px;
+  margin:34px 0 26px;
+  color:#7c818b;
+  font-size:11px;
+  font-weight:700;
+}
+
+.ss-auth .or::before, .ss-auth .or::after {
+  content:""; height:1px; flex:1; background:rgba(255,255,255,.1);
+}
+
+.ss-auth .help-list { display:grid; gap:22px; }
+
+.ss-auth .help-item {
+  display:grid;
+  grid-template-columns:30px 1fr;
+  gap:13px;
+  color:#8b8f98;
+  font-size:12px;
+  line-height:1.55;
+}
+
+.ss-auth .help-item p { margin:0; }
+
+.ss-auth .help-item strong { color:#f2d100; font-weight:700; }
+
+.ss-auth .help-icon { color:#f2d100; }
+
+.ss-auth .bottom-glow {
+  position:absolute;
+  left:-10%;
+  right:-10%;
+  bottom:-90px;
+  height:180px;
+  background:
+    radial-gradient(ellipse at 22% 100%, rgba(242,209,0,.42), transparent 42%),
+    radial-gradient(ellipse at 65% 100%, rgba(255,255,255,.10), transparent 50%);
+  filter:blur(18px);
+  pointer-events:none;
+}
+
+@media (max-width: 1250px) {
+  .ss-auth { grid-template-columns: 55% 45%; }
+  .ss-auth .hero-copy { width: 72%; }
+  .ss-auth .verification { transform: scale(.72); right: -7%; top: 29%; }
+  .ss-auth .auth-card { padding: 44px 52px; }
+}
+
+@media (max-width: 980px) {
+  .ss-auth { display: block; }
+  .ss-auth .hero { min-height: auto; padding-bottom: 70px; }
+  .ss-auth .hero-copy { width: min(700px, 100%); }
+  .ss-auth .verification {
+    position: relative; right: auto; top: auto;
+    width: 520px; height: 420px;
+    margin: -10px auto -50px;
+    transform: scale(.78);
+  }
+  .ss-auth .auth-side { min-height: auto; padding: 30px 18px 70px; }
+  .ss-auth .auth-card { min-height: auto; }
+}
+
+@media (max-width: 600px) {
+  .ss-auth .hero { padding: 25px 22px 45px; }
+  .ss-auth .brand { font-size: 14px; }
+  .ss-auth .brand-mark { width: 42px; height: 42px; }
+  .ss-auth .hero-copy { margin-top: 55px; }
+  .ss-auth h1 { font-size: 54px; letter-spacing: -3px; white-space: normal; }
+  .ss-auth .tagline { font-size: 17px; }
+  .ss-auth .feature { grid-template-columns: 48px 1fr; }
+  .ss-auth .feature-icon { width: 48px; height: 48px; }
+  .ss-auth .verification { margin-left: -80px; transform: scale(.58); }
+  .ss-auth .hero-footer { flex-wrap: wrap; gap: 10px 16px; }
+  .ss-auth .footer-divider { display: none !important; }
+  .ss-auth .auth-side { padding: 10px; }
+  .ss-auth .auth-card { padding: 35px 24px; border-radius: 16px; }
+}
+
+/* ── additions beyond the handoff ─────────────────────────────────────────
+   The mock shows only the sign-in state. These cover what the real screen
+   also has to do, using the same tokens so they do not look bolted on. */
+
+.ss-auth .auth-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-bottom: 22px;
+  padding: 12px 15px;
+  border-radius: 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.ss-auth .auth-message.error {
+  color: #ffd9de;
+  border: 1px solid rgba(255, 86, 120, .38);
+  background: rgba(255, 60, 100, .1);
+}
+.ss-auth .auth-message.info {
+  color: #f0e7b8;
+  border: 1px solid rgba(242,209,0,.32);
+  background: rgba(242,209,0,.08);
+}
+
+/* The code field: wider tracking so six digits read as six digits. */
+.ss-auth .input-wrap.code input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 21px;
+  letter-spacing: .36em;
+}
+
+.ss-auth .link-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 20px;
+}
+.ss-auth .link-btn {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: #f2d100;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.ss-auth .link-btn:hover { color: #ffe873; }
+.ss-auth .link-btn.block { width: 100%; margin-top: 18px; }
+
+.ss-auth .signin:disabled { opacity: .65; cursor: wait; transform: none; }
+.ss-auth .spin { animation: ss-spin 1s linear infinite; }
+@keyframes ss-spin { to { transform: rotate(360deg); } }
+
+/* Chrome repaints autofilled inputs with its own near-white background and
+   ignores background-color. The absurd transition delay is the accepted way
+   to stop it ever being painted. */
+.ss-auth .input-wrap input:-webkit-autofill,
+.ss-auth .input-wrap input:-webkit-autofill:hover,
+.ss-auth .input-wrap input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #f1f5f9;
+  caret-color: #f1f5f9;
+  transition: background-color 100000s ease-in-out 0s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ss-auth .spin { animation: none; }
+}
+
+/* ── Session check ────────────────────────────────────────────────────────
+   Shown for a fraction of a second before every protected page, so it has to
+   look deliberate rather than like a stalled request. Same charcoal-and-yellow
+   ground as the sign-in screen, with the real mark at the centre: a spinner
+   alone reads as "something is wrong", a logo reads as "this is loading". */
+
+.ss-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(242, 209, 0, .10), transparent 46%),
+    #0f1012;
+}
+
+.ss-splash-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 26px;
+  animation: ss-splash-in .4s ease both;
+}
+@keyframes ss-splash-in { from { opacity: 0; transform: translateY(8px); } }
+
+.ss-splash-ring {
+  position: relative;
+  width: 92px;
+  height: 92px;
+  display: grid;
+  place-items: center;
+}
+/* Two counter-rotating arcs rather than one spinner — it reads as activity
+   even at the ~300ms this is usually on screen. */
+.ss-splash-ring::before,
+.ss-splash-ring::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid transparent;
+}
+.ss-splash-ring::before {
+  border-top-color: #f2d100;
+  border-right-color: rgba(242, 209, 0, .35);
+  animation: ss-spin 1.15s cubic-bezier(.6, .1, .4, .9) infinite;
+}
+.ss-splash-ring::after {
+  inset: 9px;
+  border-bottom-color: rgba(255, 255, 255, .45);
+  animation: ss-spin 1.7s linear infinite reverse;
+}
+
+.ss-splash-mark {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: #fff;
+  box-shadow: 0 0 26px rgba(242, 209, 0, .28);
+  animation: ss-splash-pulse 2s ease-in-out infinite;
+}
+.ss-splash-mark img { display: block; width: 100%; height: 100%; object-fit: cover; }
+@keyframes ss-splash-pulse {
+  50% { transform: scale(1.05); box-shadow: 0 0 34px rgba(242, 209, 0, .42); }
+}
+
+.ss-splash-text {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: #8b8f98;
+}
+
+/* Three dots that fill in turn — a quiet second signal that time is passing. */
+.ss-splash-dots {
+  display: flex;
+  gap: 6px;
+}
+.ss-splash-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(242, 209, 0, .3);
+  animation: ss-dot 1.2s ease-in-out infinite;
+}
+.ss-splash-dots i:nth-child(2) { animation-delay: .15s; }
+.ss-splash-dots i:nth-child(3) { animation-delay: .3s; }
+@keyframes ss-dot {
+  50% { background: #f2d100; transform: translateY(-3px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ss-splash-ring::before,
+  .ss-splash-ring::after,
+  .ss-splash-mark,
+  .ss-splash-dots i,
+  .ss-splash-inner { animation: none; }
+}
