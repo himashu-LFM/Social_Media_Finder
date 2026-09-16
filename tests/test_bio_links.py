@@ -3,8 +3,9 @@ Phase 0 — adopting first-party links from a client-supplied anchor profile.
 
 Two things this file is really guarding:
 
-1. Wikipedia mode never enters Phase 0. Every saving here comes from *skipping*
-   verification, so a leak into the tuned flow would cost precision silently.
+1. Phase 0 runs for EVERY row, regardless of the mode toggle. A link the client's
+   own Instagram/YouTube bio publishes is first-party whether or not the row also
+   has a Wikipedia page, so it is adopted (Verified) before any search.
 2. A harvest failure is a normal outcome. Instagram blocks anonymous readers
    often enough that "found nothing" must fall through to ordinary discovery
    rather than degrade the row.
@@ -107,12 +108,14 @@ def _stub_harvest(monkeypatch, found, calls=None):
     monkeypatch.setattr(bl, "harvest", harvest)
 
 
-def test_wikipedia_mode_never_harvests(monkeypatch):
-    """The tuned flow must be untouched — no fetch, no adoption, no saving."""
+def test_bio_links_run_for_every_row_including_wikipedia(monkeypatch):
+    """Phase 0 is no longer mode-gated: a wiki row harvests and adopts too."""
     calls = []
     _stub_harvest(monkeypatch, {"YouTube": "https://www.youtube.com/@kako"}, calls)
-    assert vp._row_bio_link_phase("Kako", HANDLES, {}, so.DEFAULT) == {}
-    assert calls == []
+    out = vp._row_bio_link_phase("Kako", HANDLES, {}, so.DEFAULT)
+    assert set(out) == {"Instagram", "YouTube"}
+    assert all(r.status == vs.STATUS_VERIFIED and r.confidence == 100 for r in out.values())
+    assert calls  # the anchor WAS read
 
 
 CUSTOM = so.SearchOptions(mode="custom", prompt="social media handles")
