@@ -680,10 +680,11 @@ def _row_bio_link_phase(
     Read the client-supplied anchor profile and adopt the platforms it links to.
 
     Returns only the platforms it filled; everything absent from the result
-    falls through to ordinary discovery. Runs in custom mode only — the
-    Wikipedia flow is measured and must not change.
+    falls through to ordinary discovery. Runs for EVERY row: a link the client's
+    own Instagram/YouTube bio publishes is first-party regardless of whether the
+    row also has a Wikipedia page, so it is trusted (Verified) before any search.
     """
-    if not options.is_custom or _is_cancelled(should_cancel):
+    if _is_cancelled(should_cancel):
         return {}
 
     input_handles = input_handles or {}
@@ -808,75 +809,193 @@ def _detect_profession(input_metadata: Optional[Dict[str, str]]) -> str:
     return ""
 
 
-def _row_serper_fallback_phase(
+
+# Confidence written when a no-Wikipedia Serper hit is corroborated (its profile
+# links back to a known handle, or it reuses a distinctive known handle). Sits
+# below the wiki-verified tier and well above a bare Manual Review.
+_CORROBORATED_CONFIDENCE = 88
+
+
+def _corroboration_signal(
+    cand: dict, known_profiles: Dict[str, str], anchor_slugs: List[str],
+) -> str:
+    """
+    Deterministic corroboration for a no-Wikipedia candidate — no LLM.
+
+    Returns a short reason when the candidate is self-evidencing, else "". Two
+    independent signals:
+      • back-link  — the candidate's own profile page links to a handle we already
+        know for this subject on another platform (read during enrichment; only
+        Facebook/YouTube/Instagram expose it).
+      • anchor handle — the candidate reuses a distinctive handle we already know
+        for this subject elsewhere (every platform; no fetch needed).
+    ``known_profiles`` is the client's supplied handles plus anything already
+    Verified this row (e.g. a link harvested from the client's YouTube bio).
+    """
+    meta = cand.get("meta") or {}
+    published = meta.get("profile_links") or {}
+    if isinstance(published, dict):
+        for other, known_url in (known_profiles or {}).items():
+            listed = published.get(other)
+            if listed and known_url and _same_profile(listed, known_url, other):
+                return (f"Its page links back to the known {other} profile "
+                        f"({known_url}) — first-party corroboration.")
+    # Handle reuse is evidence ONLY for a profile an independent search surfaced.
+    # A fanout URL we synthesised from the known handle reuses it by construction,
+    # so treating that as corroboration would be circular — and would auto-write a
+    # guessed handle we never confirmed exists.
+    if cand.get("source") != "handle_fanout":
+        handle = _handle_from_url(cand.get("url", "")).lower()
+        if handle and len(handle) >= _MIN_ANCHOR_HANDLE_LEN:
+            anchors = {s.lower() for s in anchor_slugs if len(s) >= _MIN_ANCHOR_HANDLE_LEN}
+            if handle in anchors:
+                return (f"An independently-found profile reuses the distinctive handle "
+                        f"'{handle}' already on file for this subject elsewhere.")
+    return ""
+
+
+def _corroborate_or_flag_platform(
+    talent: str, platform: str,
+    known_profiles: Dict[str, str], anchor_slugs: List[str],
+    profession: str, template: str,
+    rejected: set, options: search_options.SearchOptions,
+) -> VerificationResult:
+    """One platform of the no-Wikipedia path: Serper discover -> corroborate or flag."""
+    searched = serper_service.is_configured()
+    errored = False
+    raw: List[dict] = []
+    if searched:
+        try:
+            raw = serper_service.discover_by_site(
+                talent, platform, top_n=SERPER_CANDIDATES_PER_PLATFORM,
+                query_template=template, category=profession,
+            )
+        except Exception as exc:  # noqa: BLE001 — never abort the row on Serper failure
+            print(f"  [PIPELINE] Serper (no-wiki) failed for '{talent}'/{platform}: {exc}")
+            errored = True
+
+    candidates: List[dict] = []
+    seen: set = set()
+    for c in raw:
+        _add_candidate(candidates, seen, platform, c.get("url", ""),
+                       c.get("source", "serper"), c.get("meta"))
+    # No Serper hit — try a known handle reused from another platform (no search).
+    if not candidates:
+        for slug in anchor_slugs:
+            url = social_urls.profile_url_from_handle(slug, platform)
+            _add_candidate(candidates, seen, platform, url, "handle_fanout",
+                           {"handle_reused_from_known_profile_on_another_platform": slug})
+
+    if rejected:
+        norm_rejected = {social_urls.normalize_profile_url(u, platform).lower() for u in rejected}
+        candidates = [c for c in candidates
+                      if social_urls.normalize_profile_url(c["url"], platform).lower()
+                      not in norm_rejected]
+
+    if not candidates:
+        if errored or not searched:
+            return VerificationResult(
+                platform=platform, status=STATUS_STOPPED,
+                reason=("Search unavailable (Serper not configured or out of credits) "
+                        "— existence was not checked."))
+        return VerificationResult(
+            platform=platform, status=STATUS_NOT_FOUND,
+            reason="No profile found by a Serper site-search — no such account located.")
+
+    # Read each candidate's public profile page (FB/YouTube/Instagram) so a
+    # back-link to a known handle can be detected. No LLM — that is the whole
+    # difference from the Wikipedia path.
+    _enrich_candidates(candidates, platform)
+
+    for cand in candidates:
+        signal = _corroboration_signal(cand, known_profiles, anchor_slugs)
+        if signal:
+            print(f"  [CORROBORATE] {platform} | {talent} -> confirmed without LLM: {signal}")
+            return VerificationResult(
+                platform=platform, best_candidate=cand["url"],
+                status=STATUS_VERIFIED, confidence=_CORROBORATED_CONFIDENCE,
+                source="Serper + corroboration (no Wikipedia)",
+                reason=("No Wikipedia record for this subject, but the profile is "
+                        "self-evidencing. " + signal),
+                evidence=[signal], decision="verified",
+            )
+
+    # Nothing corroborated. Only links an INDEPENDENT search actually found go to
+    # manual review; a synthesised handle-guess that didn't link back is not
+    # something the search located, so it must not be presented as a candidate.
+    search_urls = [c["url"] for c in candidates
+                   if c.get("source") != "handle_fanout" and c.get("url")]
+    if not search_urls:
+        if errored or not searched:
+            return VerificationResult(
+                platform=platform, status=STATUS_STOPPED,
+                reason=("Search unavailable (Serper not configured or out of credits) "
+                        "— existence was not checked."))
+        return VerificationResult(
+            platform=platform, status=STATUS_NOT_FOUND,
+            reason="No profile found by a Serper site-search — no such account located.")
+
+    # No Wikipedia means nothing to verify identity against, so hand the
+    # search-found candidate(s) to a human rather than guess.
+    if len(search_urls) > 1:
+        reason = ("Serper cited multiple candidates and there is no Wikipedia record "
+                  "to verify against — review which is correct: " + "  |  ".join(search_urls))
+    else:
+        reason = ("Link found by Serper site-search but no Wikipedia record to verify "
+                  "against — manual review needed.")
+    return VerificationResult(
+        platform=platform, best_candidate=search_urls[0], status=STATUS_MANUAL,
+        confidence=0, decision="manual_review",
+        source="Serper (site-search, no Wikipedia)", reason=reason,
+    )
+
+
+def _row_serper_corroborate_phase(
     talent: str,
+    input_handles: Optional[Dict[str, str]],
     input_metadata: Optional[Dict[str, str]],
+    decisions: Optional[Dict[str, Dict[str, str]]],
     options: search_options.SearchOptions,
     resolved: Optional[Dict[str, VerificationResult]] = None,
     platform_progress: Optional[Callable[[str, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, VerificationResult]:
     """
-    Custom-mode fallback for the platforms Phase 0 (bio links / Apify) did NOT
-    fill. One ``"<name> [<profession>] site:<domain>"`` Serper search per missing
-    platform; the top organic profile URL(s) are handed through as Manual Review.
-
-    Serper rather than a generative search: it is far cheaper, its results are
-    deterministic, it returns clean organic profile URLs, and it is the same
-    vendor the Wikipedia flow already uses — so the whole product runs on one
-    search key. There is NO LLM and NO verification here: these links are
-    candidates for a human to confirm.
+    No-Wikipedia path for one row (Option B): for each platform Phase 0 left blank,
+    Serper-search and WRITE the hit only when it is deterministically corroborated
+    (back-link to a known handle, or reuse of a distinctive known handle). Anything
+    else is flagged Manual Review. No LLM, and no Apify backup (that stays
+    Wikipedia-only, where a verdict can actually be adjudicated).
     """
+    input_handles = input_handles or {}
     resolved = dict(resolved or {})
+
+    # Anchor set = the client's own handles PLUS anything Phase 0 already Verified
+    # this row (e.g. a channel harvested from the client's Instagram bio). Both are
+    # trustworthy handles this subject is known to own.
+    known_profiles: Dict[str, str] = dict(input_handles)
+    for platform, result in resolved.items():
+        if result.status == STATUS_VERIFIED and result.best_candidate:
+            known_profiles.setdefault(platform, result.best_candidate)
+    anchor_slugs = _fanout_slugs(known_profiles)
+
     profession = _detect_profession(input_metadata) if options.include_profession else ""
-    # build_query collapses whitespace, so an empty {category} is harmless.
     template = "{name} {category} site:{domain}"
+    rejected = {u for u in ((decisions or {}).get("rejected") or {}).values() if u}
 
     results: Dict[str, VerificationResult] = dict(resolved)
     for platform in PLATFORMS:
+        if platform in results:  # Phase 0 already settled it — keep it
+            continue
         if platform_progress:
             platform_progress(platform, "start")
-        if platform not in results:  # Phase 0 already confirmed ones stay as-is
-            searched = serper_service.is_configured()
-            errored = False
-            cands: List[dict] = []
-            if searched:
-                try:
-                    cands = serper_service.discover_by_site(
-                        talent, platform, top_n=SERPER_CANDIDATES_PER_PLATFORM,
-                        query_template=template, category=profession,
-                    )
-                except Exception as exc:  # noqa: BLE001 — never abort the row on Serper failure
-                    print(f"  [PIPELINE] Serper fallback failed for '{talent}'/{platform}: {exc}")
-                    errored = True
-            urls = [c["url"] for c in cands if c.get("url")]
-            if urls:
-                if len(urls) > 1:
-                    reason = ("Serper cited multiple candidates — not verified; "
-                              "review which is correct: " + "  |  ".join(urls))
-                else:
-                    reason = ("Link found by Serper site-search — not verified; "
-                              "manual review needed.")
-                results[platform] = VerificationResult(
-                    platform=platform, best_candidate=urls[0],
-                    status=STATUS_MANUAL, confidence=0, decision="manual_review",
-                    source="Serper (site-search)", reason=reason,
-                )
-            elif errored or not searched:
-                # We could NOT actually run the search (no Serper key / out of
-                # credits / connection), so we cannot assert the account is absent.
-                # Mark Not Checked — excluded from the analysis — never a false Not Found.
-                results[platform] = VerificationResult(
-                    platform=platform, status=STATUS_STOPPED,
-                    reason=("Search unavailable (Serper not configured or out of "
-                            "credits) — existence was not checked."),
-                )
-            else:
-                # A real search ran and returned nothing: as far as the tool can
-                # determine, no such account exists for this subject.
-                results[platform] = VerificationResult(
-                    platform=platform, status=STATUS_NOT_FOUND,
-                    reason="No profile found by a Serper site-search — no such account located.",
-                )
+        if _is_cancelled(should_cancel):
+            results[platform] = VerificationResult(
+                platform=platform, status=STATUS_STOPPED, reason=CANCELLED_REASON)
+        else:
+            results[platform] = _corroborate_or_flag_platform(
+                talent, platform, known_profiles, anchor_slugs,
+                profession, template, rejected, options)
         if platform_progress:
             platform_progress(platform, "done")
     return results
@@ -1153,20 +1272,23 @@ def _resolve_row_result(
     non-Verified (used by the single-row / CLI path).
     """
     decisions = load_decisions([talent]).get(talent.lower(), {})
+    has_wiki = bool(wiki_url and wiki_url.strip())
 
-    # Custom (non-Wikipedia) mode: Phase 0 first-party bio links + Apify Instagram
-    # (Verified), then a Serper site-search for the platforms left over (Manual
-    # Review). No Wikipedia lookup, no LLM.
-    if options.is_custom:
-        resolved = _row_bio_link_phase(talent, input_handles, decisions, options)
-        final = _row_serper_fallback_phase(talent, input_metadata, options, resolved,
-                                           platform_progress)
+    # Phase 0 — first-party bio links (client handles + Instagram/YouTube bio +
+    # aggregator + Apify-IG). Runs for every row; its links are Verified.
+    resolved = _row_bio_link_phase(talent, input_handles, decisions, options)
+
+    # No Wikipedia URL on this row: no ground truth to adjudicate against, so we
+    # do NOT run the LLM or the Apify backup. Serper fills the remaining blanks;
+    # a hit is written only if it corroborates itself (back-link / handle reuse),
+    # otherwise it is flagged for manual review.
+    if not has_wiki:
+        final = _row_serper_corroborate_phase(
+            talent, input_handles, input_metadata, decisions, options,
+            resolved, platform_progress)
         return _assemble_row_out(final)
 
     wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
-
-    # Phase 0 — first-party bio links (a no-op in Wikipedia mode).
-    resolved = _row_bio_link_phase(talent, input_handles, decisions, options)
 
     # Phase 1 — Serper-primary discovery + verification.
     phase1 = _row_serper_phase(talent, wiki_meta, platform_progress,
@@ -1323,31 +1445,34 @@ def run_pipeline_on_dataframe(
             if platform_progress:
                 platform_progress(idx, platform, phase)
 
-        # Custom (non-Wikipedia) mode skips the Wikipedia lookup entirely — the
-        # The custom path never uses the ground-truth record.
-        if options.is_custom:
-            wiki_meta = wikipedia_service.WikiMetadata(talent=talent, name=talent)
-        else:
+        # The branch is per-row, on whether THIS row carries a Wikipedia URL —
+        # not a run-wide mode. A row with no Wikipedia page has no ground truth,
+        # so it skips the Wikipedia lookup, the LLM, and the Apify backup.
+        has_wiki = bool(wiki_url and wiki_url.strip())
+        if has_wiki:
             wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
+        else:
+            wiki_meta = wikipedia_service.WikiMetadata(talent=talent, name=talent)
         try:
             row_decisions = decisions_by_talent.get(talent.lower(), {})
-            if options.is_custom:
-                # Phase 0 bio links + Apify Instagram (Verified) + a Serper
-                # site-search for the rest (Manual Review). No LLM.
-                resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
-                                               options, should_cancel)
-                phase1 = _row_serper_fallback_phase(talent, input_metadata, options,
-                                                    resolved, _pp)
-            else:
-                resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
-                                               options, should_cancel)
+            # Phase 0 bio links run for every row (client handles + IG/YT bio +
+            # aggregator + Apify-IG), Verified.
+            resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
+                                           options, should_cancel)
+            if has_wiki:
                 phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
                                            input_handles=input_handles,
                                            decisions=row_decisions,
                                            options=options, input_metadata=input_metadata,
                                            resolved=resolved)
+            else:
+                # No ground truth: Serper fills the blanks, a hit is written only
+                # when it corroborates itself, otherwise flagged. No LLM.
+                phase1 = _row_serper_corroborate_phase(
+                    talent, input_handles, input_metadata, row_decisions, options,
+                    resolved, _pp, should_cancel)
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the run
-            print(f"  [PIPELINE] {'Serper fallback' if options.is_custom else 'Serper'} "
+            print(f"  [PIPELINE] {'Serper' if has_wiki else 'no-wiki'} "
                   f"phase failed for '{talent}': {exc}")
             phase1 = {
                 p: VerificationResult(platform=p, status=STATUS_MANUAL, confidence=0,
@@ -1356,7 +1481,7 @@ def run_pipeline_on_dataframe(
             }
         return {"idx": idx, "row_label": row_label, "talent": talent,
                 "wiki_meta": wiki_meta, "phase1": phase1, "cancelled": False,
-                "custom": options.is_custom}
+                "has_wiki": has_wiki}
 
     workers = max(1, min(PIPELINE_ROW_WORKERS, total or 1))
     phase_a: List[dict] = []
@@ -1368,7 +1493,7 @@ def run_pipeline_on_dataframe(
     stopped = _is_cancelled(should_cancel)
     failing_talents = sorted({
         r["talent"] for r in phase_a
-        if not r.get("cancelled") and not r.get("custom")  # custom rows: no LLM/Apify pass
+        if not r.get("cancelled") and r.get("has_wiki")  # no-wiki rows: no Apify backup
         and any(v.status not in _GOOD_STATUSES for v in r["phase1"].values())
     })
     if stopped:
@@ -1390,9 +1515,10 @@ def run_pipeline_on_dataframe(
         # Apify/LLM calls — partial results are still saved and viewable.
         if r.get("cancelled") or _is_cancelled(should_cancel):
             return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
-        # Custom rows are already final from Phase 0 + Serper — no Apify backup,
-        # no cross-platform corroboration (those belong to the Wikipedia flow).
-        if r.get("custom"):
+        # No-wiki rows are already final from Phase 0 + Serper corroboration — no
+        # Apify backup, no LLM cross-platform corroboration (both need a verdict
+        # to adjudicate, which only the Wikipedia flow has).
+        if not r.get("has_wiki"):
             return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
         try:
             final = _row_apify_phase(
