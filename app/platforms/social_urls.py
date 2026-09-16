@@ -147,10 +147,14 @@ def is_valid_profile_url(link: str, platform: str) -> bool:
 
 
 def normalize_profile_url(url: str, platform: str) -> str:
-    """Canonicalise a profile URL (strip trailing slash, normalise YT host)."""
+    """Canonicalise a profile URL (strip query/fragment + trailing slash, normalise YT host)."""
     if not url or not isinstance(url, str):
         return ""
     u = url.strip()
+    # Drop tracking/locale query strings and fragments (e.g. "?locale=gl_ES",
+    # "?igsh=..."). The canonical profile page never needs them, and leaving
+    # them in means the export doesn't write back the exact profile URL.
+    u = u.split("?", 1)[0].split("#", 1)[0]
     if platform == "X":
         # twitter.com and x.com are the same account. Without this the same
         # profile from two sources never dedupes, and a link that matches the
