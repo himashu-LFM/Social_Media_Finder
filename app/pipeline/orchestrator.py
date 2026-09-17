@@ -854,13 +854,16 @@ def _corroboration_signal(
     return ""
 
 
-def _corroborate_or_flag_platform(
-    talent: str, platform: str,
-    known_profiles: Dict[str, str], anchor_slugs: List[str],
-    profession: str, template: str,
-    rejected: set, options: search_options.SearchOptions,
-) -> VerificationResult:
-    """One platform of the no-Wikipedia path: Serper discover -> corroborate or flag."""
+def _gather_serper_candidates(
+    talent: str, platform: str, anchor_slugs: List[str],
+    profession: str, template: str, rejected: set,
+) -> tuple[List[dict], bool, bool]:
+    """
+    Discover no-Wikipedia candidates for one platform (Serper + handle fanout),
+    drop analyst-rejected ones, and enrich for back-link detection. Makes NO
+    decision — that happens once every platform's candidates are known, so
+    cross-platform agreement can be weighed. Returns ``(candidates, searched, errored)``.
+    """
     searched = serper_service.is_configured()
     errored = False
     raw: List[dict] = []
@@ -892,6 +895,36 @@ def _corroborate_or_flag_platform(
                       if social_urls.normalize_profile_url(c["url"], platform).lower()
                       not in norm_rejected]
 
+    # Read each candidate's public profile page (FB/YouTube/Instagram) so a
+    # back-link to a known handle can be detected. No LLM — that is the whole
+    # difference from the Wikipedia path.
+    if candidates:
+        _enrich_candidates(candidates, platform)
+    return candidates, searched, errored
+
+
+def _top_search_handle(candidates: List[dict]) -> str:
+    """Lowercased handle of the top INDEPENDENT search hit (a fanout guess we
+    synthesised does not count — it would reuse a known handle by construction)."""
+    top = next((c for c in candidates
+                if c.get("source") != "handle_fanout" and c.get("url")), None)
+    return _handle_from_url(top["url"]).lower() if top else ""
+
+
+def _decide_no_wiki_platform(
+    talent: str, platform: str, candidates: List[dict],
+    searched: bool, errored: bool,
+    known_profiles: Dict[str, str], anchor_slugs: List[str],
+    mutual_handles: set,
+) -> VerificationResult:
+    """
+    Corroborate or flag one platform, using the whole row's cross-platform agreement.
+
+    Written (Verified) only when self-evidencing: a back-link to a known handle,
+    reuse of a distinctive known handle, OR (new) a distinctive handle that an
+    independent search returned on another platform too. Everything else that a
+    search actually found is flagged Manual Review; nothing found is Not Found.
+    """
     if not candidates:
         if errored or not searched:
             return VerificationResult(
@@ -902,11 +935,7 @@ def _corroborate_or_flag_platform(
             platform=platform, status=STATUS_NOT_FOUND,
             reason="No profile found by a Serper site-search — no such account located.")
 
-    # Read each candidate's public profile page (FB/YouTube/Instagram) so a
-    # back-link to a known handle can be detected. No LLM — that is the whole
-    # difference from the Wikipedia path.
-    _enrich_candidates(candidates, platform)
-
+    # 1. Deterministic self-evidence against what we already know for this subject.
     for cand in candidates:
         signal = _corroboration_signal(cand, known_profiles, anchor_slugs)
         if signal:
@@ -920,9 +949,29 @@ def _corroborate_or_flag_platform(
                 evidence=[signal], decision="verified",
             )
 
-    # Nothing corroborated. Only links an INDEPENDENT search actually found go to
-    # manual review; a synthesised handle-guess that didn't link back is not
-    # something the search located, so it must not be presented as a candidate.
+    # 2. Cross-platform agreement: the top independent search hit reuses a
+    #    distinctive handle that another platform's search ALSO returned. Two
+    #    independent searches converging on the same handle is strong evidence
+    #    even with no client-supplied anchor to seed it.
+    top = next((c for c in candidates
+                if c.get("source") != "handle_fanout" and c.get("url")), None)
+    if top:
+        h = _handle_from_url(top["url"]).lower()
+        if h and len(h) >= _MIN_ANCHOR_HANDLE_LEN and h in mutual_handles:
+            signal = (f"The distinctive handle '{h}' was independently returned by the "
+                      f"search on another platform too — cross-platform agreement.")
+            print(f"  [CORROBORATE] {platform} | {talent} -> cross-platform agreement: '{h}'")
+            return VerificationResult(
+                platform=platform, best_candidate=top["url"],
+                status=STATUS_VERIFIED, confidence=_CORROBORATED_CONFIDENCE,
+                source="Serper + cross-platform agreement (no Wikipedia)",
+                reason=("No Wikipedia record for this subject, but " + signal),
+                evidence=[signal], decision="verified",
+            )
+
+    # 3. Nothing corroborated. Only links an INDEPENDENT search found go to manual
+    #    review; a synthesised handle-guess that didn't link back is not something
+    #    the search located, so it must not be presented as a candidate.
     search_urls = [c["url"] for c in candidates
                    if c.get("source") != "handle_fanout" and c.get("url")]
     if not search_urls:
@@ -935,8 +984,6 @@ def _corroborate_or_flag_platform(
             platform=platform, status=STATUS_NOT_FOUND,
             reason="No profile found by a Serper site-search — no such account located.")
 
-    # No Wikipedia means nothing to verify identity against, so hand the
-    # search-found candidate(s) to a human rather than guess.
     if len(search_urls) > 1:
         reason = ("Serper cited multiple candidates and there is no Wikipedia record "
                   "to verify against — review which is correct: " + "  |  ".join(search_urls))
@@ -984,18 +1031,45 @@ def _row_serper_corroborate_phase(
     rejected = {u for u in ((decisions or {}).get("rejected") or {}).values() if u}
 
     results: Dict[str, VerificationResult] = dict(resolved)
-    for platform in PLATFORMS:
-        if platform in results:  # Phase 0 already settled it — keep it
-            continue
+    blank = [p for p in PLATFORMS if p not in results]
+
+    # Pass 1 — gather candidates for EVERY blank platform first, so cross-platform
+    # agreement can be judged before any single platform is decided.
+    gathered: Dict[str, Optional[tuple]] = {}
+    for platform in blank:
         if platform_progress:
             platform_progress(platform, "start")
         if _is_cancelled(should_cancel):
+            gathered[platform] = None
+            continue
+        gathered[platform] = _gather_serper_candidates(
+            talent, platform, anchor_slugs, profession, template, rejected)
+
+    # Cross-platform agreement map: a distinctive handle (>= the anchor length)
+    # that the top independent search hit shares across >= 2 platforms
+    # corroborates all of them, even with no client-supplied anchor.
+    handle_plats: Dict[str, set] = {}
+    for platform, g in gathered.items():
+        if not g:
+            continue
+        h = _top_search_handle(g[0])
+        if h and len(h) >= _MIN_ANCHOR_HANDLE_LEN:
+            handle_plats.setdefault(h, set()).add(platform)
+    mutual_handles = {h for h, plats in handle_plats.items() if len(plats) >= 2}
+    if mutual_handles:
+        print(f"  [CORROBORATE] '{talent}': cross-platform handle agreement -> {sorted(mutual_handles)}")
+
+    # Pass 2 — decide each platform with the whole row's agreement in hand.
+    for platform in blank:
+        g = gathered.get(platform)
+        if g is None:
             results[platform] = VerificationResult(
                 platform=platform, status=STATUS_STOPPED, reason=CANCELLED_REASON)
         else:
-            results[platform] = _corroborate_or_flag_platform(
-                talent, platform, known_profiles, anchor_slugs,
-                profession, template, rejected, options)
+            cands, searched, errored = g
+            results[platform] = _decide_no_wiki_platform(
+                talent, platform, cands, searched, errored,
+                known_profiles, anchor_slugs, mutual_handles)
         if platform_progress:
             platform_progress(platform, "done")
     return results
