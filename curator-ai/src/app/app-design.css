@@ -1267,3 +1267,44 @@
   .sc-pulse,
   .sc-phase.active { animation: none; }
 }
+
+/* ── Split export button + its dropdown menu ─────────────────────────────── */
+.sc-split { position: relative; display: inline-flex; }
+.sc-split .sc-btn.accent { border-radius: 0; box-shadow: none; }
+.sc-split-main { border-top-left-radius: 9px; border-bottom-left-radius: 9px; }
+.sc-split-caret {
+  padding: 0 8px;
+  border-left: 1px solid rgba(0, 0, 0, 0.18);
+  border-top-right-radius: 9px;
+  border-bottom-right-radius: 9px;
+}
+.sc-menu-backdrop { position: fixed; inset: 0; z-index: 40; }
+.sc-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 50;
+  width: 288px;
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: #14161b;
+  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.7);
+}
+.sc-menu-item {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 14px;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  color: #e2e8f0;
+  transition: background-color 0.15s;
+}
+.sc-menu-item + .sc-menu-item { border-top: 1px solid rgba(255, 255, 255, 0.07); }
+.sc-menu-item:hover { background: rgba(255, 255, 255, 0.05); }
+.sc-menu-item .material-symbols-outlined { font-size: 18px; margin-top: 1px; }
+.sc-menu-item-title { display: block; font-size: 13px; font-weight: 700; color: #f1f5f9; }
+.sc-menu-item-note { display: block; margin-top: 2px; font-size: 11px; color: #64748b; }
