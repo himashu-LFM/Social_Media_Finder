@@ -46,6 +46,24 @@ _X_NON_PROFILE_HANDLES = frozenset({
     "embed", "redirect", "sessions", "rules", "safety",
 })
 
+# facebook.com single-segment paths that are Facebook's own features/endpoints,
+# NOT user or page profiles. A crawler/link-preview endpoint like
+# ``externalhit_uatext.php`` was being accepted as a profile and Verified.
+_FB_NON_PROFILE_SEGMENTS = frozenset({
+    "share", "sharer", "groups", "events", "marketplace", "gaming", "watch",
+    "plugins", "tr", "dialog", "login", "logout", "help", "policies", "terms",
+    "privacy", "legal", "ads", "business", "careers", "directory", "bookmarks",
+    "settings", "notifications", "messages", "home", "reel", "reels", "stories",
+    "story", "hashtag", "search", "public", "pg",
+})
+
+# YouTube channel *tab* suffixes (…/@handle/videos). They point at the same
+# channel, so they are stripped during normalisation to a canonical profile URL.
+_YT_TAB_SUFFIXES = (
+    "videos", "featured", "about", "streams", "shorts", "playlists",
+    "community", "channels", "store", "podcasts",
+)
+
 
 def _x_handle_from_url(link: str) -> str:
     """First path segment for x.com / twitter.com URLs (empty if not a lone handle)."""
@@ -103,9 +121,14 @@ def is_valid_profile_url(link: str, platform: str) -> bool:
         if "profile.php" in path or "/people/" in path or "/pages/" in path:
             return True
         segs = [s for s in path.strip("/").split("/") if s]
-        if len(segs) == 1 and segs[0] not in (
-            "share", "sharer", "groups", "events", "marketplace", "gaming", "watch"
-        ):
+        if len(segs) == 1:
+            seg = segs[0]
+            # A single-segment path ending in .php is a Facebook script endpoint
+            # (externalhit_uatext.php, sharer.php, plugins/*.php), never a profile.
+            if seg.lower().endswith(".php"):
+                return False
+            if seg.lower() in _FB_NON_PROFILE_SEGMENTS:
+                return False
             return True
         return False
 
@@ -155,18 +178,32 @@ def normalize_profile_url(url: str, platform: str) -> str:
     # "?igsh=..."). The canonical profile page never needs them, and leaving
     # them in means the export doesn't write back the exact profile URL.
     u = u.split("?", 1)[0].split("#", 1)[0]
+    # Force https so the same account from an http source dedupes and the export
+    # is consistent (bio-harvested links often arrive as http).
+    u = re.sub(r"^http://", "https://", u, flags=re.I)
     if platform == "X":
         # twitter.com and x.com are the same account. Without this the same
         # profile from two sources never dedupes, and a link that matches the
-        # client's record reads as a mismatch.
+        # client's record reads as a mismatch. X's canonical host has no www.
         u = re.sub(r"^(https?://)(www\.|mobile\.)?twitter\.com", r"\1x.com", u, flags=re.I)
         u = re.sub(r"^(https?://)(www\.|mobile\.)?x\.com", r"\1x.com", u, flags=re.I)
+    if platform == "Instagram":
+        u = re.sub(r"^(https?://)(m\.)?instagram\.com", r"\1www.instagram.com", u, flags=re.I)
+    if platform == "Facebook":
+        u = re.sub(r"^(https?://)(m\.|web\.)?facebook\.com", r"\1www.facebook.com", u, flags=re.I)
+    if platform == "TikTok":
+        u = re.sub(r"^(https?://)(m\.)?tiktok\.com", r"\1www.tiktok.com", u, flags=re.I)
     if platform == "YouTube":
         u = u.replace("://m.youtube.com", "://www.youtube.com")
         u = u.replace("://music.youtube.com", "://www.youtube.com")
         netloc = urlparse(u).netloc
         if "youtube.com" in u and "www." not in netloc and "m." not in netloc:
             u = u.replace("://youtube.com", "://www.youtube.com")
+        # Strip a channel tab suffix (…/@handle/videos, …/channel/UC.../about)
+        # so every source resolves to the one canonical channel URL.
+        u = re.sub(
+            r"/(?:%s)/?$" % "|".join(_YT_TAB_SUFFIXES), "", u, flags=re.I
+        )
     return u.rstrip("/")
 
 
