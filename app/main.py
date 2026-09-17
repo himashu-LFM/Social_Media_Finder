@@ -73,6 +73,7 @@ def _persist(job_id: str, rows: Optional[List[dict]] = None,
 
 
 def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
+                  compact_path: Optional[str] = None,
                   rows: Optional[List[dict]] = None) -> None:
     """Mark a finished run completed — or cancelled when a stop was requested."""
     with _jobs_lock:
@@ -83,6 +84,7 @@ def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
         job["status"] = "cancelled" if was_cancelled else "completed"
         job["output_path"] = out_path
         job["serper_output_path"] = serper_path
+        job["compact_output_path"] = compact_path
         if rows is not None:
             # The tool-schema rows the Results/Analysis UI reads. Kept in memory
             # because the exported .xlsx is now the client's brand-report format,
@@ -234,11 +236,12 @@ def _apply_platform_progress(
             completed.append(platform)
 
 
-def _persist_outputs(final_df: Any) -> tuple[str, Optional[str]]:
-    """Save the final workbook plus the companion Serper-only (Phase A) workbook.
+def _persist_outputs(final_df: Any) -> tuple[str, Optional[str], Optional[str]]:
+    """Save the full workbook, the companion Serper-only (Phase A) workbook, and
+    the compact analyst sheet (the default download).
 
-    Returns (final_output_path, serper_output_path). The Serper-only frame is
-    stashed on ``final_df.attrs['serper_df']`` by the pipeline.
+    Returns (full_output_path, serper_output_path, compact_output_path). The
+    Serper-only frame is stashed on ``final_df.attrs['serper_df']`` by the pipeline.
     """
     out_path = testing.save_output(final_df, output_dir=EXPORT_DIR)
     serper_path: Optional[str] = None
@@ -250,7 +253,14 @@ def _persist_outputs(final_df: Any) -> tuple[str, Optional[str]]:
             )
         except Exception as exc:  # noqa: BLE001 — companion is best-effort
             print(f"[api_server] Serper companion save failed: {exc}")
-    return out_path, serper_path
+    compact_path: Optional[str] = None
+    try:
+        compact_path = str(
+            testing.excel_service.save_compact_report(final_df, output_dir=EXPORT_DIR)
+        )
+    except Exception as exc:  # noqa: BLE001 — compact sheet is best-effort
+        print(f"[api_server] compact report save failed: {exc}")
+    return out_path, serper_path, compact_path
 
 
 def _frame_to_rows(df: Any) -> List[dict]:
@@ -293,8 +303,8 @@ def _run_job(job_id: str, names: List[str],
             options=options,
         )
 
-        out_path, serper_path = _persist_outputs(final_df)
-        _finalize_job(job_id, out_path, serper_path, _frame_to_rows(final_df))
+        out_path, serper_path, compact_path = _persist_outputs(final_df)
+        _finalize_job(job_id, out_path, serper_path, compact_path, _frame_to_rows(final_df))
     except Exception as exc:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -334,8 +344,8 @@ def _run_job_from_file(job_id: str, path: Path,
             options=options,
         )
 
-        out_path, serper_path = _persist_outputs(final_df)
-        _finalize_job(job_id, out_path, serper_path, _frame_to_rows(final_df))
+        out_path, serper_path, compact_path = _persist_outputs(final_df)
+        _finalize_job(job_id, out_path, serper_path, compact_path, _frame_to_rows(final_df))
     except Exception as exc:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -837,6 +847,15 @@ def _latest_serper_paths() -> List[Path]:
     return [p for p in paths if not p.name.startswith(".~")]
 
 
+def _latest_compact_paths() -> List[Path]:
+    paths = sorted(
+        EXPORT_DIR.glob("Talent_Social_Compact_*.xlsx"),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    return [p for p in paths if not p.name.startswith(".~")]
+
+
 def _resolve_result_paths(job_id: Optional[str], output_key: str, fallback):
     """
     Decide which workbook(s) to read.
@@ -949,7 +968,7 @@ def api_results_serper_latest(job_id: Optional[str] = None,
     return _read_rows_response(paths)
 
 
-def _rebuild_export_from_db(job_id: Optional[str]) -> Optional[Path]:
+def _rebuild_export_from_db(job_id: Optional[str], compact: bool = False) -> Optional[Path]:
     """
     Regenerate a run's workbook from the rows persisted in Postgres.
 
@@ -957,6 +976,11 @@ def _rebuild_export_from_db(job_id: Optional[str]) -> Optional[Path]:
     container: uploads and exports written by instance A simply do not exist on
     instance B, and both vanish on the next deploy. The job row already carries
     every result cell as JSONB, so a download is always reproducible.
+
+    ``compact`` rebuilds the compact sheet instead of the tool-schema workbook.
+    The persisted rows are the tool schema (no original input columns), so a
+    rebuilt compact file has a blank brand_id — the same graceful fallback as a
+    names-only run.
     """
     if not job_id:
         return None
@@ -965,6 +989,8 @@ def _rebuild_export_from_db(job_id: Optional[str]) -> Optional[Path]:
         if not rows:
             return None
         frame = pd.DataFrame(rows)
+        if compact:
+            return testing.excel_service.save_compact_report(frame, output_dir=EXPORT_DIR)
         return testing.excel_service.save_results(frame, output_dir=EXPORT_DIR)
     except Exception as exc:  # noqa: BLE001 — a failed rebuild is a 404, not a 500
         print(f"[api_server] export rebuild failed for {job_id}: "
@@ -974,9 +1000,17 @@ def _rebuild_export_from_db(job_id: Optional[str]) -> Optional[Path]:
 
 @app.get("/api/export/latest")
 def api_export_latest(job_id: Optional[str] = None,
+                      format: str = "compact",
                       user: Optional[Dict[str, Any]] = Depends(current_user)) -> FileResponse:
-    """Download the newest export file (for Open in browser / save as)."""
-    paths, pending = _resolve_result_paths(job_id, "output_path", _latest_lookup_paths)
+    """Download the newest export file (for Open in browser / save as).
+
+    ``format=compact`` (the default) serves the compact analyst sheet;
+    ``format=full`` serves the client's brand-report / tool-schema workbook.
+    """
+    want_compact = (format or "compact").strip().lower() != "full"
+    output_key = "compact_output_path" if want_compact else "output_path"
+    fallback = _latest_compact_paths if want_compact else _latest_lookup_paths
+    paths, pending = _resolve_result_paths(job_id, output_key, fallback)
     if pending:
         raise HTTPException(status_code=409, detail="That run is still processing.")
     if not paths:
@@ -984,7 +1018,7 @@ def api_export_latest(job_id: Optional[str] = None,
         # the filesystem is ephemeral and the instance that ran the job is often
         # not the one serving the download. Postgres holds the rows, so rebuild
         # the workbook rather than telling the analyst their results are gone.
-        rebuilt = _rebuild_export_from_db(job_id)
+        rebuilt = _rebuild_export_from_db(job_id, compact=want_compact)
         if rebuilt:
             return FileResponse(
                 path=str(rebuilt), filename=rebuilt.name,

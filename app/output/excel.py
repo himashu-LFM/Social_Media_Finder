@@ -502,3 +502,117 @@ def save_output(
     if _has_source_rows(df):
         return str(save_brand_report(df, output_dir=output_dir, filename_prefix=filename_prefix))
     return str(save_results(df, output_dir=output_dir, filename_prefix=filename_prefix))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Compact report: brand_id + name + link/status per platform + one reason
+# ────────────────────────────────────────────────────────────────────────────
+
+# Header suffix for a platform's status column in the compact sheet.
+_COMPACT_STATUS_SUFFIX = " Status"
+
+
+def _compact_brand_id(source_row: object) -> str:
+    """The brand_id from the original input row, or "" (names-only runs have none)."""
+    if not isinstance(source_row, dict):
+        return ""
+    for key, value in source_row.items():
+        if str(key).strip().lower() in ("brand_id", "brandid", "brand id"):
+            return _clean_str(value)
+    return ""
+
+
+def compact_columns() -> List[str]:
+    """Column order for the compact sheet."""
+    cols: List[str] = ["brand_id", "name"]
+    for platform in PLATFORM_ORDER:
+        cols.extend([platform, platform + _COMPACT_STATUS_SUFFIX])
+    cols.append("reason")
+    return cols
+
+
+def save_compact_report(
+    df: pd.DataFrame,
+    output_dir: Optional[Path] = None,
+    filename_prefix: str = "Talent_Social_Compact",
+) -> Path:
+    """
+    The default analyst download: one row per brand — brand_id, name, then a link
+    and a status for each of the five platforms, then a single ``reason`` column.
+
+    The status is the same wording the dashboard shows (Verified / Manual Review
+    Needed / Wrong / Not Found / Not Checked). The link column carries the
+    confirmed URL for Verified, the candidate for Manual Review, and the rejected
+    link for Wrong; it is blank for Not Found / Not Checked. The reason column
+    spells out every Manual Review and Wrong cell, platform-prefixed. There is no
+    confidence or per-platform source — those stay in the live dashboard.
+    """
+    has_src = SOURCE_ROW_COL in df.columns
+    records: List[Dict[str, str]] = []
+    for i in range(len(df)):
+        row = df.iloc[i]
+        src = row[SOURCE_ROW_COL] if has_src else None
+        rec: Dict[str, str] = {
+            "brand_id": _compact_brand_id(src),
+            "name": _clean_str(row.get(TALENT_COL, "")),
+        }
+        reason_bits: List[str] = []
+        for platform in PLATFORM_ORDER:
+            status = _clean_str(row.get(status_col(platform), "")) or STATUS_NOT_FOUND
+            rec[platform] = _clean_str(row.get(link_col(platform), ""))
+            rec[platform + _COMPACT_STATUS_SUFFIX] = status
+            if status in (STATUS_MANUAL, STATUS_WRONG):
+                reason = _clean_str(row.get(reason_col(platform), ""))
+                reason_bits.append(f"{platform}: {reason}" if reason else platform)
+        rec["reason"] = "   ||   ".join(reason_bits)
+        records.append(rec)
+
+    out_df = pd.DataFrame(records).reindex(columns=compact_columns())
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = Path(output_dir) if output_dir is not None else Path(__file__).resolve().parents[2]
+    base_dir.mkdir(parents=True, exist_ok=True)
+    output_path = base_dir / f"{filename_prefix}_{timestamp}.xlsx"
+
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        out_df.to_excel(output_path, index=False)
+        print(f"\n[EXPORT] Saved compact report (no formatting): {output_path}")
+        return output_path
+
+    out_df.to_excel(output_path, index=False)
+    wb = load_workbook(output_path)
+    ws = wb.active
+
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    headers = [str(c.value or "") for c in ws[1]]
+    status_idx = {
+        headers.index(p + _COMPACT_STATUS_SUFFIX): p
+        for p in PLATFORM_ORDER if (p + _COMPACT_STATUS_SUFFIX) in headers
+    }
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        for idx in status_idx:
+            fill_hex = _STATUS_FILL.get(str(row[idx].value or "").strip())
+            if fill_hex:
+                row[idx].fill = PatternFill("solid", fgColor=fill_hex)
+
+    for col_idx in range(1, ws.max_column + 1):
+        max_len = max((len(str(c.value or "")) for r in ws.iter_rows(min_col=col_idx, max_col=col_idx)
+                       for c in r), default=0)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 60)
+
+    ws.freeze_panes = "C2"  # keep brand_id + name pinned while scrolling platforms
+    wb.save(output_path)
+    print(f"\n[EXPORT] Saved compact report: {output_path}")
+    return output_path
