@@ -856,7 +856,7 @@ def _corroboration_signal(
 
 def _gather_serper_candidates(
     talent: str, platform: str, anchor_slugs: List[str],
-    profession: str, template: str, rejected: set,
+    profession: str, template: str, rejected: set, prompt: str = "",
 ) -> tuple[List[dict], bool, bool]:
     """
     Discover no-Wikipedia candidates for one platform (Serper + handle fanout),
@@ -871,7 +871,7 @@ def _gather_serper_candidates(
         try:
             raw = serper_service.discover_by_site(
                 talent, platform, top_n=SERPER_CANDIDATES_PER_PLATFORM,
-                query_template=template, category=profession,
+                query_template=template, category=profession, prompt=prompt,
             )
         except Exception as exc:  # noqa: BLE001 — never abort the row on Serper failure
             print(f"  [PIPELINE] Serper (no-wiki) failed for '{talent}'/{platform}: {exc}")
@@ -1027,7 +1027,10 @@ def _row_serper_corroborate_phase(
     anchor_slugs = _fanout_slugs(known_profiles)
 
     profession = _detect_profession(input_metadata) if options.include_profession else ""
-    template = "{name} {category} site:{domain}"
+    # The analyst's free-text prompt is appended to the query, restoring the
+    # original non-Wikipedia behaviour: "<name> [<profession>] <prompt> site:<domain>".
+    prompt = (options.prompt or "").strip()
+    template = "{name} {category} {prompt} site:{domain}"
     rejected = {u for u in ((decisions or {}).get("rejected") or {}).values() if u}
 
     results: Dict[str, VerificationResult] = dict(resolved)
@@ -1043,7 +1046,7 @@ def _row_serper_corroborate_phase(
             gathered[platform] = None
             continue
         gathered[platform] = _gather_serper_candidates(
-            talent, platform, anchor_slugs, profession, template, rejected)
+            talent, platform, anchor_slugs, profession, template, rejected, prompt)
 
     # Cross-platform agreement map: a distinctive handle (>= the anchor length)
     # that the top independent search hit shares across >= 2 platforms
