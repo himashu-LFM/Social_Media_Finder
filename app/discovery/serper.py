@@ -270,11 +270,11 @@ DEFAULT_QUERY_TEMPLATE = "{name} site:{domain}"
 # The placeholders an analyst may use. Single source of truth: build_query
 # renders exactly these, and search_options.validate_template rejects anything
 # else before a run starts.
-TEMPLATE_FIELDS = ("name", "platform", "domain", "category", "subcategory")
+TEMPLATE_FIELDS = ("name", "platform", "domain", "category", "subcategory", "prompt")
 
 
 def build_query(template: str, talent: str, platform: str, domain: str,
-                category: str = "", subcategory: str = "") -> str:
+                category: str = "", subcategory: str = "", prompt: str = "") -> str:
     """
     Render a search query from a template.
 
@@ -290,6 +290,7 @@ def build_query(template: str, talent: str, platform: str, domain: str,
         "domain": domain,
         "category": (category or "").strip(),
         "subcategory": (subcategory or "").strip(),
+        "prompt": (prompt or "").strip(),
     }
     assert set(values) == set(TEMPLATE_FIELDS)   # keep validation in step
     out = template or DEFAULT_QUERY_TEMPLATE
@@ -300,7 +301,7 @@ def build_query(template: str, talent: str, platform: str, domain: str,
 
 def discover_by_site(talent: str, platform: str, top_n: int = 1,
                      query_template: str = "", category: str = "",
-                     subcategory: str = "") -> List[dict]:
+                     subcategory: str = "", prompt: str = "") -> List[dict]:
     """
     Simplified discovery for entities with NO Wikipedia link in the input.
 
@@ -321,7 +322,7 @@ def discover_by_site(talent: str, platform: str, top_n: int = 1,
     # Deep-copy on the way out: callers mutate candidate meta during enrichment,
     # so handing out the cached objects would leak one row's evidence into another.
     query = build_query(query_template or DEFAULT_QUERY_TEMPLATE, talent,
-                        platform, domain, category, subcategory)
+                        platform, domain, category, subcategory, prompt)
     # The template is part of the key: a custom query and the default query are
     # different searches and must not share a cache entry.
     cache_key = (talent.strip().lower(), platform, top_n, query)
