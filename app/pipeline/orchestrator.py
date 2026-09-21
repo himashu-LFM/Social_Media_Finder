@@ -259,6 +259,7 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
 # Candidate ``source`` tag (set at discovery) -> human-readable Source label.
 _VERIFY_SOURCE_LABELS = {
     "input": "Input file + LLM",
+    "wikidata": "Wikidata + LLM",
     "serper": "Serper + LLM",
     "apify": "Apify + LLM",
     "handle_fanout": "Input handle reused + LLM",
@@ -528,8 +529,12 @@ def _resolve_platform_serper(
 
     Candidate order (all are judged by the LLM; none is auto-accepted):
       1. the profile the CLIENT already has on file for this platform
-      2. the top Serper "<name> site:<domain>" result
-      3. ONLY if 1 and 2 produced nothing: the client's handle from ANOTHER
+      2. the profile Wikidata DECLARES for this platform (P2003/P2397/… — the
+         authoritative source; without this a channel Wikidata names outright,
+         e.g. a YouTube channel, could never be picked because Serper's
+         "<name> site:youtube.com" mostly returns videos, not the channel)
+      3. the top Serper "<name> site:<domain>" result
+      4. ONLY if the above produced nothing: the client's handle from ANOTHER
          platform, reused here — a cheap recall rescue that costs no search.
     """
     decisions = decisions or {}
@@ -552,6 +557,14 @@ def _resolve_platform_serper(
     if known_url:
         _add_candidate(candidates, seen, platform, known_url, "input",
                        {"supplied_in_client_record": True})
+    # The profile Wikidata declares for this platform (via P2003/P2397/P2002/…).
+    # It is the authoritative source, so it belongs in the pool the LLM chooses
+    # from — not only in the ground-truth context, where the model could see it
+    # but the "must return a supplied URL" guard forbade returning it.
+    wikidata_url = (getattr(wiki_meta, "social_links", None) or {}).get(platform, "")
+    if wikidata_url:
+        _add_candidate(candidates, seen, platform, wikidata_url, "wikidata",
+                       {"declared_by_wikidata": True})
     for cand in serper_candidates:
         _add_candidate(candidates, seen, platform, cand.get("url", ""),
                        cand.get("source", "serper"), cand.get("meta"))
@@ -882,12 +895,17 @@ def _gather_serper_candidates(
     for c in raw:
         _add_candidate(candidates, seen, platform, c.get("url", ""),
                        c.get("source", "serper"), c.get("meta"))
-    # No Serper hit — try a known handle reused from another platform (no search).
-    if not candidates:
-        for slug in anchor_slugs:
-            url = social_urls.profile_url_from_handle(slug, platform)
-            _add_candidate(candidates, seen, platform, url, "handle_fanout",
-                           {"handle_reused_from_known_profile_on_another_platform": slug})
+    # ALWAYS also offer the known distinctive handle this subject reuses on other
+    # platforms — even when Serper returned something. A wrong Serper top-hit
+    # (very common on X: a journalist, a namesake, a related account) must not
+    # SUPPRESS reusing a handle the client already confirmed elsewhere. The
+    # decision step corroborates the reused handle and picks it over the wrong
+    # hit. (_add_candidate de-dupes, so a Serper result that already IS the
+    # reused handle is not doubled.)
+    for slug in anchor_slugs:
+        url = social_urls.profile_url_from_handle(slug, platform)
+        _add_candidate(candidates, seen, platform, url, "handle_fanout",
+                       {"handle_reused_from_known_profile_on_another_platform": slug})
 
     if rejected:
         norm_rejected = {social_urls.normalize_profile_url(u, platform).lower() for u in rejected}
@@ -969,11 +987,29 @@ def _decide_no_wiki_platform(
                 evidence=[signal], decision="verified",
             )
 
-    # 3. Nothing corroborated. Only links an INDEPENDENT search found go to manual
-    #    review; a synthesised handle-guess that didn't link back is not something
-    #    the search located, so it must not be presented as a candidate.
+    # 3. Nothing corroborated → manual review. We stay conservative on writing
+    #    (no LLM, no auto-Verify of an unconfirmed guess), but we still SURFACE
+    #    the best candidate for the analyst.
     search_urls = [c["url"] for c in candidates
                    if c.get("source") != "handle_fanout" and c.get("url")]
+    # The distinctive handle this subject reuses on another platform is a strong
+    # hint — far more likely correct than a stray Serper hit (a journalist, a
+    # namesake). Surface it as the review candidate rather than letting a wrong
+    # Serper top-hit be the one presented; it is NOT auto-Verified.
+    fanout_url = next((c["url"] for c in candidates
+                       if c.get("source") == "handle_fanout" and c.get("url")), "")
+
+    if fanout_url:
+        others = "  |  ".join(u for u in search_urls if u != fanout_url)
+        reason = ("Likely handle reused from another platform this subject owns — "
+                  "not independently confirmed, review before accepting."
+                  + (f" Other candidates the search returned: {others}" if others else ""))
+        return VerificationResult(
+            platform=platform, best_candidate=fanout_url, status=STATUS_MANUAL,
+            confidence=0, decision="manual_review",
+            source="Handle reuse (no Wikipedia)", reason=reason,
+        )
+
     if not search_urls:
         if errored or not searched:
             return VerificationResult(

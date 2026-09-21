@@ -197,6 +197,32 @@ def _new_frame(rows: List[Dict[str, str]]) -> pd.DataFrame:
     return df.astype(object)
 
 
+# A single handle cell that resolves to this many DISTINCT handles is treated as
+# a data-export artifact (a list of other entities' handles), not the brand's own.
+_MULTI_HANDLE_THRESHOLD = 3
+
+
+def _distinct_handle_count(raw_value: str, platform: str) -> int:
+    """
+    How many DISTINCT valid profile handles a (possibly multi-line / pipe-
+    delimited) cell resolves to for ``platform``.
+
+    Client exports sometimes pack one cell with many rows like
+    ``atlutd|2018-06-24|...\\ndcunited|...\\nlafc|...`` — a time series of OTHER
+    entities' handles, not this brand's. Counting the distinct handles lets the
+    loader spot that and refuse to adopt the first one as a confident handle.
+    """
+    seen: set = set()
+    for line in re.split(r"[\r\n]+", str(raw_value or "")):
+        token = line.split("|", 1)[0].strip()
+        if not token:
+            continue
+        url = social_urls.coerce_profile_url(token, platform)
+        if url:
+            seen.add((social_urls.handle_from_url(url, platform) or url).lower())
+    return len(seen)
+
+
 def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
     """Read an .xlsx/.xls/.csv into the verification schema (Talent Name + Wikipedia URL)."""
     excel_path = Path(excel_path)
@@ -257,7 +283,15 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
         for platform, col in handle_cols.items():
             # _clean_str first: a bare pandas NaN stringifies to "nan", which
             # would otherwise be accepted as the handle "nan".
-            url = social_urls.coerce_profile_url(_clean_str(raw.iloc[i][col]), platform)
+            raw_cell = _clean_str(raw.iloc[i][col])
+            # A cell that resolves to many DIFFERENT handles is a data-export
+            # artifact (e.g. a broadcast's featured-team time-series), not this
+            # brand's own handle — do NOT confidently adopt the first one as
+            # Verified. Leave the platform to discovery instead. A one- or
+            # two-handle cell (a brand's own name + an alias) is left untouched.
+            if _distinct_handle_count(raw_cell, platform) >= _MULTI_HANDLE_THRESHOLD:
+                continue
+            url = social_urls.coerce_profile_url(raw_cell, platform)
             if url:
                 known[platform] = url
         handle_hits += len(known)
