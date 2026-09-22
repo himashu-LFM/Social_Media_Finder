@@ -567,6 +567,24 @@ def fetch_wiki_metadata(
             if not platform.startswith("_"):
                 meta.social_links[platform] = url
 
+        # Step 2 — scrape the official website's footer/header for first-party
+        # social links, for any platform Wikidata did not already declare. This
+        # is the authoritative fallback the pipeline was missing: for a brand
+        # like FC Dallas it recovers the real Facebook/Instagram/X/YouTube from
+        # its own site. Wikidata (higher confidence) is never overwritten.
+        _TARGET_PLATFORMS = ("Instagram", "Facebook", "YouTube", "TikTok", "X")
+        if meta.official_website and any(p not in meta.social_links for p in _TARGET_PLATFORMS):
+            try:
+                site_socials = wd.crawl_official_website(meta.official_website, talent)
+            except Exception:  # noqa: BLE001 — a failed scrape must never abort the row
+                site_socials = {}
+            for platform, value in (site_socials or {}).items():
+                if platform.startswith("_") or platform in meta.social_links:
+                    continue
+                url = value[0] if isinstance(value, tuple) else value
+                if url:
+                    meta.social_links[platform] = url
+
         # Reference identity sources beyond Wikipedia (IMDb, Spotify, TMDb).
         meta.reference_urls = _extract_reference_urls(claims)
 

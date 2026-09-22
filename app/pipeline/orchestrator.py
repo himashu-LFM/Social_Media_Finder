@@ -529,13 +529,14 @@ def _resolve_platform_serper(
 
     Candidate order (all are judged by the LLM; none is auto-accepted):
       1. the profile the CLIENT already has on file for this platform
-      2. the profile Wikidata DECLARES for this platform (P2003/P2397/… — the
-         authoritative source; without this a channel Wikidata names outright,
-         e.g. a YouTube channel, could never be picked because Serper's
-         "<name> site:youtube.com" mostly returns videos, not the channel)
+      2. the profile Wikidata DECLARES for this platform (P2003/P2397/… — plus
+         any link scraped from the official website; the authoritative sources,
+         without which a YouTube channel Wikidata names outright could never be
+         picked, since "<name> site:youtube.com" mostly returns videos)
       3. the top Serper "<name> site:<domain>" result
-      4. ONLY if the above produced nothing: the client's handle from ANOTHER
-         platform, reused here — a cheap recall rescue that costs no search.
+    We do NOT synthesise a candidate by reusing a handle from another platform:
+    manufacturing an unverified URL yields confident wrong links for individuals.
+    Nothing found across 1-3 ⇒ Not Found, not a guess.
     """
     decisions = decisions or {}
     # A human already ruled on this cell — return it and spend nothing. This is
@@ -569,14 +570,13 @@ def _resolve_platform_serper(
         _add_candidate(candidates, seen, platform, cand.get("url", ""),
                        cand.get("source", "serper"), cand.get("meta"))
 
-    if not candidates:
-        for slug in (fanout_slugs or []):
-            url = social_urls.profile_url_from_handle(slug, platform)
-            _add_candidate(candidates, seen, platform, url, "handle_fanout",
-                           {"handle_reused_from_client_profile_on_another_platform": slug})
-        if candidates:
-            print(f"  [FANOUT] {platform} | {talent} -> trying known handle(s) "
-                  f"{fanout_slugs} (Serper found nothing)")
+    # NOTE: we deliberately do NOT synthesise a candidate by reusing a handle from
+    # another platform. Manufacturing a URL the pipeline never actually found or
+    # corroborated produces confident-looking wrong links for individuals who do
+    # not reuse one handle everywhere. When the authoritative sources (client
+    # handle, Wikidata, official-website scrape) and Serper all find nothing, the
+    # honest answer is Not Found. ``fanout_slugs`` is still used below, as EVIDENCE
+    # for corroborating a profile an independent search actually surfaced.
 
     # Drop anything an analyst has already rejected, comparing on the normalised
     # URL so a trailing slash or scheme difference can't smuggle it back in.
@@ -895,17 +895,10 @@ def _gather_serper_candidates(
     for c in raw:
         _add_candidate(candidates, seen, platform, c.get("url", ""),
                        c.get("source", "serper"), c.get("meta"))
-    # ALWAYS also offer the known distinctive handle this subject reuses on other
-    # platforms — even when Serper returned something. A wrong Serper top-hit
-    # (very common on X: a journalist, a namesake, a related account) must not
-    # SUPPRESS reusing a handle the client already confirmed elsewhere. The
-    # decision step corroborates the reused handle and picks it over the wrong
-    # hit. (_add_candidate de-dupes, so a Serper result that already IS the
-    # reused handle is not doubled.)
-    for slug in anchor_slugs:
-        url = social_urls.profile_url_from_handle(slug, platform)
-        _add_candidate(candidates, seen, platform, url, "handle_fanout",
-                       {"handle_reused_from_known_profile_on_another_platform": slug})
+    # We do NOT synthesise a candidate from a reused handle. A manufactured URL
+    # the search never surfaced becomes a confident wrong link for anyone who
+    # doesn't reuse one handle everywhere. ``anchor_slugs`` is still used as
+    # EVIDENCE to corroborate a profile an independent search actually found.
 
     if rejected:
         norm_rejected = {social_urls.normalize_profile_url(u, platform).lower() for u in rejected}
@@ -919,14 +912,6 @@ def _gather_serper_candidates(
     if candidates:
         _enrich_candidates(candidates, platform)
     return candidates, searched, errored
-
-
-def _top_search_handle(candidates: List[dict]) -> str:
-    """Lowercased handle of the top INDEPENDENT search hit (a fanout guess we
-    synthesised does not count — it would reuse a known handle by construction)."""
-    top = next((c for c in candidates
-                if c.get("source") != "handle_fanout" and c.get("url")), None)
-    return _handle_from_url(top["url"]).lower() if top else ""
 
 
 def _decide_no_wiki_platform(
@@ -969,11 +954,15 @@ def _decide_no_wiki_platform(
 
     # 2. Cross-platform agreement: the top independent search hit reuses a
     #    distinctive handle that another platform's search ALSO returned. Two
-    #    independent searches converging on the same handle is strong evidence
-    #    even with no client-supplied anchor to seed it.
+    #    independent searches converging on the same handle is strong evidence —
+    #    BUT only if the candidate actually presents as this subject. Without that
+    #    check, a subject with no accounts (e.g. "Princess Grace of Monaco") lets
+    #    Serper's popular fallback (Lady Gaga's @ladygaga, returned on IG AND
+    #    TikTok) get auto-Verified. _claims_identity gates on the profile's own
+    #    displayed name, not the handle string.
     top = next((c for c in candidates
                 if c.get("source") != "handle_fanout" and c.get("url")), None)
-    if top:
+    if top and _claims_identity(top, talent):
         h = _handle_from_url(top["url"]).lower()
         if h and len(h) >= _MIN_ANCHOR_HANDLE_LEN and h in mutual_handles:
             signal = (f"The distinctive handle '{h}' was independently returned by the "
@@ -987,28 +976,10 @@ def _decide_no_wiki_platform(
                 evidence=[signal], decision="verified",
             )
 
-    # 3. Nothing corroborated → manual review. We stay conservative on writing
-    #    (no LLM, no auto-Verify of an unconfirmed guess), but we still SURFACE
-    #    the best candidate for the analyst.
+    # 3. Nothing corroborated → manual review on what an INDEPENDENT search
+    #    actually found, or Not Found. We never surface a manufactured handle.
     search_urls = [c["url"] for c in candidates
                    if c.get("source") != "handle_fanout" and c.get("url")]
-    # The distinctive handle this subject reuses on another platform is a strong
-    # hint — far more likely correct than a stray Serper hit (a journalist, a
-    # namesake). Surface it as the review candidate rather than letting a wrong
-    # Serper top-hit be the one presented; it is NOT auto-Verified.
-    fanout_url = next((c["url"] for c in candidates
-                       if c.get("source") == "handle_fanout" and c.get("url")), "")
-
-    if fanout_url:
-        others = "  |  ".join(u for u in search_urls if u != fanout_url)
-        reason = ("Likely handle reused from another platform this subject owns — "
-                  "not independently confirmed, review before accepting."
-                  + (f" Other candidates the search returned: {others}" if others else ""))
-        return VerificationResult(
-            platform=platform, best_candidate=fanout_url, status=STATUS_MANUAL,
-            confidence=0, decision="manual_review",
-            source="Handle reuse (no Wikipedia)", reason=reason,
-        )
 
     if not search_urls:
         if errored or not searched:
@@ -1091,7 +1062,14 @@ def _row_serper_corroborate_phase(
     for platform, g in gathered.items():
         if not g:
             continue
-        h = _top_search_handle(g[0])
+        top = next((c for c in g[0]
+                    if c.get("source") != "handle_fanout" and c.get("url")), None)
+        # Only a candidate that PRESENTS as this subject can contribute to
+        # cross-platform agreement — a famous unrelated account Serper returned
+        # as a fallback (e.g. Lady Gaga) must not count as corroboration.
+        if not top or not _claims_identity(top, talent):
+            continue
+        h = _handle_from_url(top["url"]).lower()
         if h and len(h) >= _MIN_ANCHOR_HANDLE_LEN:
             handle_plats.setdefault(h, set()).add(platform)
     mutual_handles = {h for h, plats in handle_plats.items() if len(plats) >= 2}
