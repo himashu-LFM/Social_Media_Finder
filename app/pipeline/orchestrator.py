@@ -914,14 +914,6 @@ def _gather_serper_candidates(
     return candidates, searched, errored
 
 
-def _top_search_handle(candidates: List[dict]) -> str:
-    """Lowercased handle of the top INDEPENDENT search hit (a fanout guess we
-    synthesised does not count — it would reuse a known handle by construction)."""
-    top = next((c for c in candidates
-                if c.get("source") != "handle_fanout" and c.get("url")), None)
-    return _handle_from_url(top["url"]).lower() if top else ""
-
-
 def _decide_no_wiki_platform(
     talent: str, platform: str, candidates: List[dict],
     searched: bool, errored: bool,
@@ -962,11 +954,15 @@ def _decide_no_wiki_platform(
 
     # 2. Cross-platform agreement: the top independent search hit reuses a
     #    distinctive handle that another platform's search ALSO returned. Two
-    #    independent searches converging on the same handle is strong evidence
-    #    even with no client-supplied anchor to seed it.
+    #    independent searches converging on the same handle is strong evidence —
+    #    BUT only if the candidate actually presents as this subject. Without that
+    #    check, a subject with no accounts (e.g. "Princess Grace of Monaco") lets
+    #    Serper's popular fallback (Lady Gaga's @ladygaga, returned on IG AND
+    #    TikTok) get auto-Verified. _claims_identity gates on the profile's own
+    #    displayed name, not the handle string.
     top = next((c for c in candidates
                 if c.get("source") != "handle_fanout" and c.get("url")), None)
-    if top:
+    if top and _claims_identity(top, talent):
         h = _handle_from_url(top["url"]).lower()
         if h and len(h) >= _MIN_ANCHOR_HANDLE_LEN and h in mutual_handles:
             signal = (f"The distinctive handle '{h}' was independently returned by the "
@@ -1066,7 +1062,14 @@ def _row_serper_corroborate_phase(
     for platform, g in gathered.items():
         if not g:
             continue
-        h = _top_search_handle(g[0])
+        top = next((c for c in g[0]
+                    if c.get("source") != "handle_fanout" and c.get("url")), None)
+        # Only a candidate that PRESENTS as this subject can contribute to
+        # cross-platform agreement — a famous unrelated account Serper returned
+        # as a fallback (e.g. Lady Gaga) must not count as corroboration.
+        if not top or not _claims_identity(top, talent):
+            continue
+        h = _handle_from_url(top["url"]).lower()
         if h and len(h) >= _MIN_ANCHOR_HANDLE_LEN:
             handle_plats.setdefault(h, set()).add(platform)
     mutual_handles = {h for h, plats in handle_plats.items() if len(plats) >= 2}
