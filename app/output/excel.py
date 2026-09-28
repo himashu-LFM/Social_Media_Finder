@@ -60,6 +60,14 @@ INPUT_HANDLES_COL = "_input_handles"
 # Not part of ``ordered_columns``; dropped before the tool-schema export.
 SOURCE_ROW_COL = "_source_row"
 
+# Working-only column holding a distributor/label YouTube channel that was supplied
+# with a pipe (e.g. "http://www.youtube.com/@sonypictures|Spider-Man: Brand New
+# Day"). The pipe marks a channel shared across many titles, NOT this title's own,
+# so it is never trusted or scraped: YouTube is sent to discovery, and this URL is
+# only surfaced — flagged — if no title-specific channel is found.
+# Not part of ``ordered_columns`` so it is dropped before export.
+YT_DISTRIBUTOR_COL = "_youtube_distributor"
+
 # Two columns appended to the brand-report export (the only additions):
 #   needs_manual_review  — platforms found but NOT sure (search-fallback links)
 #   manual_review_reason — why, plus every candidate link when it's ambiguous
@@ -187,10 +195,12 @@ def _new_frame(rows: List[Dict[str, str]]) -> pd.DataFrame:
     for col in ordered_columns():
         if col not in df.columns:
             df[col] = ""
-    for working_col in (INPUT_META_COL, INPUT_HANDLES_COL, SOURCE_ROW_COL):
+    for working_col in (INPUT_META_COL, INPUT_HANDLES_COL, SOURCE_ROW_COL,
+                        YT_DISTRIBUTOR_COL):
         if working_col not in df.columns:
             df[working_col] = ""
-    df = df[ordered_columns() + [INPUT_META_COL, INPUT_HANDLES_COL, SOURCE_ROW_COL]]
+    df = df[ordered_columns() + [INPUT_META_COL, INPUT_HANDLES_COL, SOURCE_ROW_COL,
+                                 YT_DISTRIBUTOR_COL]]
     # Force object dtype so numeric confidences (and the metadata dict) can share
     # columns with strings — some pandas versions infer a strict `str` dtype for
     # all-string columns, which then rejects int/dict assignment.
@@ -280,6 +290,7 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
             if _clean_str(raw.iloc[i][c])
         }
         known: Dict[str, str] = {}
+        yt_distributor = ""
         for platform, col in handle_cols.items():
             # _clean_str first: a bare pandas NaN stringifies to "nan", which
             # would otherwise be accepted as the handle "nan".
@@ -291,6 +302,14 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
             # two-handle cell (a brand's own name + an alias) is left untouched.
             if _distinct_handle_count(raw_cell, platform) >= _MULTI_HANDLE_THRESHOLD:
                 continue
+            # A piped YouTube value ("<channel>|<title>") is a distributor/label
+            # channel shared across titles, not this title's own. Never trust or
+            # scrape it: record it as a flagged fallback and leave YouTube blank so
+            # discovery looks for the title's own channel.
+            if platform == "YouTube" and "|" in raw_cell:
+                left = raw_cell.split("|", 1)[0].strip()
+                yt_distributor = social_urls.coerce_profile_url(left, "YouTube") or left
+                continue
             url = social_urls.coerce_profile_url(raw_cell, platform)
             if url:
                 known[platform] = url
@@ -301,7 +320,7 @@ def load_talent_table_from_path(excel_path: Path) -> pd.DataFrame:
         rows.append({
             TALENT_COL: name, WIKI_COL: wiki,
             INPUT_META_COL: metadata, INPUT_HANDLES_COL: known,
-            SOURCE_ROW_COL: source_row,
+            SOURCE_ROW_COL: source_row, YT_DISTRIBUTOR_COL: yt_distributor,
         })
 
     if not rows:
@@ -558,7 +577,7 @@ def _compact_brand_id(source_row: object) -> str:
 
 def compact_columns() -> List[str]:
     """Column order for the compact sheet."""
-    cols: List[str] = ["brand_id", "name"]
+    cols: List[str] = ["brand_id", "name", WIKI_COL]
     for platform in PLATFORM_ORDER:
         cols.extend([platform, platform + _COMPACT_STATUS_SUFFIX])
     cols.append("reason")
@@ -589,6 +608,7 @@ def save_compact_report(
         rec: Dict[str, str] = {
             "brand_id": _compact_brand_id(src),
             "name": _clean_str(row.get(TALENT_COL, "")),
+            WIKI_COL: _clean_str(row.get(WIKI_COL, "")),
         }
         reason_bits: List[str] = []
         for platform in PLATFORM_ORDER:

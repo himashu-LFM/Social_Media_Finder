@@ -89,6 +89,12 @@ _USABLE_STATUSES = {STATUS_VERIFIED, STATUS_MANUAL}
 # account from a fan page or an empty impostor with the same name.
 _OG_FETCH_PLATFORMS = {"Facebook", "YouTube", "Instagram"}
 
+# Platforms whose client-supplied handle is trusted as-is (Verified, no re-check).
+# The tester treats only the Instagram and YouTube columns of the BDR as the source
+# of truth; Facebook / X / TikTok values are re-verified like any discovered link,
+# so a wrong handle or fan page sitting in the input file can still be caught.
+_TRUSTED_INPUT_PLATFORMS = {"Instagram", "YouTube"}
+
 # Candidates fetched per platform from Serper. Was 1, which made namesake
 # collisions invisible: the model could not weigh three same-named accounts
 # because it only ever saw one of them. Env-overridable.
@@ -706,12 +712,13 @@ def _row_bio_link_phase(
     }
     adopted: Dict[str, VerificationResult] = {}
 
-    # Trust EVERY handle the client supplied — for all five platforms, not just
-    # the Instagram/YouTube anchors we read for bio links. A Facebook/X/TikTok URL
-    # in the file is the client asserting it; re-searching it would waste spend and
-    # would wrongly land a client-supplied profile in Manual Review.
+    # Trust only the Instagram and YouTube handles the client supplied — these are
+    # the anchors we also read for bio links and the tester's declared source of
+    # truth. Facebook / X / TikTok input handles are NOT adopted here; they fall
+    # through to the Serper phases and are re-verified like any discovered link, so
+    # a wrong or fan-page handle in the file can still be flagged.
     for platform, url in input_handles.items():
-        if platform in PLATFORMS and url and url not in rejected:
+        if platform in _TRUSTED_INPUT_PLATFORMS and url and url not in rejected:
             adopted[platform] = VerificationResult(
                 platform=platform, best_candidate=url,
                 status=STATUS_VERIFIED, confidence=100,
@@ -870,12 +877,19 @@ def _corroboration_signal(
 def _gather_serper_candidates(
     talent: str, platform: str, anchor_slugs: List[str],
     profession: str, template: str, rejected: set, prompt: str = "",
+    client_url: str = "",
 ) -> tuple[List[dict], bool, bool]:
     """
     Discover no-Wikipedia candidates for one platform (Serper + handle fanout),
     drop analyst-rejected ones, and enrich for back-link detection. Makes NO
     decision — that happens once every platform's candidates are known, so
     cross-platform agreement can be weighed. Returns ``(candidates, searched, errored)``.
+
+    ``client_url`` is a client-supplied handle for a non-trusted platform
+    (Facebook/X/TikTok). It is added as an ``input`` candidate so it is enriched
+    and can be corroborated (e.g. it back-links to the client's Instagram) — or,
+    failing that, surfaced for Manual Review rather than dropped. It never drives
+    cross-platform agreement (that is independent-search only).
     """
     searched = serper_service.is_configured()
     errored = False
@@ -892,6 +906,9 @@ def _gather_serper_candidates(
 
     candidates: List[dict] = []
     seen: set = set()
+    if client_url:
+        _add_candidate(candidates, seen, platform, client_url, "input",
+                       {"supplied_in_client_record": True})
     for c in raw:
         _add_candidate(candidates, seen, platform, c.get("url", ""),
                        c.get("source", "serper"), c.get("meta"))
@@ -961,7 +978,7 @@ def _decide_no_wiki_platform(
     #    TikTok) get auto-Verified. _claims_identity gates on the profile's own
     #    displayed name, not the handle string.
     top = next((c for c in candidates
-                if c.get("source") != "handle_fanout" and c.get("url")), None)
+                if c.get("source") not in ("handle_fanout", "input") and c.get("url")), None)
     if top and _claims_identity(top, talent):
         h = _handle_from_url(top["url"]).lower()
         if h and len(h) >= _MIN_ANCHOR_HANDLE_LEN and h in mutual_handles:
@@ -1024,10 +1041,15 @@ def _row_serper_corroborate_phase(
     input_handles = input_handles or {}
     resolved = dict(resolved or {})
 
-    # Anchor set = the client's own handles PLUS anything Phase 0 already Verified
-    # this row (e.g. a channel harvested from the client's Instagram bio). Both are
-    # trustworthy handles this subject is known to own.
-    known_profiles: Dict[str, str] = dict(input_handles)
+    # Anchor set = the client's TRUSTED handles (Instagram/YouTube) PLUS anything
+    # Phase 0 already Verified this row (e.g. a channel harvested from the client's
+    # Instagram bio). A client-supplied Facebook/X/TikTok handle is deliberately NOT
+    # an anchor — it is unverified, so letting it corroborate itself would be
+    # circular. It still enters discovery below as a candidate to be verified.
+    known_profiles: Dict[str, str] = {
+        p: u for p, u in input_handles.items()
+        if p in _TRUSTED_INPUT_PLATFORMS and u
+    }
     for platform, result in resolved.items():
         if result.status == STATUS_VERIFIED and result.best_candidate:
             known_profiles.setdefault(platform, result.best_candidate)
@@ -1053,7 +1075,8 @@ def _row_serper_corroborate_phase(
             gathered[platform] = None
             continue
         gathered[platform] = _gather_serper_candidates(
-            talent, platform, anchor_slugs, profession, template, rejected, prompt)
+            talent, platform, anchor_slugs, profession, template, rejected, prompt,
+            client_url=input_handles.get(platform, ""))
 
     # Cross-platform agreement map: a distinctive handle (>= the anchor length)
     # that the top independent search hit shares across >= 2 platforms
@@ -1063,10 +1086,12 @@ def _row_serper_corroborate_phase(
         if not g:
             continue
         top = next((c for c in g[0]
-                    if c.get("source") != "handle_fanout" and c.get("url")), None)
+                    if c.get("source") not in ("handle_fanout", "input") and c.get("url")), None)
         # Only a candidate that PRESENTS as this subject can contribute to
         # cross-platform agreement — a famous unrelated account Serper returned
-        # as a fallback (e.g. Lady Gaga) must not count as corroboration.
+        # as a fallback (e.g. Lady Gaga) must not count as corroboration. A
+        # client-supplied ("input") handle is excluded too: agreement is
+        # independent-search evidence, not the client's own assertion echoed back.
         if not top or not _claims_identity(top, talent):
             continue
         h = _handle_from_url(top["url"]).lower()
@@ -1296,9 +1321,44 @@ def _corroborate_row(
     return final
 
 
-def _assemble_row_out(results: Dict[str, VerificationResult]) -> Dict[str, Any]:
-    """Turn per-platform results into the row's {column -> value} dict."""
-    out: Dict[str, Any] = {}
+def _apply_yt_distributor_override(
+    results: Dict[str, VerificationResult], distributor_url: str,
+) -> Dict[str, VerificationResult]:
+    """
+    Surface a distributor/label YouTube channel ONLY as a flagged fallback.
+
+    The input carried a shared channel ("<channel>|<title>") that is not this
+    title's own, so it was kept out of discovery. If discovery then found no
+    title-specific channel, we still show the distributor URL — flagged Manual
+    Review — instead of a bare "Not Found", so the analyst has the lead. A real
+    title channel that discovery DID find is left untouched.
+    """
+    if not distributor_url:
+        return results
+    yt = results.get("YouTube")
+    if yt and yt.best_candidate and yt.status not in (STATUS_NOT_FOUND, STATUS_STOPPED):
+        return results  # discovery found a title-specific channel — keep it
+    results = dict(results)
+    results["YouTube"] = VerificationResult(
+        platform="YouTube", best_candidate=distributor_url,
+        status=STATUS_MANUAL, confidence=0, decision="manual_review",
+        source="Input file (distributor channel)",
+        reason=("The supplied YouTube link is a distributor/label channel shared "
+                "across titles, not this title's own channel, and no title-specific "
+                "channel was found — manual review needed."),
+    )
+    return results
+
+
+def _assemble_row_out(results: Dict[str, VerificationResult],
+                      wiki_url: str = "") -> Dict[str, Any]:
+    """Turn per-platform results into the row's {column -> value} dict.
+
+    ``wiki_url`` is the Wikipedia page the tool resolved as ground truth for this
+    row (empty when the row had no Wikipedia page). It is surfaced in the export
+    so an analyst can use it as a validation reference.
+    """
+    out: Dict[str, Any] = {excel_service.WIKI_COL: wiki_url or ""}
     usable_confidences: List[int] = []
     for platform in PLATFORMS:
         result = results.get(platform) or VerificationResult(
@@ -1353,6 +1413,7 @@ def _resolve_row_result(
     platform_progress: Optional[Callable[[str, str], None]] = None,
     input_handles: Optional[Dict[str, str]] = None,
     options: search_options.SearchOptions = search_options.DEFAULT,
+    yt_distributor_url: str = "",
 ) -> Dict[str, Any]:
     """
     Run the full verification workflow for ONE talent (both phases) and return a
@@ -1377,7 +1438,8 @@ def _resolve_row_result(
         final = _row_serper_corroborate_phase(
             talent, input_handles, input_metadata, decisions, options,
             resolved, platform_progress)
-        return _assemble_row_out(final)
+        final = _apply_yt_distributor_override(final, yt_distributor_url)
+        return _assemble_row_out(final)  # no Wikipedia ground truth for this row
 
     wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
 
@@ -1405,7 +1467,8 @@ def _resolve_row_result(
     # Cross-platform corroboration: rescue Manual Reviews using handles confirmed
     # (Verified) on other platforms this run.
     final = _corroborate_row(talent, wiki_meta, final, options=options)
-    return _assemble_row_out(final)
+    final = _apply_yt_distributor_override(final, yt_distributor_url)
+    return _assemble_row_out(final, wiki_meta.wikipedia_url or wiki_url)
 
 
 def load_decisions(talents: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
@@ -1433,7 +1496,7 @@ def load_decisions(talents: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
 
 
 def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
-    """Read (talent, wiki_url, input_metadata, input_handles) for a row."""
+    """Read (talent, wiki_url, input_metadata, input_handles, yt_distributor) for a row."""
     talent = str(df.at[row_label, excel_service.TALENT_COL] or "").strip()
     wiki_url = str(df.at[row_label, excel_service.WIKI_COL] or "").strip()
     input_metadata: dict = {}
@@ -1446,7 +1509,10 @@ def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
         raw_handles = df.at[row_label, excel_service.INPUT_HANDLES_COL]
         if isinstance(raw_handles, dict):
             input_handles = raw_handles
-    return talent, wiki_url, input_metadata, input_handles
+    yt_distributor = ""
+    if excel_service.YT_DISTRIBUTOR_COL in df.columns:
+        yt_distributor = str(df.at[row_label, excel_service.YT_DISTRIBUTOR_COL] or "").strip()
+    return talent, wiki_url, input_metadata, input_handles, yt_distributor
 
 
 def process_row(
@@ -1455,13 +1521,14 @@ def process_row(
     platform_progress: Optional[Callable[[str, str], None]] = None,
 ) -> None:
     """Single-row entry point (in place). Kept for the sequential / CLI path."""
-    talent, wiki_url, input_metadata, input_handles = _row_inputs(df, row_label)
+    talent, wiki_url, input_metadata, input_handles, yt_distributor = _row_inputs(df, row_label)
     if not talent:
         return
     print(f"\n{'=' * 65}\nProcessing: {talent}")
     result = _resolve_row_result(talent, wiki_url, input_metadata,
                                  apify_candidates=None, platform_progress=platform_progress,
-                                 input_handles=input_handles)
+                                 input_handles=input_handles,
+                                 yt_distributor_url=yt_distributor)
     for col, val in result.items():
         df.at[row_label, col] = val
 
@@ -1501,9 +1568,10 @@ def run_pipeline_on_dataframe(
     # Collect processable rows (skip blank names), preserving 0-based index.
     rows = []
     for idx, row_label in enumerate(df.index):
-        talent, wiki_url, input_metadata, input_handles = _row_inputs(df, row_label)
+        talent, wiki_url, input_metadata, input_handles, yt_distributor = _row_inputs(df, row_label)
         if talent:
-            rows.append((idx, row_label, talent, wiki_url, input_metadata, input_handles))
+            rows.append((idx, row_label, talent, wiki_url, input_metadata,
+                         input_handles, yt_distributor))
 
     total = len(rows)
     print(f"[PIPELINE] Verification run started for {total} talent row(s) "
@@ -1515,7 +1583,7 @@ def run_pipeline_on_dataframe(
 
     # ── Phase A: Serper-primary discovery + verification for every row ──
     def _phase_a(entry: tuple) -> dict:
-        idx, row_label, talent, wiki_url, input_metadata, input_handles = entry
+        idx, row_label, talent, wiki_url, input_metadata, input_handles, yt_distributor = entry
         # Rows still queued when the operator stops are returned untouched, so no
         # Wikipedia/Serper/LLM budget is spent on work nobody is waiting for.
         if _is_cancelled(should_cancel):
@@ -1571,8 +1639,9 @@ def run_pipeline_on_dataframe(
                 for p in PLATFORMS
             }
         return {"idx": idx, "row_label": row_label, "talent": talent,
-                "wiki_meta": wiki_meta, "phase1": phase1, "cancelled": False,
-                "has_wiki": has_wiki}
+                "wiki_meta": wiki_meta, "wiki_url": wiki_url, "phase1": phase1,
+                "cancelled": False, "has_wiki": has_wiki,
+                "yt_distributor": yt_distributor}
 
     workers = max(1, min(PIPELINE_ROW_WORKERS, total or 1))
     phase_a: List[dict] = []
@@ -1604,23 +1673,28 @@ def run_pipeline_on_dataframe(
     def _phase_b(r: dict) -> tuple:
         # Once stopped, assemble what Phase A produced instead of spending more
         # Apify/LLM calls — partial results are still saved and viewable.
+        wiki_out = r["wiki_meta"].wikipedia_url or r.get("wiki_url", "")
+        distributor = r.get("yt_distributor", "")
         if r.get("cancelled") or _is_cancelled(should_cancel):
-            return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
+            return r["row_label"], r["idx"], _assemble_row_out(r["phase1"], wiki_out)
         # No-wiki rows are already final from Phase 0 + Serper corroboration — no
         # Apify backup, no LLM cross-platform corroboration (both need a verdict
         # to adjudicate, which only the Wikipedia flow has).
         if not r.get("has_wiki"):
-            return r["row_label"], r["idx"], _assemble_row_out(r["phase1"])
+            final = _apply_yt_distributor_override(r["phase1"], distributor)
+            return r["row_label"], r["idx"], _assemble_row_out(final, wiki_out)
         try:
             final = _row_apify_phase(
                 r["talent"], r["wiki_meta"], r["phase1"], apify_map.get(r["talent"], {}),
                 options=options,
             )
             final = _corroborate_row(r["talent"], r["wiki_meta"], final, options=options)
-            out = _assemble_row_out(final)
+            final = _apply_yt_distributor_override(final, distributor)
+            out = _assemble_row_out(final, wiki_out)
         except Exception as exc:  # noqa: BLE001
             print(f"  [PIPELINE] Apify phase failed for '{r['talent']}': {exc}")
-            out = _assemble_row_out(r["phase1"])
+            final = _apply_yt_distributor_override(r["phase1"], distributor)
+            out = _assemble_row_out(final, wiki_out)
         return r["row_label"], r["idx"], out
 
     done = 0
@@ -1640,7 +1714,9 @@ def run_pipeline_on_dataframe(
     # alone produced. Stashed on the frame so the caller can save it separately.
     serper_df = df.copy()
     for r in phase_a:
-        for col, val in _assemble_row_out(r["phase1"]).items():
+        wiki_out = r["wiki_meta"].wikipedia_url or r.get("wiki_url", "")
+        phase1 = _apply_yt_distributor_override(r["phase1"], r.get("yt_distributor", ""))
+        for col, val in _assemble_row_out(phase1, wiki_out).items():
             serper_df.at[r["row_label"], col] = val
     df.attrs["serper_df"] = serper_df
 
