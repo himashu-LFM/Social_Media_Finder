@@ -41,6 +41,27 @@ def test_allows_official_page_written_in_third_person():
     assert vs._authenticity_block("Guy Branum", NOTABLE, c) == ""
 
 
+# ── non-official declared in the handle/URL itself (camelCase, no delimiters) ──
+
+def test_blocks_unofficial_declared_in_the_handle_even_with_evidence():
+    """Bill Murray: '.../BillMurrayUnofficialPage' declares itself, delimiter-free."""
+    c = cand("https://www.facebook.com/BillMurrayUnofficialPage",
+             display_name="Bill Murray", followers="120K", bio="Actor.")
+    assert vs._authenticity_block("Bill Murray", NOTABLE, c)
+
+
+def test_blocks_fanpage_declared_in_the_handle():
+    c = cand("https://www.instagram.com/shakirafanpage", followers="500K")
+    assert vs._authenticity_block("Shakira", NOTABLE, c)
+
+
+def test_a_real_official_handle_is_not_caught_by_the_token_check():
+    """'billygardellofficial' contains 'official', which is deliberately NOT a token."""
+    c = cand("https://www.instagram.com/billygardellofficial",
+             display_name="Billy Gardell", followers="200K")
+    assert vs._authenticity_block("Billy Gardell", NOTABLE, c) == ""
+
+
 # ── name-order mismatch ─────────────────────────────────────────────────────
 
 def test_blocks_reordered_name():

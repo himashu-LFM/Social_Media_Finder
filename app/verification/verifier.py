@@ -240,6 +240,17 @@ _FAN_HANDLE_RE = re.compile(
     re.I,
 )
 
+# Distinctive tokens a handle/URL uses to DECLARE itself a non-official account.
+# Matched as substrings after stripping separators, so a camelCase handle like
+# "BillMurrayUnofficialPage" is caught — which the delimiter-based _FAN_HANDLE_RE
+# above misses. Deliberately limited to tokens that essentially never occur inside
+# a real person's or brand's own handle: bare "fan" (Stefani, Fanning) and bare
+# "official" (BillyGardellOfficial) are intentionally NOT here.
+_NON_OFFICIAL_HANDLE_TOKENS = (
+    "unofficial", "fanpage", "fanspage", "fanaccount", "fanclub",
+    "fansite", "fanspot", "tribute", "parody", "notaffiliated",
+)
+
 # Evidence that is genuinely about the account holder rather than a search blurb.
 #
 # ``anchor_handle_match`` is set by the pipeline when a candidate's handle is an
@@ -369,6 +380,11 @@ def _authenticity_block(talent: str, ground_truth: Dict[str, Any],
         return (f"The profile describes itself in the third party (\"{phrase}\"), which "
                 f"indicates a fan, tribute or unofficial page rather than the person's own account.")
 
+    token = _handle_declares_non_official(cand)
+    if token:
+        return (f"The handle itself declares a non-official account (\"{token}\"), which "
+                f"indicates a fan, tribute or unofficial page rather than the person's own account.")
+
     shown = _name_order_mismatch(talent, cand)
     if shown:
         return (f"The displayed name \"{shown}\" uses the subject's words in a different order, "
@@ -389,6 +405,21 @@ def _authenticity_block(talent: str, ground_truth: Dict[str, Any],
 def _handle_from(url: str) -> str:
     m = re.search(r"(?:https?://)?[^/]+/(?:@|c/|channel/|user/)?([^/?#]+)", url or "")
     return m.group(1) if m else ""
+
+
+def _handle_declares_non_official(cand: Dict[str, Any]) -> str:
+    """The non-official token a candidate's handle/URL contains, or "".
+
+    Checks the username and the URL handle as separator-stripped substrings, so a
+    run-together handle ("BillMurrayUnofficialPage", "shakirafanpage") is caught.
+    """
+    meta = cand.get("meta") or {}
+    for part in (str(meta.get("username", "")), _handle_from(cand.get("url", ""))):
+        squashed = re.sub(r"[^a-z0-9]", "", part.lower())
+        for token in _NON_OFFICIAL_HANDLE_TOKENS:
+            if token in squashed:
+                return token
+    return ""
 
 
 @dataclass
