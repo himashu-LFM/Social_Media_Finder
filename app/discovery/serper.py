@@ -25,7 +25,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -262,10 +262,10 @@ def discover_candidates(
     return candidates
 
 
-# The default, used whenever no custom template is supplied. Keeping it here as
-# a literal means the Wikipedia flow and the custom flow run the same code path
-# with different templates — no separate branch to drift out of sync.
-DEFAULT_QUERY_TEMPLATE = "{name} site:{domain}"
+# The default, used whenever no custom template is supplied (the Wikipedia flow).
+# The name is quoted so Google treats it as an exact phrase — "John Smith"
+# site:instagram.com — which keeps the top results on the right person.
+DEFAULT_QUERY_TEMPLATE = '"{name}" site:{domain}'
 
 # The placeholders an analyst may use. Single source of truth: build_query
 # renders exactly these, and search_options.validate_template rejects anything
@@ -301,7 +301,8 @@ def build_query(template: str, talent: str, platform: str, domain: str,
 
 def discover_by_site(talent: str, platform: str, top_n: int = 1,
                      query_template: str = "", category: str = "",
-                     subcategory: str = "", prompt: str = "") -> List[dict]:
+                     subcategory: str = "", prompt: str = "",
+                     max_results: Optional[int] = None) -> List[dict]:
     """
     Simplified discovery for entities with NO Wikipedia link in the input.
 
@@ -309,6 +310,10 @@ def discover_by_site(talent: str, platform: str, top_n: int = 1,
     ``"Valentino Beauty site:instagram.com"``) and returns the TOP profile-URL
     result(s) only, each shaped like :func:`discover_candidates` output
     (``{url, source, meta{...}}``) with the full Serper metadata attached.
+
+    ``max_results`` caps how many of Google's ranked results are examined (the
+    Wikipedia flow passes 3 — a real profile almost always ranks in the top 3, and
+    looking further mostly adds namesakes). ``None`` examines them all.
     """
     if not is_configured():
         print("  [SERPER] Skipped site-search — SERPER_API_KEY not set.")
@@ -325,7 +330,7 @@ def discover_by_site(talent: str, platform: str, top_n: int = 1,
                         platform, domain, category, subcategory, prompt)
     # The template is part of the key: a custom query and the default query are
     # different searches and must not share a cache entry.
-    cache_key = (talent.strip().lower(), platform, top_n, query)
+    cache_key = (talent.strip().lower(), platform, top_n, query, max_results)
     with _DISCOVERY_LOCK:
         cached = _DISCOVERY_CACHE.get(cache_key)
     if cached is not None:
@@ -357,9 +362,12 @@ def discover_by_site(talent: str, platform: str, top_n: int = 1,
     )
     broad_counts = _parse_counts(blob)
 
+    # Only look at the top-ranked results when asked (the Wikipedia flow caps at 3).
+    ranked = organic[:max_results] if max_results else organic
+
     candidates: List[dict] = []
     seen: set = set()
-    for item in organic:
+    for item in ranked:
         link = item.get("link", "")
         if social_urls.platform_from_url(link) != platform:
             continue

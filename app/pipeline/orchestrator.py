@@ -102,6 +102,13 @@ SERPER_CANDIDATES_PER_PLATFORM = max(
     1, int(os.environ.get("SERPER_CANDIDATES_PER_PLATFORM", "4"))
 )
 
+# Wikipedia flow: how many of Google's top-ranked results to examine per platform.
+# A genuine profile almost always ranks in the first three; looking deeper mostly
+# surfaces namesakes. (Serper's site-search is the "<name> site:<domain>" query.)
+SERPER_WIKI_TOP_RESULTS = max(
+    1, int(os.environ.get("SERPER_WIKI_TOP_RESULTS", "3"))
+)
+
 # When several live accounts all claim the same identity, prefer surfacing the
 # choice to an analyst over silently picking one. Set to "0" to disable.
 AMBIGUITY_GUARD = os.environ.get("AMBIGUITY_GUARD", "1").strip() not in ("0", "false", "no")
@@ -169,6 +176,7 @@ def _serper_primary_candidate(
             talent, platform, top_n=SERPER_CANDIDATES_PER_PLATFORM,
             query_template=options.template,
             category=category, subcategory=subcategory,
+            max_results=SERPER_WIKI_TOP_RESULTS,
         ), False
     except RuntimeError as exc:
         print(f"  [PIPELINE] Serper site-search unavailable for {platform}/{talent}: {exc}")
@@ -269,6 +277,7 @@ _VERIFY_SOURCE_LABELS = {
     "serper": "Serper + LLM",
     "apify": "Apify + LLM",
     "handle_fanout": "Input handle reused + LLM",
+    "bio": "Bio link + LLM",
 }
 
 
@@ -668,24 +677,36 @@ def _row_taxonomy(input_metadata: Optional[Dict[str, str]]) -> tuple[str, str]:
 #  Phase 0 — first-party bio links (custom mode only)
 # ────────────────────────────────────────────────────────────────────────────
 
-def _bio_link_result(platform: str, url: str, anchor_platform: str,
-                     anchor_url: str) -> VerificationResult:
+def _validate_bio_candidate(
+    platform: str, url: str, wiki_meta: wikipedia_service.WikiMetadata,
+    anchor_platform: str, anchor_url: str,
+    options: search_options.SearchOptions,
+) -> Optional[VerificationResult]:
     """
-    A link the anchor profile publishes about itself.
+    Validate a profile SOURCED from a bio against the subject's name and category.
 
-    Confirmed without adjudication, by design: the account holder wrote it. The
-    reason text names the anchor so the assumption underneath it — that the
-    client's handle for this row is correct — stays auditable rather than
-    disappearing into a bare "Verified".
+    The link was published by the client's own trusted profile, so it is first-party
+    evidence — recorded as such so a genuine account is not lost to thin metadata —
+    but it is still run through the same adjudication a search hit gets (name and
+    category match, plus the fan/unofficial/tribute screen). Returns the Verified
+    result to adopt, or ``None`` when it does not validate, so the caller lets the
+    platform fall through to ordinary search.
     """
-    return VerificationResult(
-        platform=platform, best_candidate=url, status=STATUS_VERIFIED, confidence=100,
-        source=f"Phase 0 ({anchor_platform} bio)",
-        reason=(f"Published as a first-party link in the {anchor_platform} bio of "
-                f"{anchor_url} (handle supplied in the input file)."),
-        evidence=[f"{anchor_platform} profile {anchor_url} links to {url}"],
-        decision="verified",
-    )
+    cand = {
+        "url": url,
+        "source": "bio",
+        "meta": {
+            # First-party: the client's own verified profile links to this one.
+            "backlink_to_client_profile": anchor_url,
+        },
+    }
+    result = _verify(platform, wiki_meta, [cand], options)
+    if result.status != STATUS_VERIFIED:
+        print(f"  [BIO-LINKS] {platform} {url} not adopted "
+              f"({result.status}) — falls through to search.")
+        return None
+    result.source = f"{anchor_platform} bio + LLM"
+    return result
 
 
 def _row_bio_link_phase(
@@ -694,19 +715,26 @@ def _row_bio_link_phase(
     decisions: Optional[Dict[str, Dict[str, str]]] = None,
     options: search_options.SearchOptions = search_options.DEFAULT,
     should_cancel: Optional[Callable[[], bool]] = None,
+    wiki_meta: Optional[wikipedia_service.WikiMetadata] = None,
 ) -> Dict[str, VerificationResult]:
     """
     Read the client-supplied anchor profile and adopt the platforms it links to.
 
-    Returns only the platforms it filled; everything absent from the result
-    falls through to ordinary discovery. Runs for EVERY row: a link the client's
-    own Instagram/YouTube bio publishes is first-party regardless of whether the
-    row also has a Wikipedia page, so it is trusted (Verified) before any search.
+    The client's Instagram/YouTube handles are trusted as-is (the declared source
+    of truth). Every OTHER profile SOURCED from a bio — a link the anchor lists, or
+    one read from the Instagram bio via Apify — is VALIDATED against the subject's
+    name and category (the same AI check search hits get, including the fan/
+    unofficial/tribute screen) before it is trusted. A sourced profile that does
+    not validate is dropped, so the platform falls through to ordinary search.
+
+    ``wiki_meta`` is the ground truth to validate against; when absent a thin one
+    (name + category from the input row) is built.
     """
     if _is_cancelled(should_cancel):
         return {}
 
     input_handles = input_handles or {}
+    gt = wiki_meta or _thin_ground_truth(talent, None, input_handles)
     rejected = {
         url for url in ((decisions or {}).get("rejected") or {}).values() if url
     }
@@ -752,19 +780,24 @@ def _row_bio_link_phase(
         if url in rejected:
             print(f"  [BIO-LINKS] {platform} {url} skipped — previously rejected by an analyst.")
             continue
-        adopted[platform] = _bio_link_result(platform, url, anchor_platform, anchor_url)
+        # Validate the sourced profile against name + category before trusting it.
+        # A pass is adopted (Verified); a fail is dropped so the platform falls
+        # through to ordinary search.
+        result = _validate_bio_candidate(platform, url, gt, anchor_platform, anchor_url, options)
+        if result is not None:
+            adopted[platform] = result
 
     if adopted:
-        print(f"  [BIO-LINKS] '{talent}': {len(adopted)} platform(s) resolved with no "
-              f"search or LLM spend -> {', '.join(sorted(adopted))}")
+        print(f"  [BIO-LINKS] '{talent}': {len(adopted)} platform(s) resolved "
+              f"-> {', '.join(sorted(adopted))}")
 
     # Instagram is the column clients fill in, yet an anonymous read of it returns
     # almost nothing. So when a platform is still missing and the file gave an
     # Instagram handle, read that profile with the cookie-backed Apify actor. It
     # is the only reliable Instagram reader — but it is PAID, so it runs last
     # (after the free YouTube/Instagram reads above) and only for the gaps they
-    # left. Its links are as trustworthy as the client's own Instagram handle,
-    # so they are Verified, exactly like the free bio links.
+    # left. Its links are sourced from the client's own bio, so they go through the
+    # same name/category validation as the free bio links before being trusted.
     ig_url = (input_handles or {}).get("Instagram", "")
     missing = [p for p in PLATFORMS if p not in adopted]
     if ig_url and missing and apify_service.instagram_configured():
@@ -777,14 +810,10 @@ def _row_bio_link_phase(
         for platform, url in via_apify.items():
             if platform not in PLATFORMS or platform in adopted or url in rejected:
                 continue
-            adopted[platform] = VerificationResult(
-                platform=platform, best_candidate=url,
-                status=STATUS_VERIFIED, confidence=100,
-                source="Apify (Instagram bio)",
-                reason="Published in the client's Instagram bio (read via Apify).",
-                decision="verified",
-            )
-            added.append(platform)
+            result = _validate_bio_candidate(platform, url, gt, "Instagram", ig_url, options)
+            if result is not None:
+                adopted[platform] = result
+                added.append(platform)
         if added:
             print(f"  [APIFY-IG] '{talent}': {len(added)} platform(s) from the "
                   f"Instagram bio -> {', '.join(sorted(added))}")
@@ -1378,6 +1407,22 @@ def _assemble_row_out(results: Dict[str, VerificationResult],
     return out
 
 
+def _thin_ground_truth(
+    talent: str, input_metadata: Optional[dict] = None,
+    input_handles: Optional[Dict[str, str]] = None,
+) -> wikipedia_service.WikiMetadata:
+    """Name + category ground truth for a row with no Wikipedia lookup (no network).
+
+    Used to validate bio-sourced profiles against the subject's name and the
+    category the client supplied, when there is no richer Wikipedia record.
+    """
+    return wikipedia_service.WikiMetadata(
+        talent=talent, name=talent,
+        input_metadata=dict(input_metadata or {}),
+        client_recorded_profiles=dict(input_handles or {}),
+    )
+
+
 def _ground_truth(talent: str, wiki_url: str, input_metadata: dict,
                   input_handles: Optional[Dict[str, str]] = None
                   ) -> wikipedia_service.WikiMetadata:
@@ -1426,9 +1471,15 @@ def _resolve_row_result(
     decisions = load_decisions([talent]).get(talent.lower(), {})
     has_wiki = bool(wiki_url and wiki_url.strip())
 
-    # Phase 0 — first-party bio links (client handles + Instagram/YouTube bio +
-    # aggregator + Apify-IG). Runs for every row; its links are Verified.
-    resolved = _row_bio_link_phase(talent, input_handles, decisions, options)
+    # Ground truth up front: the full Wikipedia record when this row has one, else a
+    # thin name+category record. Phase 0 needs it to VALIDATE bio-sourced profiles.
+    wiki_meta = (_ground_truth(talent, wiki_url, input_metadata, input_handles)
+                 if has_wiki else _thin_ground_truth(talent, input_metadata, input_handles))
+
+    # Phase 0 — first-party bio links (client IG/YT handles trusted; every OTHER
+    # sourced profile validated against name + category before it is trusted).
+    resolved = _row_bio_link_phase(talent, input_handles, decisions, options,
+                                   wiki_meta=wiki_meta)
 
     # No Wikipedia URL on this row: no ground truth to adjudicate against, so we
     # do NOT run the LLM or the Apify backup. Serper fills the remaining blanks;
@@ -1440,8 +1491,6 @@ def _resolve_row_result(
             resolved, platform_progress)
         final = _apply_yt_distributor_override(final, yt_distributor_url)
         return _assemble_row_out(final)  # no Wikipedia ground truth for this row
-
-    wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
 
     # Phase 1 — Serper-primary discovery + verification.
     phase1 = _row_serper_phase(talent, wiki_meta, platform_progress,
@@ -1611,13 +1660,13 @@ def run_pipeline_on_dataframe(
         if has_wiki:
             wiki_meta = _ground_truth(talent, wiki_url, input_metadata, input_handles)
         else:
-            wiki_meta = wikipedia_service.WikiMetadata(talent=talent, name=talent)
+            wiki_meta = _thin_ground_truth(talent, input_metadata, input_handles)
         try:
             row_decisions = decisions_by_talent.get(talent.lower(), {})
-            # Phase 0 bio links run for every row (client handles + IG/YT bio +
-            # aggregator + Apify-IG), Verified.
+            # Phase 0 bio links run for every row: client IG/YT handles trusted;
+            # every OTHER sourced profile validated against name + category.
             resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
-                                           options, should_cancel)
+                                           options, should_cancel, wiki_meta=wiki_meta)
             if has_wiki:
                 phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
                                            input_handles=input_handles,

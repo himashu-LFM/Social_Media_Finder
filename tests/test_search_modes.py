@@ -21,14 +21,37 @@ from app.verification import verifier as vs
 
 # ── the default (Wikipedia) path must not have moved ────────────────────────
 
-def test_wikipedia_mode_renders_the_original_query():
+def test_wikipedia_mode_renders_the_quoted_query():
+    """The Wikipedia flow quotes the name so Google treats it as an exact phrase."""
     assert so.DEFAULT.template == ""
     assert (ss.build_query(ss.DEFAULT_QUERY_TEMPLATE, "Guy Branum", "Instagram",
-                           "instagram.com") == "Guy Branum site:instagram.com")
+                           "instagram.com") == '"Guy Branum" site:instagram.com')
 
 
 def test_wikipedia_mode_keeps_the_strict_thin_gate():
     assert so.DEFAULT.thin_gate == vs.GATE_STRICT
+
+
+def test_discovery_can_cap_to_the_top_ranked_results(monkeypatch):
+    """max_results limits how many of Google's results are examined (Wiki flow: 3)."""
+    organic = [
+        {"link": "https://www.instagram.com/explore/tags/x"},  # not a profile
+        {"link": "https://www.instagram.com/p/ABC123"},        # a post
+        {"link": "https://www.instagram.com/news_at_three"},   # a profile, position 3
+        {"link": "https://www.instagram.com/the_real_one"},    # a profile, position 4
+    ]
+    monkeypatch.setattr(ss, "is_configured", lambda: True)
+    monkeypatch.setattr(ss, "serper_search_raw", lambda q, num_results=10: {"organic": organic})
+
+    ss.clear_cache()
+    capped = [c["url"] for c in ss.discover_by_site("X", "Instagram", top_n=5, max_results=3)]
+    assert any("news_at_three" in u for u in capped)
+    assert not any("the_real_one" in u for u in capped)   # position 4 is excluded
+
+    ss.clear_cache()
+    uncapped = [c["url"] for c in ss.discover_by_site("X", "Instagram", top_n=5)]
+    assert any("the_real_one" in u for u in uncapped)      # examined without the cap
+    ss.clear_cache()
     assert vs._thin_gate_block(vs.GATE_STRICT, _rich_candidate(), 100)
 
 
