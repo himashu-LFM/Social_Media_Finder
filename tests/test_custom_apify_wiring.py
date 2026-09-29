@@ -15,9 +15,20 @@ import pytest
 
 from app.pipeline import orchestrator as vp
 from app.pipeline import options as so
+from app.verification import verifier as vs
 
 CUSTOM = so.SearchOptions(mode="custom", prompt="social media handles")
 IG = "https://www.instagram.com/shakira"
+
+
+def _stub_validation_passes(monkeypatch):
+    """Bio-sourced profiles now go through _verify; make that validation pass so
+    these tests exercise the phase's adoption logic, not the live LLM."""
+    def fake(platform, wiki_meta, candidates, options=None):
+        return vs.VerificationResult(
+            platform=platform, best_candidate=candidates[0]["url"],
+            status=vs.STATUS_VERIFIED, confidence=100, decision="verified")
+    monkeypatch.setattr(vp, "_verify", fake)
 
 
 @pytest.fixture
@@ -32,22 +43,24 @@ def _enable_apify(monkeypatch, links):
 
 
 def test_apify_fills_gaps_and_marks_verified(no_free_links, monkeypatch):
+    _stub_validation_passes(monkeypatch)
     _enable_apify(monkeypatch, {
         "YouTube": "https://www.youtube.com/@shakira",
         "TikTok": "https://www.tiktok.com/@shakira",
     })
     out = vp._row_bio_link_phase("Shakira", {"Instagram": IG}, {}, CUSTOM)
 
-    # client's own Instagram handle: trusted
+    # client's own Instagram handle: trusted as-is
     assert out["Instagram"].status == vp.STATUS_VERIFIED
     assert out["Instagram"].source == "Input file (Phase 0 anchor)"
-    # gaps filled by Apify, Verified, correctly sourced
+    # Apify-sourced gaps are adopted only after validating; source names the bio.
     for p in ("YouTube", "TikTok"):
         assert out[p].status == vp.STATUS_VERIFIED
-        assert out[p].source == "Apify (Instagram bio)"
+        assert out[p].source == "Instagram bio + LLM"
 
 
 def test_apify_does_not_overwrite_a_free_read(monkeypatch):
+    _stub_validation_passes(monkeypatch)
     # free read already found YouTube directly
     monkeypatch.setattr(vp.bio_link_service, "harvest",
                         lambda url, platform: {"YouTube": "https://www.youtube.com/@free_direct"})
@@ -57,8 +70,8 @@ def test_apify_does_not_overwrite_a_free_read(monkeypatch):
     })
     out = vp._row_bio_link_phase("Shakira", {"Instagram": IG}, {}, CUSTOM)
     assert "free_direct" in out["YouTube"].best_candidate      # free read wins
-    assert out["YouTube"].source != "Apify (Instagram bio)"
-    assert out["TikTok"].source == "Apify (Instagram bio)"     # gap still filled
+    assert "apify_copy" not in out["YouTube"].best_candidate
+    assert out["TikTok"].best_candidate.endswith("shakira")    # gap still filled
 
 
 def test_apify_skipped_when_unconfigured(no_free_links, monkeypatch):

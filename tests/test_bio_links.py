@@ -111,6 +111,7 @@ def _stub_harvest(monkeypatch, found, calls=None):
 def test_bio_links_run_for_every_row_including_wikipedia(monkeypatch):
     """Phase 0 is no longer mode-gated: a wiki row harvests and adopts too."""
     calls = []
+    _stub_validation_passes(monkeypatch)
     _stub_harvest(monkeypatch, {"YouTube": "https://www.youtube.com/@kako"}, calls)
     out = vp._row_bio_link_phase("Kako", HANDLES, {}, so.DEFAULT)
     assert set(out) == {"Instagram", "YouTube"}
@@ -121,7 +122,18 @@ def test_bio_links_run_for_every_row_including_wikipedia(monkeypatch):
 CUSTOM = so.SearchOptions(mode="custom", prompt="social media handles")
 
 
+def _stub_validation_passes(monkeypatch):
+    """Bio-sourced profiles are now validated via _verify; make that pass so these
+    tests exercise the phase's adoption logic, not the live LLM."""
+    def fake(platform, wiki_meta, candidates, options=None):
+        return vs.VerificationResult(
+            platform=platform, best_candidate=candidates[0]["url"],
+            status=vs.STATUS_VERIFIED, confidence=100, decision="verified")
+    monkeypatch.setattr(vp, "_verify", fake)
+
+
 def test_custom_mode_adopts_the_links_and_the_anchor(monkeypatch):
+    _stub_validation_passes(monkeypatch)
     _stub_harvest(monkeypatch, {"YouTube": "https://www.youtube.com/@kako",
                                 "X": "https://x.com/kako"})
     out = vp._row_bio_link_phase("Kako", HANDLES, {}, CUSTOM)
@@ -129,11 +141,43 @@ def test_custom_mode_adopts_the_links_and_the_anchor(monkeypatch):
     assert all(r.status == vs.STATUS_VERIFIED and r.confidence == 100 for r in out.values())
 
 
-def test_the_reason_names_the_anchor_so_the_assumption_stays_auditable(monkeypatch):
-    """These cells skip adjudication; the file must say why they were trusted."""
+def test_the_source_names_the_anchor_so_the_assumption_stays_auditable(monkeypatch):
+    """Sourced cells are now validated; the Source column must name the bio anchor."""
+    _stub_validation_passes(monkeypatch)
     _stub_harvest(monkeypatch, {"YouTube": "https://www.youtube.com/@kako"})
-    reason = vp._row_bio_link_phase("Kako", HANDLES, {}, CUSTOM)["YouTube"].reason
-    assert "instagram.com/kako" in reason and "input file" in reason
+    assert vp._row_bio_link_phase("Kako", HANDLES, {}, CUSTOM)["YouTube"].source \
+        == "Instagram bio + LLM"
+
+
+def test_a_sourced_profile_that_fails_validation_falls_through(monkeypatch):
+    """The client's complaint: a sourced profile that doesn't validate must NOT be
+    adopted as Verified — it is dropped so the platform goes to ordinary search."""
+    _stub_harvest(monkeypatch, {"YouTube": "https://www.youtube.com/@not_them"})
+    monkeypatch.setattr(vp, "_verify", lambda platform, wiki_meta, cands, options=None:
+                        vs.VerificationResult(platform=platform, status=vs.STATUS_MANUAL))
+    out = vp._row_bio_link_phase("Kako", HANDLES, {}, CUSTOM)
+    assert "YouTube" not in out          # not adopted — falls through to search
+    assert set(out) == {"Instagram"}     # only the trusted anchor remains
+
+
+def test_a_sourced_profile_is_validated_with_first_party_evidence(monkeypatch):
+    """It goes through _verify (name/category + authenticity), carrying the anchor
+    as first-party evidence so a genuine account is not lost to thin metadata."""
+    seen = {}
+
+    def capture(platform, wiki_meta, candidates, options=None):
+        seen["cand"] = candidates[0]
+        return vs.VerificationResult(
+            platform=platform, best_candidate=candidates[0]["url"],
+            status=vs.STATUS_VERIFIED, confidence=100, decision="verified")
+
+    monkeypatch.setattr(vp, "_verify", capture)
+    _stub_harvest(monkeypatch, {"YouTube": "https://www.youtube.com/@kako"})
+    out = vp._row_bio_link_phase("Kako", HANDLES, {}, CUSTOM)
+
+    assert out["YouTube"].status == vs.STATUS_VERIFIED
+    assert seen["cand"]["source"] == "bio"
+    assert seen["cand"]["meta"]["backlink_to_client_profile"] == HANDLES["Instagram"]
 
 
 def test_an_analyst_rejection_outranks_the_bio(monkeypatch):
@@ -176,13 +220,14 @@ def test_a_second_anchor_is_tried_when_the_first_publishes_nothing(monkeypatch):
         return {} if anchor_platform == "Instagram" else {"X": "https://x.com/kako"}
 
     monkeypatch.setattr(bl, "harvest", harvest)
+    _stub_validation_passes(monkeypatch)
     out = vp._row_bio_link_phase("Kako", {
         "Instagram": "https://www.instagram.com/kako",
         "YouTube": "https://www.youtube.com/@kako",
     }, {}, CUSTOM)
     assert tried == ["Instagram", "YouTube"]
     assert out["X"].status == vs.STATUS_VERIFIED
-    assert "youtube.com/@kako" in out["X"].reason
+    assert out["X"].source == "YouTube bio + LLM"   # sourced from the YT anchor
 
 
 def test_platform_chrome_is_never_adopted_as_a_profile():
