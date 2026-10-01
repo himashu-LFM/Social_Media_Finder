@@ -149,6 +149,31 @@ def test_the_source_names_the_anchor_so_the_assumption_stays_auditable(monkeypat
         == "Instagram bio + LLM"
 
 
+def test_youtube_bio_fills_what_the_instagram_bio_left(monkeypatch):
+    """Scenario 2: Instagram is read first, then YouTube for the platforms it left,
+    and the first anchor to publish a platform wins."""
+    _stub_validation_passes(monkeypatch)
+    tried = []
+
+    def harvest(anchor_url, anchor_platform):
+        tried.append(anchor_platform)
+        if anchor_platform == "Instagram":
+            return {"Facebook": "https://www.facebook.com/kako"}
+        return {"TikTok": "https://www.tiktok.com/@kako",
+                "Facebook": "https://www.facebook.com/kako_yt_copy"}
+
+    monkeypatch.setattr(bl, "harvest", harvest)
+    out = vp._row_bio_link_phase("Kako", {
+        "Instagram": "https://www.instagram.com/kako",
+        "YouTube": "https://www.youtube.com/@kako",
+    }, {}, CUSTOM)
+
+    assert tried == ["Instagram", "YouTube"]                # both bios read, IG first
+    assert out["Facebook"].source == "Instagram bio + LLM"  # IG's copy wins the tie
+    assert "kako_yt_copy" not in out["Facebook"].best_candidate
+    assert out["TikTok"].source == "YouTube bio + LLM"      # YT filled the gap IG left
+
+
 def test_a_sourced_profile_that_fails_validation_falls_through(monkeypatch):
     """The client's complaint: a sourced profile that doesn't validate must NOT be
     adopted as Verified — it is dropped so the platform goes to ordinary search."""

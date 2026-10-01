@@ -755,26 +755,29 @@ def _row_bio_link_phase(
                 decision="verified",
             )
 
-    # Read the anchor profile(s) — Instagram/YouTube — for links to the OTHER
-    # platforms the client did NOT supply. Instagram often publishes nothing to an
-    # anonymous reader while YouTube's About page publishes them all, so we keep
-    # trying anchors until one yields links.
+    # Read the anchor profile(s) — Instagram FIRST (Scenario 1), then YouTube for the
+    # platforms Instagram did not fill (Scenario 2). Both anchors are read (not just
+    # the first that yields links): Instagram often publishes nothing to an anonymous
+    # reader, and each may list platforms the other omits. The FIRST anchor to
+    # publish a given platform wins, so Instagram's copy beats YouTube's.
     candidates = bio_link_service.anchors(input_handles)
-    found: Dict[str, str] = {}
-    anchor_platform, anchor_url = ("", "")
-    for platform, url in candidates:
+    found: Dict[str, tuple] = {}  # platform -> (url, anchor_platform, anchor_url)
+    for anchor_platform, anchor_url in candidates:
+        # Stop once every platform is settled — no point reading a second bio.
+        if all(p in adopted or p in found for p in PLATFORMS):
+            break
         try:
-            harvested = bio_link_service.harvest(url, platform)
+            harvested = bio_link_service.harvest(anchor_url, anchor_platform)
         except Exception as exc:  # noqa: BLE001 — a bad harvest costs spend, not correctness
             print(f"  [BIO-LINKS] harvest failed for '{talent}': {exc.__class__.__name__}")
             continue
-        if harvested:
-            anchor_platform, anchor_url = platform, url
-            found = harvested
-            break
+        for platform, url in (harvested or {}).items():
+            if platform not in PLATFORMS or platform in adopted or platform in found:
+                continue  # a client handle, or an earlier anchor, already has it
+            found[platform] = (url, anchor_platform, anchor_url)
 
-    for platform, url in found.items():
-        if platform not in PLATFORMS or platform in adopted:
+    for platform, (url, anchor_platform, anchor_url) in found.items():
+        if platform in adopted:
             continue  # a client-supplied handle always wins over the bio's copy
         # An analyst who rejected this URL outranks the bio that published it.
         if url in rejected:
