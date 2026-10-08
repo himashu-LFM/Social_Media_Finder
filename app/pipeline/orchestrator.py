@@ -677,6 +677,115 @@ def _row_taxonomy(input_metadata: Optional[Dict[str, str]]) -> tuple[str, str]:
 #  Phase 0 — first-party bio links (custom mode only)
 # ────────────────────────────────────────────────────────────────────────────
 
+def _trusted_input_result(platform: str, url: str) -> VerificationResult:
+    """The client's supplied handle, trusted as-is."""
+    return VerificationResult(
+        platform=platform, best_candidate=url,
+        status=STATUS_VERIFIED, confidence=100,
+        source="Input file (Phase 0 anchor)",
+        reason="Supplied in the input file by the client.",
+        decision="verified",
+    )
+
+
+def _confirmed_handles(resolved: Dict[str, VerificationResult]) -> Dict[str, str]:
+    """Handles confirmed to belong to THIS talent so far (Verified) — the only ones
+    trusted to corroborate or back-link the rest of the row. A client handle that
+    was validated and flagged (Manual Review) is deliberately excluded."""
+    return {
+        platform: result.best_candidate
+        for platform, result in (resolved or {}).items()
+        if result.status == STATUS_VERIFIED and result.best_candidate
+    }
+
+
+def _read_input_profile(platform: str, url: str) -> "tuple[Optional[dict], bool]":
+    """
+    Read a supplied profile's OWN name/bio, for confirming it belongs to the talent.
+
+    Returns ``(meta, flag_worthy)``:
+      * ``(meta, True)``  — a name/bio was read; the caller validates it.
+      * ``(None, True)``  — the handle is POSITIVELY confirmed bad (doesn't exist);
+                            the caller flags it for review.
+      * ``(None, False)`` — we simply couldn't read a name (reader off, blocked,
+                            private, or a transient failure). We have no positive
+                            evidence of a problem, so the caller keeps trusting the
+                            input rather than flag it — this keeps a systemic reader
+                            outage from flagging a whole file.
+    """
+    if platform == "Instagram":
+        if not apify_service.instagram_configured():
+            return None, False
+        meta = apify_service.instagram_profile(url) or {}
+        if meta.get("display_name") or meta.get("bio"):
+            return meta, True
+        return None, False  # no name read (Apify failed / private) -> trust, don't flag
+    if platform == "YouTube":
+        meta = profile_metadata.fetch_profile_metadata(url, "YouTube") or {}
+        if meta.get("display_name") or meta.get("bio"):
+            return meta, True
+        # No name read. Flag only if the channel is positively missing (404); a
+        # present-but-unreadable channel (blocked/systemic) is trusted, not flagged.
+        try:
+            missing = profile_metadata.profile_is_missing(url, "YouTube")
+        except Exception:  # noqa: BLE001 — a probe failure is not evidence of a bad handle
+            missing = False
+        return (None, True) if missing else (None, False)
+    return None, False
+
+
+def _validate_input_handle(
+    platform: str, url: str, wiki_meta: wikipedia_service.WikiMetadata,
+    options: search_options.SearchOptions,
+) -> VerificationResult:
+    """
+    Confirm a supplied Instagram/YouTube handle really belongs to the talent.
+
+    Reads the profile's own name/bio and lets the LLM compare it to the ground
+    truth (name + category). A match stays Verified; a different-named profile (the
+    classic "Stephanie Miller -> stephclairesmith" wrong input) or an unreadable one
+    is flagged Manual Review, keeping the URL. When the reader is entirely
+    unavailable (Apify off), the input is trusted as before so a whole file is not
+    flagged by mistake.
+    """
+    meta, flag_worthy = _read_input_profile(platform, url)
+    if meta is None:
+        if not flag_worthy:
+            return _trusted_input_result(platform, url)  # couldn't read -> trust
+        return VerificationResult(  # positively confirmed bad (e.g. 404)
+            platform=platform, best_candidate=url, status=STATUS_MANUAL,
+            confidence=0, decision="manual_review", source="Input file (unconfirmed)",
+            reason=("The supplied profile could not be confirmed (it may not exist) — "
+                    "manual review needed."),
+        )
+    cand = {
+        "url": url, "source": "input", "_enriched": True,
+        "meta": {k: v for k, v in meta.items() if v},
+    }
+    # We already read the profile's own name/bio, so compare directly — no 404
+    # probe or OG re-fetch of the same URL. Evidence gate (not strict): the client
+    # supplied this handle AND we read its real profile, so a name MATCH is enough
+    # to keep trusting it; the LLM still rejects a different-named profile and the
+    # authenticity guards still fire.
+    result = verification_service.verify_platform(
+        platform, wiki_meta.to_prompt_dict(), [cand],
+        is_person=wiki_meta.is_person, thin_gate=verification_service.GATE_EVIDENCE,
+    )
+    if result.status == STATUS_VERIFIED:
+        return VerificationResult(
+            platform=platform, best_candidate=url, status=STATUS_VERIFIED,
+            confidence=100, decision="verified", source="Input file (name-checked)",
+            reason="Supplied by the client; the profile's name matches the talent.",
+        )
+    shown = str(meta.get("display_name") or "")[:60]
+    return VerificationResult(
+        platform=platform, best_candidate=url, status=STATUS_MANUAL, confidence=0,
+        decision="manual_review", source="Input file (unverified)",
+        reason=(f"The supplied profile ('{shown}') could not be confirmed as this "
+                "talent — manual review needed. " + (result.reason or "")).strip(),
+    )
+
+
 def _validate_bio_candidate(
     platform: str, url: str, wiki_meta: wikipedia_service.WikiMetadata,
     anchor_platform: str, anchor_url: str,
@@ -716,51 +825,59 @@ def _row_bio_link_phase(
     options: search_options.SearchOptions = search_options.DEFAULT,
     should_cancel: Optional[Callable[[], bool]] = None,
     wiki_meta: Optional[wikipedia_service.WikiMetadata] = None,
+    input_metadata: Optional[Dict[str, str]] = None,
 ) -> Dict[str, VerificationResult]:
     """
-    Read the client-supplied anchor profile and adopt the platforms it links to.
+    Confirm the client's anchor handle(s) and adopt the platforms they link to.
 
-    The client's Instagram/YouTube handles are trusted as-is (the declared source
-    of truth). Every OTHER profile SOURCED from a bio — a link the anchor lists, or
-    one read from the Instagram bio via Apify — is VALIDATED against the subject's
-    name and category (the same AI check search hits get, including the fan/
-    unofficial/tribute screen) before it is trusted. A sourced profile that does
-    not validate is dropped, so the platform falls through to ordinary search.
+    The client's Instagram/YouTube handles are each CONFIRMED to belong to the
+    talent (read the profile's own name, compare to name + category) before being
+    trusted — a different-named handle is flagged, not trusted. The row is then
+    sourced ONLY from an anchor that was confirmed: a flagged handle does not seed
+    the other platforms. Every OTHER profile sourced from a confirmed bio is itself
+    validated before being adopted; one that doesn't validate is dropped so the
+    platform falls through to ordinary search.
 
     ``wiki_meta`` is the ground truth to validate against; when absent a thin one
-    (name + category from the input row) is built.
+    (name + category from ``input_metadata``) is built.
     """
     if _is_cancelled(should_cancel):
         return {}
 
     input_handles = input_handles or {}
-    gt = wiki_meta or _thin_ground_truth(talent, None, input_handles)
+    gt = wiki_meta or _thin_ground_truth(talent, input_metadata, input_handles)
     rejected = {
         url for url in ((decisions or {}).get("rejected") or {}).values() if url
     }
     adopted: Dict[str, VerificationResult] = {}
 
-    # Trust only the Instagram and YouTube handles the client supplied — these are
-    # the anchors we also read for bio links and the tester's declared source of
-    # truth. Facebook / X / TikTok input handles are NOT adopted here; they fall
-    # through to the Serper phases and are re-verified like any discovered link, so
-    # a wrong or fan-page handle in the file can still be flagged.
+    # The client's Instagram and YouTube handles are the declared source of truth,
+    # but we no longer trust them blindly: each is confirmed to actually belong to
+    # the talent (read the profile's own name, let the LLM compare it to the name +
+    # category) before being adopted as Verified. A different-named profile (e.g.
+    # "Stephanie Miller" -> stephclairesmith) is flagged Manual Review instead.
+    # Facebook / X / TikTok input handles are NOT adopted here; they fall through to
+    # the Serper phases and are re-verified like any discovered link.
     for platform, url in input_handles.items():
         if platform in _TRUSTED_INPUT_PLATFORMS and url and url not in rejected:
-            adopted[platform] = VerificationResult(
-                platform=platform, best_candidate=url,
-                status=STATUS_VERIFIED, confidence=100,
-                source="Input file (Phase 0 anchor)",
-                reason="Supplied in the input file by the client.",
-                decision="verified",
-            )
+            adopted[platform] = _validate_input_handle(platform, url, gt, options)
+
+    # Source the rest of the row ONLY from an anchor we confirmed belongs to the
+    # talent — a flagged (Manual Review) Instagram/YouTube handle must not seed the
+    # other platforms. A trusted handle (confirmed, or trusted by the safety valve)
+    # is adopted Verified above, so it qualifies here.
+    anchor_handles = {
+        p: input_handles[p] for p in _TRUSTED_INPUT_PLATFORMS
+        if input_handles.get(p) and adopted.get(p) is not None
+        and adopted[p].status == STATUS_VERIFIED
+    }
 
     # Read the anchor profile(s) — Instagram FIRST (Scenario 1), then YouTube for the
     # platforms Instagram did not fill (Scenario 2). Both anchors are read (not just
     # the first that yields links): Instagram often publishes nothing to an anonymous
     # reader, and each may list platforms the other omits. The FIRST anchor to
     # publish a given platform wins, so Instagram's copy beats YouTube's.
-    candidates = bio_link_service.anchors(input_handles)
+    candidates = bio_link_service.anchors(anchor_handles)
     found: Dict[str, tuple] = {}  # platform -> (url, anchor_platform, anchor_url)
     for anchor_platform, anchor_url in candidates:
         # Stop once every platform is settled — no point reading a second bio.
@@ -801,7 +918,7 @@ def _row_bio_link_phase(
     # (after the free YouTube/Instagram reads above) and only for the gaps they
     # left. Its links are sourced from the client's own bio, so they go through the
     # same name/category validation as the free bio links before being trusted.
-    ig_url = (input_handles or {}).get("Instagram", "")
+    ig_url = anchor_handles.get("Instagram", "")
     missing = [p for p in PLATFORMS if p not in adopted]
     if ig_url and missing and apify_service.instagram_configured():
         try:
@@ -1073,25 +1190,28 @@ def _row_serper_corroborate_phase(
     input_handles = input_handles or {}
     resolved = dict(resolved or {})
 
-    # Anchor set = the client's TRUSTED handles (Instagram/YouTube) PLUS anything
-    # Phase 0 already Verified this row (e.g. a channel harvested from the client's
-    # Instagram bio). A client-supplied Facebook/X/TikTok handle is deliberately NOT
-    # an anchor — it is unverified, so letting it corroborate itself would be
-    # circular. It still enters discovery below as a candidate to be verified.
-    known_profiles: Dict[str, str] = {
-        p: u for p, u in input_handles.items()
-        if p in _TRUSTED_INPUT_PLATFORMS and u
-    }
-    for platform, result in resolved.items():
-        if result.status == STATUS_VERIFIED and result.best_candidate:
-            known_profiles.setdefault(platform, result.best_candidate)
+    # Anchor set = only handles CONFIRMED this row (Phase 0 Verified: a validated
+    # client Instagram/YouTube handle, or a channel harvested from a confirmed bio).
+    # A client handle we validated and flagged (Manual) is NOT an anchor — it must
+    # not corroborate the rest of the row. A client Facebook/X/TikTok handle is also
+    # not an anchor until it verifies on its own (it enters discovery as a candidate).
+    known_profiles: Dict[str, str] = _confirmed_handles(resolved)
     anchor_slugs = _fanout_slugs(known_profiles)
 
-    profession = _detect_profession(input_metadata) if options.include_profession else ""
-    # The analyst's free-text prompt is appended to the query, restoring the
-    # original non-Wikipedia behaviour: "<name> [<profession>] <prompt> site:<domain>".
-    prompt = (options.prompt or "").strip()
-    template = "{name} {category} {prompt} site:{domain}"
+    # No-wiki discovery query: the bare "<name> site:<domain>".
+    #
+    # An A/B/C test over 366 curated talent→handle reference points (real Serper,
+    # two passes, stable to within ~2 pts) showed this plain query surfaces the
+    # correct profile for ~80% of no-wiki rows — versus ~41% with the category
+    # appended and ~16% with the old "<name> <category> <prompt>" query. Both the
+    # category term and the analyst's free-text prompt SUPPRESS the right result
+    # (Google treats the extra words as near-required, and a profile page rarely
+    # contains "Athlete" or "social media handles"); quoting the name hurts
+    # multi-word names too. Disambiguation is the corroboration step's job, not
+    # the query's, so category/prompt are deliberately NOT appended here.
+    profession = ""
+    prompt = ""
+    template = "{name} site:{domain}"
     rejected = {u for u in ((decisions or {}).get("rejected") or {}).values() if u}
 
     results: Dict[str, VerificationResult] = dict(resolved)
@@ -1168,7 +1288,13 @@ def _row_serper_phase(
     """
     input_handles = input_handles or {}
     resolved = resolved or {}
-    fanout = _fanout_slugs(input_handles)
+    # A client Instagram/YouTube handle we already validated and flagged (Manual)
+    # must not lend its handle (fanout) or act as a back-link target for the rest of
+    # the row. Drop those; keep every other input handle as before.
+    flagged = {p for p, r in resolved.items()
+               if r.best_candidate and r.status != STATUS_VERIFIED}
+    anchor_handles = {p: u for p, u in input_handles.items() if p not in flagged}
+    fanout = _fanout_slugs(anchor_handles)
     category, subcategory = _row_taxonomy(input_metadata)
 
     def _task(platform: str) -> tuple:
@@ -1186,7 +1312,7 @@ def _row_serper_phase(
                 known_url=input_handles.get(platform, ""), fanout_slugs=fanout,
                 decisions=decisions, options=options,
                 category=category, subcategory=subcategory,
-                input_handles_for_backlink=input_handles,
+                input_handles_for_backlink=anchor_handles,
             )
         except Exception as exc:  # noqa: BLE001 — isolate platform failures
             print(f"  [PIPELINE] {platform} Serper phase error for '{talent}': {exc}")
@@ -1482,7 +1608,7 @@ def _resolve_row_result(
     # Phase 0 — first-party bio links (client IG/YT handles trusted; every OTHER
     # sourced profile validated against name + category before it is trusted).
     resolved = _row_bio_link_phase(talent, input_handles, decisions, options,
-                                   wiki_meta=wiki_meta)
+                                   wiki_meta=wiki_meta, input_metadata=input_metadata)
 
     # No Wikipedia URL on this row: no ground truth to adjudicate against, so we
     # do NOT run the LLM or the Apify backup. Serper fills the remaining blanks;
@@ -1616,6 +1742,7 @@ def run_pipeline_on_dataframe(
     serper_service.clear_cache()
     bio_link_service.clear_cache()
     aggregators.clear_cache()
+    apify_service.clear_cache()
 
     # Collect processable rows (skip blank names), preserving 0-based index.
     rows = []
@@ -1669,7 +1796,8 @@ def run_pipeline_on_dataframe(
             # Phase 0 bio links run for every row: client IG/YT handles trusted;
             # every OTHER sourced profile validated against name + category.
             resolved = _row_bio_link_phase(talent, input_handles, row_decisions,
-                                           options, should_cancel, wiki_meta=wiki_meta)
+                                           options, should_cancel, wiki_meta=wiki_meta,
+                                           input_metadata=input_metadata)
             if has_wiki:
                 phase1 = _row_serper_phase(talent, wiki_meta, _pp, should_cancel,
                                            input_handles=input_handles,

@@ -16,7 +16,11 @@
 export type SearchMode = "wikipedia" | "custom";
 
 const MODE_KEY = "curator-ai-search-mode-v1";
-const PROMPT_KEY = "curator-ai-search-prompt-v1";
+// Bumped v1 -> v2 to discard a stale custom prompt some browsers had saved (the
+// preview example "Kako Fujita Musician social media handles" had been pasted into
+// the prompt box and persisted, polluting every non-Wikipedia query). v2 is absent
+// in those browsers, so readSearchConfig falls back to the correct DEFAULT_PROMPT.
+const PROMPT_KEY = "curator-ai-search-prompt-v2";
 const INCLUDE_PROF_KEY = "curator-ai-search-include-profession-v1";
 
 /** The default custom-mode prompt, matching the backend default suffix. */

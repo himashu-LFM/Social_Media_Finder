@@ -71,3 +71,41 @@ def test_blank_cells_on_a_no_wiki_row_are_all_searched(monkeypatch):
 
     # Blank Instagram and YouTube are searched like every other platform.
     assert set(searched) == set(su.PLATFORMS)
+
+
+def test_no_wiki_query_is_the_bare_name_no_category_or_prompt(monkeypatch):
+    """The no-Wikipedia query is '<name> site:<domain>' — nothing else.
+
+    An A/B/C test (366 curated reference points, real Serper) showed appending
+    the category word or the analyst prompt SUPPRESSES the correct profile
+    (~80% found with the bare name vs ~41% with category vs ~16% with the old
+    '<name> <category> <prompt>' query). So even when a prompt is set and the
+    profession toggle is on with a category in the row, neither reaches the query.
+    """
+    from app.discovery import serper as serper_service
+    from app.pipeline import options as so
+
+    captured: list = []
+
+    def fake_discover(talent, platform, *args, **kwargs):
+        captured.append(kwargs)
+        return []
+
+    monkeypatch.setattr(serper_service, "is_configured", lambda: True)
+    monkeypatch.setattr(vp.serper_service, "discover_by_site", fake_discover)
+
+    opts = so.SearchOptions(mode="custom", prompt="social media handles",
+                            include_profession=True)
+    vp._row_serper_corroborate_phase(
+        "Billy Garvey",
+        {},                                   # no input handles → every platform is blank
+        {"title_sub_category": "Talent Type - Education"},  # a category IS available
+        {},
+        opts,
+    )
+
+    assert captured, "no-wiki phase must search the blank platforms"
+    for kw in captured:
+        assert kw.get("query_template") == "{name} site:{domain}"
+        assert kw.get("category") == ""      # profession is NOT appended
+        assert kw.get("prompt") == ""        # analyst prompt is NOT appended
