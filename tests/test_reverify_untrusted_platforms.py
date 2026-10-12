@@ -89,3 +89,68 @@ def test_a_client_handle_alone_does_not_win_cross_platform_agreement():
         known_profiles={}, anchor_slugs=[], mutual_handles={handle})
     # It is not auto-Verified off its own asserted handle — it is flagged instead.
     assert res.status == vs.STATUS_MANUAL
+
+
+# ── No-wiki noise reduction: name-exact auto-verify (#2) + namesake gate (#1) ──
+
+def _nw(talent, platform, cands, known=None, anchors=None):
+    return vp._decide_no_wiki_platform(
+        talent, platform, cands, searched=True, errored=False,
+        known_profiles=known or {}, anchor_slugs=anchors or [], mutual_handles=set())
+
+
+def test_name_exact_handle_is_surfaced_as_manual_not_auto_verified():
+    # "Holly Wainwright" — TikTok handle is the name-exact '@hollywainwright'. A
+    # name-exact handle is strong but unproven (could be a namesake or tribute page),
+    # so it is surfaced at the TOP of Manual Review, not auto-Verified.
+    cands = [{"url": "https://www.tiktok.com/@hollywainwright", "source": "serper", "meta": {}}]
+    res = _nw("Holly Wainwright", "TikTok", cands,
+              known={"Instagram": "https://www.instagram.com/wainwrightholly"},
+              anchors=["wainwrightholly"])
+    assert res.status == vs.STATUS_MANUAL
+    assert res.best_candidate.endswith("hollywainwright")
+    assert "name-exact" in (res.source or "").lower()
+    assert "strong match" in (res.reason or "").lower()
+
+
+def test_name_exact_does_not_match_fan_suffix_variant():
+    # 'jessiestephens40' is NOT exactly "Jessie Stephens" -> stays Manual (name-plausible).
+    cands = [{"url": "https://www.tiktok.com/@jessiestephens40", "source": "serper", "meta": {}}]
+    res = _nw("Jessie Stephens", "TikTok", cands)
+    assert res.status == vs.STATUS_MANUAL
+
+
+def test_several_unrelated_namesakes_are_not_found():
+    # The broad '<name> site:x.com' sweeps in multiple unrelated namesakes for
+    # "Emily Vernem": none bears a name relation -> Not Found (not a human's time).
+    cands = [{"url": "https://x.com/breguissimxs", "source": "serper", "meta": {}},
+             {"url": "https://x.com/LeydeDa82339670", "source": "serper", "meta": {}}]
+    res = _nw("Emily Vernem", "X", cands)
+    assert res.status == vs.STATUS_NOT_FOUND
+
+
+def test_lone_unrelated_hit_stays_manual_not_dropped():
+    # Softened gate: a SINGLE uncorroborated, name-unrelated hit may be a real
+    # account whose handle isn't the name (a podcast's network handle) -> keep it
+    # as Manual for one human glance rather than hiding it as Not Found.
+    cands = [{"url": "https://x.com/littlefishpod_", "source": "serper", "meta": {}}]
+    res = _nw("Dyl & Friends Podcast", "X", cands)
+    assert res.status == vs.STATUS_MANUAL
+    assert res.best_candidate.endswith("littlefishpod_")
+
+
+def test_name_plausible_hit_still_goes_to_manual():
+    # '@RadioNational' shares the distinctive token 'radio'/'national' with
+    # "ABC Radio National" -> worth a human -> Manual, not dropped.
+    cands = [{"url": "https://x.com/RadioNational", "source": "serper", "meta": {}}]
+    res = _nw("ABC Radio National", "X", cands)
+    assert res.status == vs.STATUS_MANUAL
+    assert res.best_candidate.endswith("RadioNational")
+
+
+def test_client_supplied_handle_is_never_dropped_by_the_gate():
+    # A client FB handle with no name relation still reaches a human (Manual), not Not Found.
+    cands = [{"url": "https://www.facebook.com/xyz123feed", "source": "input", "meta": {}}]
+    res = _nw("Some Brand", "Facebook", cands,
+              known={"Instagram": "https://www.instagram.com/other"}, anchors=["other"])
+    assert res.status == vs.STATUS_MANUAL

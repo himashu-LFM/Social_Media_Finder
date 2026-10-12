@@ -112,7 +112,7 @@ def _record_anchors(monkeypatch):
 def test_flagged_instagram_anchor_does_not_seed_the_row(monkeypatch):
     # The supplied Instagram validates as a mismatch (wrong person).
     monkeypatch.setattr(vp, "_validate_input_handle",
-                        lambda platform, url, gt, options: vs.VerificationResult(
+                        lambda platform, url, gt, options, talent="": vs.VerificationResult(
                             platform=platform, best_candidate=url,
                             status=vs.STATUS_MANUAL, source="Input file (unverified)"))
     seen = _record_anchors(monkeypatch)
@@ -124,7 +124,7 @@ def test_flagged_instagram_anchor_does_not_seed_the_row(monkeypatch):
 
 def test_confirmed_instagram_anchor_is_used_to_seed_the_row(monkeypatch):
     monkeypatch.setattr(vp, "_validate_input_handle",
-                        lambda platform, url, gt, options: vs.VerificationResult(
+                        lambda platform, url, gt, options, talent="": vs.VerificationResult(
                             platform=platform, best_candidate=url,
                             status=vs.STATUS_VERIFIED, source="Input file (name-checked)"))
     seen = _record_anchors(monkeypatch)
@@ -153,3 +153,80 @@ def test_profile_read_and_bio_links_share_one_actor_run(monkeypatch):
     assert calls["n"] == 1                      # one actor run, shared via cache
     assert prof.get("display_name") == "Kako"
     ap.clear_cache()
+
+
+# ── Loophole #4 hardening: surname-consistency guard ─────────────────────────
+
+def test_input_surname_mismatch_flags_wrong_person(monkeypatch):
+    # "Stephanie Miller" supplied as 'stephclairesmith' (profile: Steph Claire Smith).
+    monkeypatch.setattr(vp, "_read_input_profile",
+                        lambda p, u: ({"display_name": "Steph Claire Smith",
+                                       "username": "stephclairesmith"}, True))
+    gt = vp._thin_ground_truth("Stephanie Miller")
+    out = vp._validate_input_handle(
+        "Instagram", "https://www.instagram.com/stephclairesmith", gt, so.DEFAULT,
+        "Stephanie Miller")
+    assert out.status == vs.STATUS_MANUAL
+    assert "surname" in out.reason.lower()
+
+
+def test_input_surname_match_is_not_flagged(monkeypatch):
+    # Brandon's real profile IS named "Brandon Mychal Smith" (handle just ends 'ceo')
+    # — surname present, so the guard must NOT flag it; the LLM decides as before.
+    monkeypatch.setattr(vp, "_read_input_profile",
+                        lambda p, u: ({"display_name": "Brandon Mychal Smith",
+                                       "username": "brandonsmithceo"}, True))
+    monkeypatch.setattr(vp.verification_service, "verify_platform",
+                        lambda *a, **k: _res(vs.STATUS_VERIFIED,
+                                             "https://www.instagram.com/brandonsmithceo"))
+    gt = vp._thin_ground_truth("Brandon Mychal Smith")
+    out = vp._validate_input_handle(
+        "Instagram", "https://www.instagram.com/brandonsmithceo", gt, so.DEFAULT,
+        "Brandon Mychal Smith")
+    assert out.status == vs.STATUS_VERIFIED
+
+
+def test_surname_guard_skips_brands():
+    # Organisations have no surname — the guard must never fire on them.
+    gt = vp._thin_ground_truth("ABC Radio National")
+    gt.is_person = False
+    assert vp._input_surname_mismatch(
+        {"display_name": "ABC News", "username": "abc"},
+        "https://instagram.com/abc", gt, "ABC Radio National") is False
+
+
+# ── YouTube over-flag fix: surname guard is Instagram-only ────────────────────
+
+def test_youtube_brand_channel_is_not_surname_flagged(monkeypatch):
+    # A correct, client-supplied YouTube channel branded with a show name
+    # ("The Jane Show") legitimately omits the person's surname. The deterministic
+    # surname guard must NOT fire for YouTube — the channel goes through the normal
+    # name-check and stays Verified.
+    monkeypatch.setattr(vp, "_read_input_profile",
+                        lambda p, u: ({"display_name": "The Jane Show",
+                                       "username": "thejaneshow"}, True))
+    monkeypatch.setattr(vp.verification_service, "verify_platform",
+                        lambda *a, **k: vs.VerificationResult(
+                            platform="YouTube",
+                            best_candidate="https://www.youtube.com/@thejaneshow",
+                            status=vs.STATUS_VERIFIED))
+    gt = vp._thin_ground_truth("Jane Doe")
+    out = vp._validate_input_handle(
+        "YouTube", "https://www.youtube.com/@thejaneshow", gt, so.DEFAULT, "Jane Doe")
+    assert out.status == vs.STATUS_VERIFIED      # not flagged by the surname guard
+
+
+def test_instagram_surname_in_bio_is_not_flagged(monkeypatch):
+    # An IG account whose display name/handle is brand-ish but whose BIO carries the
+    # person's surname is the real account -> the bio rescues it from the guard.
+    monkeypatch.setattr(vp, "_read_input_profile",
+                        lambda p, u: ({"display_name": "The Jane Show",
+                                       "username": "thejaneshow",
+                                       "bio": "Official page of Jane Doe"}, True))
+    monkeypatch.setattr(vp.verification_service, "verify_platform",
+                        lambda *a, **k: _res(vs.STATUS_VERIFIED,
+                                             "https://www.instagram.com/thejaneshow"))
+    gt = vp._thin_ground_truth("Jane Doe")
+    out = vp._validate_input_handle(
+        "Instagram", "https://www.instagram.com/thejaneshow", gt, so.DEFAULT, "Jane Doe")
+    assert out.status == vs.STATUS_VERIFIED      # bio contains "Doe" -> not flagged

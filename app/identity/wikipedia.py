@@ -370,6 +370,12 @@ def _fetch_rest_summary(wikipedia_url: str) -> Dict[str, str]:
         if "/wiki/" not in (parsed.path or ""):
             return {}
         page_title = parsed.path.split("/wiki/", 1)[1].strip("/")
+        # Defensive: a malformed input cell can glue a second URL onto the title
+        # ("Bitsie_Tullochhttp://en.wikipedia.org/..."), which 404s the REST call.
+        # Keep only the title up to any embedded scheme.
+        page_title = re.split(r"https?://", page_title, maxsplit=1)[0].strip("/")
+        if not page_title:
+            return {}
         summary_url = (
             f"{parsed.scheme}://{parsed.netloc}/api/rest_v1/page/summary/{page_title}"
         )

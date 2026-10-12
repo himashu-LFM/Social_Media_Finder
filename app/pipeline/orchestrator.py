@@ -734,9 +734,42 @@ def _read_input_profile(platform: str, url: str) -> "tuple[Optional[dict], bool]
     return None, False
 
 
+def _input_surname_mismatch(meta: dict, url: str,
+                            wiki_meta: wikipedia_service.WikiMetadata,
+                            talent: str) -> bool:
+    """
+    Deterministic wrong-person guard for a supplied PERSON handle.
+
+    A plausible-but-different name ("Stephanie Miller" supplied as the handle
+    'stephclairesmith', whose profile is "Steph Claire Smith") shares a first name
+    and reads as a near-match, so a lenient evidence gate can wave it through. But
+    a real person's profile carries their SURNAME — in the display name, the
+    username, the bio, or the handle. If the talent's surname appears in none of
+    those, it is almost certainly a different person, so we flag it.
+
+    Callers apply this to Instagram only: an IG profile's display name is reliably
+    the person's own name, whereas a YouTube channel is often branded with a show
+    name ("The Jane Show") that legitimately omits the surname — flagging those
+    would wrongly reject a correct, client-supplied channel.
+
+    Only applies to people with a multi-token name; brands/orgs have no surname.
+    """
+    if not getattr(wiki_meta, "is_person", True):
+        return False
+    toks = [t for t in re.findall(r"[a-z0-9]+", (talent or "").lower()) if len(t) >= 3]
+    if len(toks) < 2:
+        return False                              # single-token name: nothing to check
+    surname = toks[-1]
+    hay = re.sub(r"[^a-z0-9]", "",
+                 f"{meta.get('display_name', '')} {meta.get('username', '')} "
+                 f"{meta.get('bio', '')} {url}".lower())
+    return surname not in hay
+
+
 def _validate_input_handle(
     platform: str, url: str, wiki_meta: wikipedia_service.WikiMetadata,
     options: search_options.SearchOptions,
+    talent: str = "",
 ) -> VerificationResult:
     """
     Confirm a supplied Instagram/YouTube handle really belongs to the talent.
@@ -757,6 +790,20 @@ def _validate_input_handle(
             confidence=0, decision="manual_review", source="Input file (unconfirmed)",
             reason=("The supplied profile could not be confirmed (it may not exist) — "
                     "manual review needed."),
+        )
+    # Deterministic wrong-person guard: a supplied handle whose profile drops the
+    # talent's surname is almost certainly someone else (the classic "Stephanie
+    # Miller -> Steph Claire Smith" wrong input). Flag before the LLM, which a
+    # shared first name can otherwise talk past. Instagram only — a YouTube channel
+    # is often branded with a show name that legitimately omits the surname, so the
+    # guard would wrongly reject a correct, client-supplied channel there.
+    if platform == "Instagram" and talent and _input_surname_mismatch(meta, url, wiki_meta, talent):
+        shown = str(meta.get("display_name") or "")[:60]
+        return VerificationResult(
+            platform=platform, best_candidate=url, status=STATUS_MANUAL, confidence=0,
+            decision="manual_review", source="Input file (unverified)",
+            reason=(f"The supplied profile's name ('{shown}') does not include the "
+                    "talent's surname — likely a different person; manual review needed."),
         )
     cand = {
         "url": url, "source": "input", "_enriched": True,
@@ -860,7 +907,7 @@ def _row_bio_link_phase(
     # the Serper phases and are re-verified like any discovered link.
     for platform, url in input_handles.items():
         if platform in _TRUSTED_INPUT_PLATFORMS and url and url not in rejected:
-            adopted[platform] = _validate_input_handle(platform, url, gt, options)
+            adopted[platform] = _validate_input_handle(platform, url, gt, options, talent)
 
     # Source the rest of the row ONLY from an anchor we confirmed belongs to the
     # talent — a flagged (Manual Review) Instagram/YouTube handle must not seed the
@@ -1023,6 +1070,57 @@ def _corroboration_signal(
     return ""
 
 
+def _name_match_signal(cand: dict, talent: str) -> str:
+    """
+    Strong, high-precision name evidence for a no-Wikipedia candidate: the
+    profile's HANDLE, reduced to alphanumerics, is exactly the talent name reduced
+    to alphanumerics — e.g. ``@hollywainwright`` for "Holly Wainwright",
+    ``/popcultureparenting`` for "Pop Culture Parenting".
+
+    Handles are unique per platform, so a handle that *equals* the name is very
+    unlikely to be a different subject — unlike a mere display-name match, which
+    every namesake shares (that is why a US radio host "Stephanie Miller" must NOT
+    corroborate a different "Stephanie Miller"). Suffix / fan variants such as
+    ``jessiestephens40`` do not match, by construction, so they stay Manual.
+
+    Only an INDEPENDENTLY-DISCOVERED profile qualifies: a manufactured
+    ``handle_fanout`` URL reuses the name by construction (circular), and a
+    client-supplied ``input`` handle is the client's own assertion — the
+    input-trust policy re-verifies client Facebook/X/TikTok rather than trusting
+    a name-shaped handle they may have recorded wrongly.
+    """
+    if cand.get("source") in ("handle_fanout", "input"):
+        return ""
+    name_compact = re.sub(r"[^a-z0-9]", "", (talent or "").lower())
+    if len(name_compact) < _MIN_ANCHOR_HANDLE_LEN:
+        return ""   # a short name ("abc", "nba") collides by chance — not evidence
+    handle = _handle_from_url(cand.get("url", ""))
+    if handle and re.sub(r"[^a-z0-9]", "", handle) == name_compact:
+        return (f"The profile handle '{handle}' is exactly the subject's name — a "
+                f"unique-per-platform handle equal to the name is first-party identity.")
+    return ""
+
+
+def _name_plausible(cand: dict, talent: str) -> bool:
+    """
+    Loose check that a candidate could belong to the subject — used only to decide,
+    on a no-Wikipedia platform with nothing to corroborate against, whether an
+    uncorroborated hit is worth a human's time (Manual Review) or is just a
+    namesake the broad "<name> site:<domain>" search swept in (Not Found).
+
+    True when the handle carries a distinctive (>= 4-char) token of the name, or
+    the profile's displayed name carries the full name. Deliberately generous:
+    its job is only to strip out the clearly-unrelated (``breguissimxs`` for
+    "Emily Vernem", the movie ``mammamiamovie`` for "Mamamia Out Loud"), not to
+    adjudicate between plausible accounts.
+    """
+    tokens = {t for t in _name_tokens(talent) if len(t) >= 4}
+    handle_compact = re.sub(r"[^a-z0-9]", "", _handle_from_url(cand.get("url", "")))
+    if handle_compact and any(tok in handle_compact for tok in tokens):
+        return True
+    return _claims_identity(cand, talent)
+
+
 def _gather_serper_candidates(
     talent: str, platform: str, anchor_slugs: List[str],
     profession: str, template: str, rejected: set, prompt: str = "",
@@ -1090,9 +1188,13 @@ def _decide_no_wiki_platform(
     Corroborate or flag one platform, using the whole row's cross-platform agreement.
 
     Written (Verified) only when self-evidencing: a back-link to a known handle,
-    reuse of a distinctive known handle, OR (new) a distinctive handle that an
-    independent search returned on another platform too. Everything else that a
-    search actually found is flagged Manual Review; nothing found is Not Found.
+    reuse of a distinctive known handle, or a distinctive handle an independent
+    search returned on another platform too. A name-exact handle is a strong but
+    unproven signal, so it is surfaced at the TOP of Manual Review (not auto-
+    Verified — it could be a namesake or a tribute page). Any other hit that bears
+    a name relation is also Manual; a hit with NO name relation is Not Found when
+    it is one of several namesakes, but a LONE uncorroborated hit is still shown as
+    Manual (deterministic search means a drop is permanent). No hit at all is Not Found.
     """
     if not candidates:
         if errored or not searched:
@@ -1142,12 +1244,33 @@ def _decide_no_wiki_platform(
                 evidence=[signal], decision="verified",
             )
 
-    # 3. Nothing corroborated → manual review on what an INDEPENDENT search
-    #    actually found, or Not Found. We never surface a manufactured handle.
-    search_urls = [c["url"] for c in candidates
-                   if c.get("source") != "handle_fanout" and c.get("url")]
+    # 3. Name-match is a STRONG triage signal, but NOT proof. A handle equal to the
+    #    subject's name is usually them (e.g. "Holly Wainwright" whose TikTok is the
+    #    name-exact '@hollywainwright'), but it can also be a namesake, or a fan /
+    #    tribute page that adopts the full name as its handle — a tribute
+    #    'princess_grace_of_monaco' for a person who died in 1982, say. The
+    #    no-Wikipedia path has no LLM, ambiguity guard or authenticity check to tell
+    #    those apart, so a name-exact hit is SURFACED at the top of Manual Review for
+    #    a one-glance human confirmation rather than auto-Verified.
+    name_match = next((c for c in candidates if _name_match_signal(c, talent)), None)
+    if name_match:
+        sig = _name_match_signal(name_match, talent)
+        print(f"  [NAME-MATCH] {platform} | {talent} -> strong name match (manual confirm)")
+        return VerificationResult(
+            platform=platform, best_candidate=name_match["url"], status=STATUS_MANUAL,
+            confidence=70, decision="manual_review",
+            source="Serper + name-exact handle (no Wikipedia)",
+            reason=("No Wikipedia record to verify against, but this is a strong match — "
+                    + sig + " Confirm it is the subject, not a namesake or tribute page."),
+            evidence=[sig],
+        )
 
-    if not search_urls:
+    # 4. Nothing corroborated → manual review on what an INDEPENDENT search
+    #    actually found, or Not Found. We never surface a manufactured handle.
+    search_cands = [c for c in candidates
+                    if c.get("source") != "handle_fanout" and c.get("url")]
+
+    if not search_cands:
         if errored or not searched:
             return VerificationResult(
                 platform=platform, status=STATUS_STOPPED,
@@ -1157,6 +1280,30 @@ def _decide_no_wiki_platform(
             platform=platform, status=STATUS_NOT_FOUND,
             reason="No profile found by a Serper site-search — no such account located.")
 
+    # Gate: the broad "<name> site:<domain>" query has high recall, so it also
+    # sweeps in unrelated namesakes (@breguissimxs for "Emily Vernem", the movie
+    # @mammamiamovie for "Mamamia Out Loud"). A client-SUPPLIED handle is always
+    # surfaced (the client asserted it; a human should see it); discovered hits are
+    # kept when name-plausible.
+    kept = [c for c in search_cands
+            if c.get("source") == "input" or _name_plausible(c, talent)]
+    if not kept:
+        # Nothing name-plausible. Serper is deterministic, so a drop to Not Found is
+        # permanent — never re-surfaced on a later run. So we only drop when a PILE
+        # of unrelated namesakes makes "none of these is the subject" the likely
+        # read; a LONE uncorroborated hit may be a real account whose handle simply
+        # isn't the name (a podcast's network handle, say) and is still worth one
+        # human glance — keep it as Manual rather than hiding it.
+        if len(search_cands) == 1:
+            kept = search_cands
+        else:
+            return VerificationResult(
+                platform=platform, status=STATUS_NOT_FOUND,
+                reason=("Only unrelated namesakes surfaced by the site-search (none bears "
+                        "a name relation), with no Wikipedia record to adjudicate — no "
+                        "profile confidently belongs to this subject."))
+
+    search_urls = [c["url"] for c in kept]
     if len(search_urls) > 1:
         reason = ("Serper cited multiple candidates and there is no Wikipedia record "
                   "to verify against — review which is correct: " + "  |  ".join(search_urls))
@@ -1673,10 +1820,29 @@ def load_decisions(talents: List[str]) -> Dict[str, Dict[str, Dict[str, str]]]:
         return {}
 
 
+def _clean_wiki_url(raw: str) -> str:
+    """
+    Normalise a ``wikipedia_page`` input cell to a single well-formed URL.
+
+    The cell is sometimes two URLs mashed together (no separator) or whitespace-
+    separated — e.g. ``http://…/wiki/Bitsie_Tullochhttp://…/wiki/Bitsie_Tulloch``.
+    Left as-is, the REST-summary title becomes a concatenation and the call 404s.
+    Keep the FIRST well-formed URL only.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = s.split()[0]                                  # whitespace/newline-separated
+    m = re.search(r"https?://.*?(?=https?://)", s)     # a second embedded scheme
+    if m:
+        s = m.group(0)
+    return s.rstrip("/")
+
+
 def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
     """Read (talent, wiki_url, input_metadata, input_handles, yt_distributor) for a row."""
     talent = str(df.at[row_label, excel_service.TALENT_COL] or "").strip()
-    wiki_url = str(df.at[row_label, excel_service.WIKI_COL] or "").strip()
+    wiki_url = _clean_wiki_url(str(df.at[row_label, excel_service.WIKI_COL] or ""))
     input_metadata: dict = {}
     if excel_service.INPUT_META_COL in df.columns:
         raw_meta = df.at[row_label, excel_service.INPUT_META_COL]
