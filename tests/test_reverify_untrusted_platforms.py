@@ -154,3 +154,37 @@ def test_client_supplied_handle_is_never_dropped_by_the_gate():
     res = _nw("Some Brand", "Facebook", cands,
               known={"Instagram": "https://www.instagram.com/other"}, anchors=["other"])
     assert res.status == vs.STATUS_MANUAL
+
+
+# ── Dis-corroboration: a candidate whose bio conflicts with a known handle ────
+
+def test_candidate_linking_to_a_conflicting_handle_is_discarded():
+    # The Brad Alexander case: a YouTube '@bradalexander' whose bio links to a
+    # DIFFERENT Brad Alexander's Instagram (not the actor's 'bradalexanderactor').
+    # Its own page declares a different identity -> discard, not surface.
+    known = {"Instagram": "https://www.instagram.com/bradalexanderactor"}
+    cand = {"url": "https://www.youtube.com/@bradalexander", "source": "serper",
+            "meta": {"profile_links": {"Instagram": "https://www.instagram.com/bradalexandermusic"}}}
+    res = _nw("Brad Alexander", "YouTube", [cand], known=known)
+    assert res.status == vs.STATUS_NOT_FOUND
+    assert res.best_candidate == ""
+
+
+def test_candidate_linking_back_to_the_known_handle_still_corroborates():
+    # The opposite direction must be untouched: a bio that links to the SAME known
+    # Instagram is first-party corroboration -> Verified.
+    known = {"Instagram": "https://www.instagram.com/bradalexanderactor"}
+    cand = {"url": "https://www.youtube.com/@bradofficial", "source": "serper",
+            "meta": {"profile_links": {"Instagram": "https://www.instagram.com/bradalexanderactor"}}}
+    res = _nw("Brad Alexander", "YouTube", [cand], known=known)
+    assert res.status == vs.STATUS_VERIFIED
+
+
+def test_a_client_supplied_candidate_is_not_discarded_by_its_bio():
+    # An 'input' candidate is the client's own assertion — re-verified, never
+    # dropped on its own bio links.
+    known = {"Instagram": "https://www.instagram.com/bradalexanderactor"}
+    cand = {"url": "https://x.com/someclient", "source": "input",
+            "meta": {"profile_links": {"Instagram": "https://www.instagram.com/someoneelse"}}}
+    res = _nw("Brad Alexander", "X", [cand], known=known)
+    assert res.status != vs.STATUS_NOT_FOUND     # surfaced (Manual), not discarded

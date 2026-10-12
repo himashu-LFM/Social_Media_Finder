@@ -472,15 +472,22 @@ def fetch_wiki_metadata(
     meta.is_person, meta.entity_type = _infer_entity_type(input_metadata)
 
     # 1) Resolve the Wikidata QID (from URL if present, else best-effort search).
+    #    A QID from a PROVIDED link (Wikipedia URL or IMDb id in the input file) is
+    #    trusted to be the right person — but the input can be wrong (Damon Dash's
+    #    page was listed for his son "Boogie Dash"), so we re-check its name below.
+    #    The name-search path already name-checks before adopting, so it is exempt.
     qid: Optional[str] = None
+    qid_needs_name_check = False
     try:
         if wikipedia_url:
             qid = wd._wikipedia_url_to_qid(wikipedia_url)
+            qid_needs_name_check = bool(qid)
         if not qid:
             # An IMDb id from the input file pins exactly one person, so prefer it
-            # over the name search — no namesake can slip through an exact
-            # property match. Falls through when the person has no entity.
+            # over the name search — but the input file can still list the WRONG
+            # id, so it is name-checked below just like a provided URL.
             qid = wd._imdb_to_qid(_meta_get(input_metadata, "imdb_id", "imdb", "imdb_url"))
+            qid_needs_name_check = bool(qid)
         if not qid:
             qid = wd._name_to_qid(talent, title_category, title_sub_category)
     except Exception as exc:  # noqa: BLE001
@@ -510,10 +517,31 @@ def fetch_wiki_metadata(
         claims = entity.get("claims", {})
 
         label = (entity.get("labels", {}).get("en", {}) or {}).get("value", "")
+        meta.aliases = _entity_aliases(entity)
+
+        # Guard a PROVIDED Wikipedia URL / IMDb id against pointing at the wrong
+        # entity. The input file listed Damon Dash's page for his son "Boogie Dash",
+        # so the row was verified against a music executive and a namesake TikTok
+        # "matched". The name-search path already rejects a mismatch via
+        # _title_matches_name; apply the same test here. The entity's own label or
+        # an alias must plausibly name the talent, else discard it and fall back to
+        # name-only ground truth (a Manual Review beats a confident wrong answer).
+        if qid_needs_name_check and label and not any(
+            wd._title_matches_name(n, talent) for n in [label, *meta.aliases]
+        ):
+            print(f"  [WIKI-META] Provided entity '{label}' (qid={qid}) does not match "
+                  f"talent '{talent}' — likely a wrong input link; using name only.")
+            fresh = WikiMetadata(
+                talent=talent, wikipedia_url=wikipedia_url, name=talent,
+                input_metadata=input_metadata,
+            )
+            fresh.is_person, fresh.entity_type = _infer_entity_type(input_metadata)
+            _METADATA_CACHE[cache_key] = fresh
+            return fresh
+
         if label:
             meta.name = label.strip()
 
-        meta.aliases = _entity_aliases(entity)
         meta.birth_year = _claim_birth_year(claims)
 
         # Extended attributes + all entity QIDs to resolve in a single batch.
