@@ -74,6 +74,27 @@ def test_a_rich_record_keeps_its_wrong_verdict(llm):
     assert label([cand], gt=RICH, gate=vs.GATE_STRICT).status == vs.STATUS_WRONG
 
 
+def test_a_rich_record_in_evidence_mode_keeps_its_wrong_verdict(llm):
+    """
+    The Grace Kelly case. A Custom-mode run applies GATE_EVIDENCE to EVERY row,
+    including rows that DO have a Wikipedia record. A 'wrong' that cites a real
+    contradiction — a different Grace Kelly, a jazz musician, vs the actress /
+    Princess of Monaco — must stand as Wrong, not be softened to Manual just
+    because the candidate carries the name. The downgrade applies only when the
+    record is GENUINELY name-only, so it keys on the row's actual thinness.
+    """
+    gk = {"name": "Grace Kelly", "professions": ["actress"],
+          "known_works": ["Rear Window"], "entity_type": "person"}
+    cand = {"url": "https://www.youtube.com/channel/UCO8wh1hREqUsCwtZP2iwvVg",
+            "meta": {"display_name": "Grace Kelly",
+                     "serper_snippet": "Grace Kelly, jazz saxophonist and composer."}}
+    llm("wrong", 30, cand["url"],
+        "a different Grace Kelly, a jazz musician, contradicts the actress")
+    r = label([cand], gt=gk, gate=vs.GATE_EVIDENCE, platform="YouTube")
+    assert r.status == vs.STATUS_WRONG
+    assert "more specific than our name-only record" not in (r.reason or "")
+
+
 # ── the evidence gate: what may stand in for a Wikipedia page ───────────────
 
 def test_an_unfetchable_profile_is_escalated_not_confirmed(llm):
@@ -166,3 +187,51 @@ def test_both_providers_pin_temperature():
     import inspect
     for fn in (vs._call_anthropic, vs._call_openai):
         assert '"temperature": 0' in inspect.getsource(fn), fn.__name__
+
+
+def test_a_handle_declaring_fanpage_is_rejected_not_escalated(llm):
+    """
+    BD Wong's 'BDWongFanpage' — the handle itself says fan page. That is a
+    definitive non-official self-declaration, so the cell is rejected (Wrong),
+    not sent to a human on a self-answering case. (Contrast: a bio that merely
+    reads like a fan page stays Manual — see the mettya_bizin case above.)
+    """
+    bd = {"name": "BD Wong", "professions": ["actor"], "entity_type": "person"}
+    cand = {"url": "https://www.facebook.com/BDWongFanpage",
+            "meta": {"display_name": "BD Wong", "bio": "Actor. Jurassic Park, SVU."}}
+    llm("verified", 95, cand["url"], "matches the name and occupation of BD Wong")
+    r = label([cand], gt=bd, gate=vs.GATE_STRICT, platform="Facebook")
+    assert r.status == vs.STATUS_WRONG
+    assert "non-official" in r.reason.lower()
+
+
+def test_a_fanpage_handle_on_a_thin_record_is_still_rejected(llm):
+    """
+    On a name-only (no-wiki) row the thin-record guard softens a 'more specific'
+    Wrong to Manual — but an explicit fan-page HANDLE is a declaration, not a
+    'more specific' rejection, so it must still be rejected (Wrong), not softened.
+    """
+    cand = {"url": "https://www.instagram.com/meccha_bijin_fanpage",
+            "meta": {"display_name": "Meccha Bijin"}}
+    llm("verified", 90, cand["url"], "name matches")
+    r = label([cand], gt=THIN, gate=vs.GATE_EVIDENCE, platform="Instagram")
+    assert r.status == vs.STATUS_WRONG
+
+
+def test_a_declared_unofficial_handle_is_rejected_on_any_verdict(llm):
+    """
+    Bill Murray's 'BillMurrayUnofficialPage'. The handle explicitly says
+    'Unofficial', so the cell is rejected (Wrong) whatever the model returns —
+    verified, a low-confidence downgrade, OR manual_review — and without the
+    contradictory 'more specific than our name-only record' softening.
+    """
+    bm = {"name": "Bill Murray", "professions": ["actor", "comedian"],
+          "entity_type": "person"}
+    cand = {"url": "https://www.facebook.com/BillMurrayUnofficialPage",
+            "meta": {"display_name": "Bill Murray"}}
+    for decision, conf in (("verified", 95), ("verified", 50), ("manual_review", 50),
+                           ("wrong", 40)):
+        llm(decision, conf, cand["url"], "labeled Unofficial; third person")
+        r = label([cand], gt=bm, gate=vs.GATE_EVIDENCE, platform="Facebook")
+        assert r.status == vs.STATUS_WRONG, f"{decision}/{conf} -> {r.status}"
+        assert "more specific than our name-only record" not in (r.reason or "")

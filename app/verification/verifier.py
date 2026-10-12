@@ -836,16 +836,26 @@ def verify_platform(
                 reason = f"{block} {reason}".strip()
                 print(f"  [VERIFY] {platform} authenticity guard -> manual review")
 
-    # "Wrong" is an assertion about identity, and a name-only record does not
+    # "Wrong" is an assertion about identity, and a name-ONLY record does not
     # support it. The model kept rejecting real profiles for being MORE specific
     # than the ground truth ("a four-member band … contradicts 'Talent'"), which
     # is not a contradiction at all. When the record is thin and the candidate
     # still carries the subject's name, that claim becomes Manual Review: we
     # genuinely do not know, and saying so is the honest answer. A candidate whose
     # name does NOT match is left as Wrong — that judgement stands on its own.
-    if status == STATUS_WRONG and thin_gate == GATE_EVIDENCE and best:
+    #
+    # Gate on the ACTUAL thinness of this row, not just the run-wide evidence gate:
+    # a Custom-mode run applies GATE_EVIDENCE to every row, including rows that DO
+    # have a Wikipedia record. For those, a "Wrong" citing a real contradiction
+    # ("a different Grace Kelly, a jazz musician, vs the actress / Princess of
+    # Monaco") is well-founded and must stand — only a genuinely name-only record
+    # lacks the facts to support it. Mirrors the Verified-downgrade guard below.
+    if (status == STATUS_WRONG and thin_gate == GATE_EVIDENCE
+            and _ground_truth_is_thin(wiki_meta) and best):
         chosen = next((c for c in candidates if c.get("url") == best), None)
-        if chosen is not None and _name_is_present(str(wiki_meta.get("name") or ""), chosen):
+        if (chosen is not None
+                and _name_is_present(str(wiki_meta.get("name") or ""), chosen)
+                and not _handle_declares_non_official(chosen)):
             status = STATUS_MANUAL
             confidence = min(confidence or 50, 60)
             reason = ("Rejected only for being more specific than our name-only "
@@ -861,6 +871,25 @@ def verify_platform(
         if block:
             status = STATUS_MANUAL
             reason = f"{block} {reason or ''}".strip()
+
+    # FINAL OVERRIDE. An EXPLICIT non-official token in the chosen handle itself
+    # ("…Unofficial", "…Fanpage", "parody", "tribute") is a self-declaration that
+    # the account is NOT the person's own — definitive, whatever the model and the
+    # softening guards above concluded (verified, manual_review, or a low-confidence
+    # downgrade all collapse to a rejection). Runs last so nothing re-escalates a
+    # self-answering case to a human. Softer signals (bio framing, name order,
+    # follower count) are untouched and still go to Manual Review above.
+    if best and status != STATUS_WRONG:
+        chosen = next((c for c in candidates if c.get("url") == best), None)
+        token = _handle_declares_non_official(chosen) if chosen else ""
+        if token:
+            status = STATUS_WRONG
+            confidence = min(confidence, 40)
+            if "non-official" not in (reason or "").lower():
+                reason = (f"The handle itself declares a non-official account "
+                          f"(\"{token}\") — a fan, tribute or unofficial page, not "
+                          f"the person's own account. " + (reason or "")).strip()
+            print(f"  [VERIFY] {platform} handle declares non-official -> wrong")
 
     chosen_meta = dict((next((c for c in candidates if c.get("url") == best), {})
                         or {}).get("meta") or {})

@@ -1070,6 +1070,37 @@ def _corroboration_signal(
     return ""
 
 
+def _contradicts_known_profiles(cand: dict, known_profiles: Dict[str, str]) -> str:
+    """
+    Deterministic DIS-corroboration: the candidate self-declares a DIFFERENT
+    identity. Its own profile page links to a handle on a platform where we already
+    have a CONFIRMED handle for this subject, and the two are different accounts.
+
+    A real profile links to the subject's OWN other accounts, so a conflicting link
+    is strong evidence this is a namesake — e.g. a YouTube '@bradalexander' whose
+    bio points at a different Brad Alexander's Instagram, not the actor's
+    'bradalexanderactor'. ``_corroboration_signal`` only ever CONFIRMED a matching
+    back-link; this is the missing opposite. Returns a reason, or "".
+
+    Compares only against CONFIRMED handles (input-verified or already corroborated
+    this row), and only where both sides have a handle — an absent link is not a
+    contradiction. A client-supplied ("input") candidate is exempt: the client
+    asserted that handle, so it is re-verified, not discarded on its own bio.
+    """
+    if cand.get("source") == "input":
+        return ""
+    published = (cand.get("meta") or {}).get("profile_links") or {}
+    if not isinstance(published, dict):
+        return ""
+    for platform, known_url in (known_profiles or {}).items():
+        listed = published.get(platform)
+        if listed and known_url and not _same_profile(listed, known_url, platform):
+            return (f"Its own page links to a different {platform} account ({listed}) "
+                    f"than the one on file for this subject ({known_url}) — a different "
+                    f"person.")
+    return ""
+
+
 def _name_match_signal(cand: dict, talent: str) -> str:
     """
     Strong, high-precision name evidence for a no-Wikipedia candidate: the
@@ -1205,6 +1236,28 @@ def _decide_no_wiki_platform(
         return VerificationResult(
             platform=platform, status=STATUS_NOT_FOUND,
             reason="No profile found by a Serper site-search — no such account located.")
+
+    # 0. DIS-corroboration. Drop any candidate that self-declares a DIFFERENT
+    #    identity — its own page links to a handle conflicting with a CONFIRMED one
+    #    for this subject (the YouTube '@bradalexander' whose bio points at a
+    #    different Brad Alexander's Instagram, not the actor's). Corroboration below
+    #    only ever CONFIRMED a matching back-link; without this, such a namesake
+    #    falls through to the name-match / gate and is surfaced for review instead
+    #    of discarded. Runs first so it can never be rescued by a later signal.
+    kept: List[dict] = []
+    for cand in candidates:
+        why = _contradicts_known_profiles(cand, known_profiles)
+        if why:
+            print(f"  [DISCONFIRM] {platform} | {talent} -> dropped {cand.get('url','')}: {why}")
+        else:
+            kept.append(cand)
+    if not kept:
+        return VerificationResult(
+            platform=platform, status=STATUS_NOT_FOUND,
+            reason=("Every profile found self-declares a different identity — its page "
+                    "links to accounts that conflict with this subject's known handles. "
+                    "No account for this subject was located."))
+    candidates = kept
 
     # 1. Deterministic self-evidence against what we already know for this subject.
     for cand in candidates:
