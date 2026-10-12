@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -134,6 +134,53 @@ def instagram_configured() -> bool:
     return bool(APIFY_TOKEN and APIFY_INSTAGRAM_ACTOR_ID)
 
 
+# Per-run cache of the raw Instagram actor item, keyed by username. Reading a
+# profile for VALIDATION (its own name/bio) and for BIO-LINK sourcing (the links
+# it lists) then costs ONE actor run, not two. Cleared per run via clear_cache().
+_IG_ITEM_CACHE: Dict[str, Optional[dict]] = {}
+
+
+def clear_cache() -> None:
+    """Drop the per-run Instagram actor cache (call at the start of each run)."""
+    _IG_ITEM_CACHE.clear()
+
+
+def _fetch_instagram_item(username: str) -> Optional[dict]:
+    """Run the Instagram actor once per username (cached) and return its item, or
+    None when the run failed or the actor reported an error. Never raises."""
+    if username in _IG_ITEM_CACHE:
+        return _IG_ITEM_CACHE[username]
+    item: Optional[dict] = None
+    try:
+        items = _run_named_actor(APIFY_INSTAGRAM_ACTOR_ID, _instagram_input(username))
+        cand = items[0] if items else None
+        if isinstance(cand, dict) and cand.get("error"):
+            print(f"  [APIFY-IG] {username}: actor error {cand.get('error')}")
+        elif isinstance(cand, dict):
+            item = cand
+    except Exception as exc:  # noqa: BLE001 — reading must never raise
+        print(f"  [APIFY-IG] run failed for {username}: {exc.__class__.__name__}")
+    # Cache only a successful read. A transient failure is NOT cached, so a later
+    # caller (e.g. bio-link sourcing after validation) can retry rather than
+    # inheriting the failure.
+    if item is not None:
+        _IG_ITEM_CACHE[username] = item
+    return item
+
+
+def instagram_profile(profile_url: str) -> Dict[str, Any]:
+    """Read an Instagram profile's OWN metadata — display name, bio, username —
+    so a supplied handle can be confirmed to belong to the talent. Returns {} when
+    Apify is unconfigured or the profile can't be read. Never raises."""
+    if not instagram_configured() or not profile_url:
+        return {}
+    username = social_urls.handle_from_url(profile_url, "Instagram").lstrip("@")
+    if not username:
+        return {}
+    item = _fetch_instagram_item(username)
+    return _get_meta(item) if isinstance(item, dict) else {}
+
+
 def _run_named_actor(actor_id: str, actor_input: dict) -> List[dict]:
     """Run a specific actor synchronously; same response handling as _run_actor."""
     url = f"{_APIFY_BASE}/acts/{actor_id}/run-sync-get-dataset-items"
@@ -206,16 +253,8 @@ def instagram_bio_links(profile_url: str) -> Dict[str, str]:
     username = social_urls.handle_from_url(profile_url, "Instagram").lstrip("@")
     if not username:
         return {}
-    try:
-        items = _run_named_actor(APIFY_INSTAGRAM_ACTOR_ID, _instagram_input(username))
-    except Exception as exc:  # noqa: BLE001 — reading must never raise
-        print(f"  [APIFY-IG] run failed for {username}: {exc.__class__.__name__}")
-        return {}
-    item = items[0] if items else None
+    item = _fetch_instagram_item(username)
     if not isinstance(item, dict):
-        return {}
-    if item.get("error"):
-        print(f"  [APIFY-IG] {username}: actor error {item.get('error')}")
         return {}
 
     agg_urls, blob = _instagram_link_sources(item)

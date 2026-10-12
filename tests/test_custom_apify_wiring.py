@@ -40,6 +40,9 @@ def no_free_links(monkeypatch):
 def _enable_apify(monkeypatch, links):
     monkeypatch.setattr(vp.apify_service, "instagram_configured", lambda: True)
     monkeypatch.setattr(vp.apify_service, "instagram_bio_links", lambda url: dict(links))
+    # Input-handle validation also reads the IG profile; keep it offline (empty read
+    # -> handle trusted by the safety valve) so these tests stay network-free.
+    monkeypatch.setattr(vp.apify_service, "instagram_profile", lambda url: {})
 
 
 def test_apify_fills_gaps_and_marks_verified(no_free_links, monkeypatch):

@@ -71,3 +71,84 @@ def test_blank_cells_on_a_no_wiki_row_are_all_searched(monkeypatch):
 
     # Blank Instagram and YouTube are searched like every other platform.
     assert set(searched) == set(su.PLATFORMS)
+
+
+def test_no_wiki_query_is_the_bare_name_no_category_or_prompt(monkeypatch):
+    """The no-Wikipedia query is '<name> site:<domain>' — nothing else.
+
+    An A/B/C test (366 curated reference points, real Serper) showed appending
+    the category word or the analyst prompt SUPPRESSES the correct profile
+    (~80% found with the bare name vs ~41% with category vs ~16% with the old
+    '<name> <category> <prompt>' query). So even when a prompt is set and the
+    profession toggle is on with a category in the row, neither reaches the query.
+    """
+    from app.discovery import serper as serper_service
+    from app.pipeline import options as so
+
+    captured: list = []
+
+    def fake_discover(talent, platform, *args, **kwargs):
+        captured.append(kwargs)
+        return []
+
+    monkeypatch.setattr(serper_service, "is_configured", lambda: True)
+    monkeypatch.setattr(vp.serper_service, "discover_by_site", fake_discover)
+
+    opts = so.SearchOptions(mode="custom", prompt="social media handles",
+                            include_profession=True)
+    vp._row_serper_corroborate_phase(
+        "Billy Garvey",
+        {},                                   # no input handles → every platform is blank
+        {"title_sub_category": "Talent Type - Education"},  # a category IS available
+        {},
+        opts,
+    )
+
+    assert captured, "no-wiki phase must search the blank platforms"
+    for kw in captured:
+        assert kw.get("query_template") == "{name} site:{domain}"
+        assert kw.get("category") == ""      # profession is NOT appended
+        assert kw.get("prompt") == ""        # analyst prompt is NOT appended
+
+
+# ── Bug fix: malformed wikipedia_page cell (concatenated URLs) ────────────────
+
+def test_clean_wiki_url_splits_concatenated_cell():
+    # The real bug: two URLs mashed together -> REST summary title 404'd.
+    glued = ("http://en.wikipedia.org/wiki/Bitsie_Tulloch"
+             "http://en.wikipedia.org/wiki/Bitsie_Tulloch")
+    assert vp._clean_wiki_url(glued) == "http://en.wikipedia.org/wiki/Bitsie_Tulloch"
+
+
+def test_clean_wiki_url_takes_first_of_whitespace_separated():
+    two = "https://en.wikipedia.org/wiki/A https://en.wikipedia.org/wiki/B"
+    assert vp._clean_wiki_url(two) == "https://en.wikipedia.org/wiki/A"
+
+
+def test_clean_wiki_url_leaves_a_normal_url_untouched():
+    u = "https://en.wikipedia.org/wiki/Grace_Kelly"
+    assert vp._clean_wiki_url(u) == u
+    assert vp._clean_wiki_url("") == ""
+
+
+# ── Bug fix: _fetch_rest_summary tolerates a concatenated wikipedia URL ───────
+
+def test_fetch_rest_summary_cuts_embedded_scheme_in_title(monkeypatch):
+    from app.identity import wikipedia as wk
+
+    seen = {}
+
+    def fake_get(url, timeout=10):
+        seen["url"] = url
+        class _R:
+            def json(self):
+                return {"title": "Bitsie Tulloch", "description": "actress", "extract": "x"}
+        return _R()
+
+    monkeypatch.setattr(wk.wd, "_get", fake_get)
+    glued = ("http://en.wikipedia.org/wiki/Bitsie_Tulloch"
+             "http://en.wikipedia.org/wiki/Bitsie_Tulloch")
+    out = wk._fetch_rest_summary(glued)
+    # The REST title must be the clean page title, not the concatenation.
+    assert seen["url"].endswith("/api/rest_v1/page/summary/Bitsie_Tulloch")
+    assert out.get("description") == "actress"
