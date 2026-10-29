@@ -118,7 +118,12 @@ def is_valid_profile_url(link: str, platform: str) -> bool:
         if any(seg in full for seg in ("/posts/", "/photos/", "/videos/", "/watch/",
                                        "/reel", "/story.php", "/permalink/")):
             return False
-        if "profile.php" in path or "/people/" in path or "/pages/" in path:
+        # Old "/pages/<name>/<numeric-id>" format (e.g.
+        # /pages/New-York-University/103256838688) is excluded by requirement —
+        # it is a non-canonical, numeric-id page URL, not a clean vanity profile.
+        if "/pages/" in path:
+            return False
+        if "profile.php" in path or "/people/" in path:
             return True
         segs = [s for s in path.strip("/").split("/") if s]
         if len(segs) == 1:
