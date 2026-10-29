@@ -76,7 +76,20 @@ type JobPollPayload = {
     completed_platforms?: string[];
   }[];
   error?: string | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+  duration_seconds?: number | null;
 };
+
+/** Seconds -> "m:ss" (or "h:mm:ss" past an hour) for the execution timer. */
+function formatDuration(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
 
 const EMPTY_PLATFORM_PROGRESS: RowPlatformProgress = {
   currentPlatform: null,
@@ -128,6 +141,14 @@ export function ProcessingRunner() {
   const previousDoneCountRef = useRef(0);
   const previousActiveIndexRef = useRef(-1);
 
+  // Execution timer. ``startMsRef`` anchors the run start (the backend's
+  // ``started_at`` once it arrives — reload-safe — else the client clock);
+  // ``elapsedSeconds`` ticks live while running; ``finalSeconds`` is the
+  // backend's authoritative total once the run ends.
+  const startMsRef = useRef<number | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [finalSeconds, setFinalSeconds] = useState<number | null>(null);
+
   const doneCount = useMemo(
     () => statuses.filter((s) => s === "done").length,
     [statuses],
@@ -136,6 +157,21 @@ export function ProcessingRunner() {
   const allDone = total > 0 && doneCount === total;
   const currentNameIndex = statuses.findIndex((s) => s === "processing");
   const remainingCount = Math.max(0, total - doneCount);
+
+  // Finer-grained progress: count completed platform-steps across every row, not
+  // whole rows. With rows running in parallel, a row-only percent sits flat then
+  // jumps at the end; this advances as each platform on each row completes.
+  const platformStepCount = SOCIAL_PLATFORM_STEPS.length;
+  const doneSteps = useMemo(
+    () =>
+      statuses.reduce((acc, s, i) => {
+        if (s === "done") return acc + platformStepCount;
+        const done = rowPlatformProgress[i]?.completedPlatforms.length ?? 0;
+        return acc + Math.min(done, platformStepCount);
+      }, 0),
+    [statuses, rowPlatformProgress, platformStepCount],
+  );
+  const totalSteps = total * platformStepCount;
 
   useEffect(() => {
     setMounted(true);
@@ -262,6 +298,14 @@ export function ProcessingRunner() {
           return;
         }
         const data = (await res.json()) as JobPollPayload;
+        // Timer: anchor to the backend's start (reload-safe), and take its
+        // authoritative total once the run ends.
+        if (typeof data.started_at === "number") {
+          startMsRef.current = data.started_at * 1000;
+        }
+        if (typeof data.duration_seconds === "number") {
+          setFinalSeconds(data.duration_seconds);
+        }
         const next = data.names.map((n) => n.status);
         const nextPlatformProgress = data.names.map((entry) => platformProgressFromEntry(entry));
         const nextDoneCount = next.filter((s) => s === "done").length;
@@ -367,13 +411,37 @@ export function ProcessingRunner() {
       pushToast("Could not reach the API to stop the run.", "error");
     }
   }
+  // Live execution timer: ticks once a second while a run is in progress. The
+  // final total comes from the backend (``finalSeconds``); this only drives the
+  // live count-up. Anchors to the client clock if the backend start hasn't been
+  // seen yet (e.g. the demo run, or before the first poll).
+  useEffect(() => {
+    const active =
+      (source === "python" || source === "demo") &&
+      total > 0 &&
+      !allDone &&
+      !runCancelled &&
+      !backendError;
+    if (!active) return;
+    if (startMsRef.current === null) startMsRef.current = Date.now();
+    const tick = () =>
+      setElapsedSeconds(Math.floor((Date.now() - (startMsRef.current as number)) / 1000));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [source, total, allDone, runCancelled, backendError]);
+
   /* ── render ─────────────────────────────────────────────────────────────
      The Claude Design handoff's Processing page: a run summary naming the row
      being worked on, the four pipeline phases, and a platform-wise tracker.
      The chrome comes from AppShell so the rail, header and stage strip match
      every other page. */
 
-  const pct = total ? Math.round((doneCount / total) * 100) : 0;
+  const pct = totalSteps ? Math.round((doneSteps / totalSteps) * 100) : 0;
+  // What the timer shows: the backend's authoritative total once finished, else
+  // the live client-side count-up.
+  const timerSeconds =
+    (allDone || runCancelled) && finalSeconds !== null ? finalSeconds : elapsedSeconds;
   const activeName = currentNameIndex >= 0 ? names?.[currentNameIndex] : undefined;
   const liveMessage = LIVE_MESSAGES[currentStepIndex % LIVE_MESSAGES.length];
   const isWaitingForFirstRow = !allDone && doneCount === 0 && currentNameIndex < 0;
@@ -518,6 +586,12 @@ export function ProcessingRunner() {
             <span className="sc-metric">
               <span className="sc-metric-label">Remaining</span>
               <span className="sc-metric-value">{remainingCount}</span>
+            </span>
+            <span className="sc-metric">
+              <span className="sc-metric-label">
+                {allDone || runCancelled ? "Total time" : "Elapsed"}
+              </span>
+              <span className="sc-metric-value">{formatDuration(timerSeconds)}</span>
             </span>
             <span className="sc-metric">
               <span className="sc-metric-label">Workbook</span>

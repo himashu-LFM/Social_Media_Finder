@@ -72,6 +72,13 @@ def _persist(job_id: str, rows: Optional[List[dict]] = None,
         db_service.save_job(job_id, job, rows)
 
 
+def _stamp_finished(job: Dict[str, Any]) -> None:
+    """Record the run's end time and total execution time (seconds)."""
+    job["finished_at"] = time.time()
+    started = job.get("started_at")
+    job["duration_seconds"] = round(job["finished_at"] - started, 1) if started else None
+
+
 def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
                   compact_path: Optional[str] = None,
                   rows: Optional[List[dict]] = None) -> None:
@@ -82,6 +89,7 @@ def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
             return
         was_cancelled = job_id in _cancel_events and _cancel_events[job_id].is_set()
         job["status"] = "cancelled" if was_cancelled else "completed"
+        _stamp_finished(job)
         job["output_path"] = out_path
         job["serper_output_path"] = serper_path
         job["compact_output_path"] = compact_path
@@ -293,6 +301,7 @@ def _run_job(job_id: str, names: List[str],
     try:
         with _jobs_lock:
             _jobs[job_id]["status"] = "running"
+            _jobs[job_id]["started_at"] = time.time()
         _persist(job_id)
 
         final_df = testing.run_pipeline_for_names(
@@ -311,6 +320,7 @@ def _run_job(job_id: str, names: List[str],
             if job:
                 job["status"] = "failed"
                 job["error"] = str(exc)
+                _stamp_finished(job)
         _persist(job_id)
 
 
@@ -333,6 +343,7 @@ def _run_job_from_file(job_id: str, path: Path,
     try:
         with _jobs_lock:
             _jobs[job_id]["status"] = "running"
+            _jobs[job_id]["started_at"] = time.time()
         _persist(job_id)
 
         df = testing.load_talent_table_from_path(path)
@@ -352,6 +363,7 @@ def _run_job_from_file(job_id: str, path: Path,
             if job:
                 job["status"] = "failed"
                 job["error"] = str(exc)
+                _stamp_finished(job)
         _persist(job_id)
     finally:
         try:
@@ -713,6 +725,9 @@ def start_job(body: StartJobBody,
             ],
             "output_path": None,
             "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "duration_seconds": None,
             "started_by": _uid(user),
             "search_mode": options.mode,
             "prompt": options.prompt,
@@ -796,6 +811,9 @@ async def start_job_from_upload(file: UploadFile = File(...),
             ],
             "output_path": None,
             "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "duration_seconds": None,
             "source_filename": raw_name,
             "started_by": _uid(user),
             "search_mode": options.mode,
