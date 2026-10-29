@@ -17,7 +17,7 @@ Public interface:
     fetch_wiki_metadata(talent, wikipedia_url="", title_category="",
                         title_sub_category="") -> WikiMetadata
 
-    WikiMetadata.social_links -> {platform: url}  # Wikidata-declared, trusted
+    WikiMetadata.social_links -> {platform: url}  # Wikidata-declared candidates
     WikiMetadata.to_prompt_dict() -> dict          # compact dict for the LLM
 """
 
@@ -102,8 +102,11 @@ class WikiMetadata:
     known_works: List[str] = field(default_factory=list)
     official_website: str = ""
     summary: str = ""
-    # Wikidata-declared social profiles ({platform: url}) — most trusted source.
+    # Wikidata-declared social profiles ({platform: url}) — validated candidates.
     social_links: Dict[str, str] = field(default_factory=dict)
+    # First-party handles the official website lists that DIFFER from Wikidata's —
+    # kept as a fallback so a dead/wrong Wikidata handle can be replaced.
+    website_social_links: Dict[str, str] = field(default_factory=dict)
     # Reference identity sources beyond Wikipedia ({source: url}), e.g. IMDb,
     # Spotify, TMDb — used by the verifier as cross-reference signals.
     reference_urls: Dict[str, str] = field(default_factory=dict)
@@ -471,11 +474,9 @@ def fetch_wiki_metadata(
     # entity overrides this below with the authoritative P31 value.
     meta.is_person, meta.entity_type = _infer_entity_type(input_metadata)
 
-    # 1) Resolve the Wikidata QID (from URL if present, else best-effort search).
-    #    A QID from a PROVIDED link (Wikipedia URL or IMDb id in the input file) is
-    #    trusted to be the right person — but the input can be wrong (Damon Dash's
-    #    page was listed for his son "Boogie Dash"), so we re-check its name below.
-    #    The name-search path already name-checks before adopting, so it is exempt.
+    # 1) Resolve the Wikidata QID. A QID from a PROVIDED link (Wikipedia URL / IMDb
+    #    id) can still be the wrong entity (a wrong input link), so it is name-checked
+    #    below; the name-search path already checks the name before adopting.
     qid: Optional[str] = None
     qid_needs_name_check = False
     try:
@@ -519,13 +520,9 @@ def fetch_wiki_metadata(
         label = (entity.get("labels", {}).get("en", {}) or {}).get("value", "")
         meta.aliases = _entity_aliases(entity)
 
-        # Guard a PROVIDED Wikipedia URL / IMDb id against pointing at the wrong
-        # entity. The input file listed Damon Dash's page for his son "Boogie Dash",
-        # so the row was verified against a music executive and a namesake TikTok
-        # "matched". The name-search path already rejects a mismatch via
-        # _title_matches_name; apply the same test here. The entity's own label or
-        # an alias must plausibly name the talent, else discard it and fall back to
-        # name-only ground truth (a Manual Review beats a confident wrong answer).
+        # Guard a provided URL/IMDb id against the wrong entity (e.g. Damon Dash's
+        # page listed for his son "Boogie Dash"): the label or an alias must name
+        # the talent, else discard and fall back to name-only ground truth.
         if qid_needs_name_check and label and not any(
             wd._title_matches_name(n, talent) for n in [label, *meta.aliases]
         ):
@@ -590,7 +587,7 @@ def fetch_wiki_metadata(
 
         meta.attributes = attributes
 
-        # Official website + Wikidata-declared social profiles (trusted candidates).
+        # Official website + Wikidata-declared social profiles (validated candidates).
         try:
             socials = wd._extract_wikidata_socials(entity)
         except Exception:  # noqa: BLE001
@@ -607,17 +604,24 @@ def fetch_wiki_metadata(
         # like FC Dallas it recovers the real Facebook/Instagram/X/YouTube from
         # its own site. Wikidata (higher confidence) is never overwritten.
         _TARGET_PLATFORMS = ("Instagram", "Facebook", "YouTube", "TikTok", "X")
-        if meta.official_website and any(p not in meta.social_links for p in _TARGET_PLATFORMS):
+        if meta.official_website:
             try:
                 site_socials = wd.crawl_official_website(meta.official_website, talent)
             except Exception:  # noqa: BLE001 — a failed scrape must never abort the row
                 site_socials = {}
             for platform, value in (site_socials or {}).items():
-                if platform.startswith("_") or platform in meta.social_links:
+                if platform.startswith("_"):
                     continue
                 url = value[0] if isinstance(value, tuple) else value
-                if url:
-                    meta.social_links[platform] = url
+                if not url:
+                    continue
+                if platform not in meta.social_links:
+                    meta.social_links[platform] = url                 # fill undeclared
+                elif url != meta.social_links[platform]:
+                    # Website lists a different handle than Wikidata — keep it as a
+                    # fallback (e.g. Wikidata 'upitt' vs the site's real 'h2pitt') so
+                    # it can replace the Wikidata one if that turns out dead.
+                    meta.website_social_links.setdefault(platform, url)
 
         # Reference identity sources beyond Wikipedia (IMDb, Spotify, TMDb).
         meta.reference_urls = _extract_reference_urls(claims)

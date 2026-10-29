@@ -77,8 +77,7 @@ WIKIDATA_SOCIAL_PROPS: Dict[str, Tuple[str, str]] = {
     "P18":   ("_image",     "{}"),           # image — skip
 }
 
-# YouTube handle property (newer — @handle style)
-WIKIDATA_YT_HANDLE_PROP = "P11245"          # YouTube handle (@CBSSports style)
+WIKIDATA_YT_HANDLE_PROP = "P11245"          # YouTube @handle (newer than P2397 channel ID)
 
 # ── Platform URL patterns for HTML scraping ──────────────────────────────────
 SOCIAL_URL_PATTERNS: Dict[str, re.Pattern] = {
@@ -345,14 +344,59 @@ def _fetch_wikidata_entity(qid: str) -> Optional[dict]:
         return None
 
 
+# Common web TLDs. A social-ID value ending in one of these is a domain, not a
+# handle (Wikidata sometimes mis-files a website into a social field).
+_WEB_TLD_RE = re.compile(
+    r"\.(?:com|org|net|edu|gov|mil|int|io|co|ai|app|dev|xyz|online|site|"
+    r"us|uk|ca|au|de|fr|es|it|nl|in|info|biz|tv|me)$", re.I)
+
+
+def _host_of(url: str) -> str:
+    m = re.match(r"(?:https?://)?(?:www\.)?([^/]+)", (url or "").strip().lower())
+    return m.group(1).rstrip("/") if m else ""
+
+
+def _social_value_is_not_a_handle(value: str, website_host: str = "") -> bool:
+    """
+    True when a Wikidata social-ID value is a URL, path, or bare domain mis-filed
+    into a social field (e.g. UGA's Facebook-ID P2013 = 'uga.edu', the website),
+    which would otherwise become a dead 'facebook.com/uga.edu'. A real handle is a
+    bare username, so a dotted handle like 'john.smith' (no web TLD) is not flagged.
+    """
+    v = (value or "").strip().lower().lstrip("@")
+    if not v:
+        return True
+    if "/" in v or ":" in v or " " in v:
+        return True                       # a URL or a path, not a bare handle
+    if _WEB_TLD_RE.search(v):
+        return True                       # a bare domain ('uga.edu')
+    if website_host and v == website_host:
+        return True                       # literally the entity's own website host
+    return False
+
+
 def _extract_wikidata_socials(entity: dict) -> Dict[str, Tuple[str, str, str]]:
     """
     Extract social media handles from a Wikidata entity's claims.
 
-    Returns: {platform: (url, handle, source_property)}
+    Returns: {platform: (url, handle, source_property)}. A value that is actually a
+    URL/path/domain (Wikidata data error) is rejected, not turned into a bogus URL.
     """
     claims  = entity.get("claims", {})
     results = {}
+
+    # Website first, so a social value that is actually this site's domain is caught.
+    website_host = ""
+    if "P856" in claims:
+        try:
+            snak = claims["P856"][0]["mainsnak"]
+            if snak.get("snaktype") == "value":
+                website = snak["datavalue"]["value"].strip()
+                if website:
+                    results["_website"] = (website, website, "P856")
+                    website_host = _host_of(website)
+        except (KeyError, IndexError, TypeError):
+            pass
 
     for prop, (platform, url_tpl) in WIKIDATA_SOCIAL_PROPS.items():
         if platform.startswith("_") or prop not in claims:
@@ -364,6 +408,10 @@ def _extract_wikidata_socials(entity: dict) -> Dict[str, Tuple[str, str, str]]:
             value = snak["datavalue"]["value"]
             if isinstance(value, str) and value.strip():
                 handle = value.strip().lstrip("@")
+                if _social_value_is_not_a_handle(handle, website_host):
+                    print(f"  [WIKI] {platform} {prop}={value!r} is not a handle "
+                          f"(URL/domain mis-filed) — ignored.")
+                    continue
                 url    = url_tpl.format(handle)
                 results[platform] = (url, handle, prop)
         except (KeyError, IndexError, TypeError):
@@ -375,23 +423,12 @@ def _extract_wikidata_socials(entity: dict) -> Dict[str, Tuple[str, str, str]]:
             snak = claims[WIKIDATA_YT_HANDLE_PROP][0]["mainsnak"]
             if snak.get("snaktype") == "value":
                 handle = snak["datavalue"]["value"].strip().lstrip("@")
-                if handle:
+                if handle and not _social_value_is_not_a_handle(handle, website_host):
                     results["YouTube"] = (
                         f"https://www.youtube.com/@{handle}",
                         handle,
                         WIKIDATA_YT_HANDLE_PROP,
                     )
-        except (KeyError, IndexError, TypeError):
-            pass
-
-    # Extract official website separately
-    if "P856" in claims:
-        try:
-            snak = claims["P856"][0]["mainsnak"]
-            if snak.get("snaktype") == "value":
-                website = snak["datavalue"]["value"].strip()
-                if website:
-                    results["_website"] = (website, website, "P856")
         except (KeyError, IndexError, TypeError):
             pass
 

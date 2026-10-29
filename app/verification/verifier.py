@@ -240,12 +240,9 @@ _FAN_HANDLE_RE = re.compile(
     re.I,
 )
 
-# Distinctive tokens a handle/URL uses to DECLARE itself a non-official account.
-# Matched as substrings after stripping separators, so a camelCase handle like
-# "BillMurrayUnofficialPage" is caught — which the delimiter-based _FAN_HANDLE_RE
-# above misses. Deliberately limited to tokens that essentially never occur inside
-# a real person's or brand's own handle: bare "fan" (Stefani, Fanning) and bare
-# "official" (BillyGardellOfficial) are intentionally NOT here.
+# Tokens a handle/URL uses to DECLARE itself non-official, matched as substrings
+# after stripping separators (so "BillMurrayUnofficialPage" is caught). Limited to
+# tokens that never occur in a real handle — bare "fan"/"official" are excluded.
 _NON_OFFICIAL_HANDLE_TOKENS = (
     "unofficial", "fanpage", "fanspage", "fanaccount", "fanclub",
     "fansite", "fanspot", "tribute", "parody", "notaffiliated",
@@ -307,19 +304,10 @@ def _thin_gate_block(thin_gate: str, chosen: Optional[Dict[str, Any]],
     """
     Decide what a thin ground truth costs. Returns a downgrade reason, or "".
 
-    ``"strict"`` is Wikipedia mode and refuses every thin Verify, which is the
-    behaviour that produced the measured precision — it must not change.
-
-    ``"evidence"`` is custom (non-Wikipedia) mode. Those subjects have no
-    Wikipedia page *by definition*, so the strict gate would send 100% of the
-    run to Manual Review and the mode would be pointless. Instead of dropping
-    the gate, the burden of proof moves onto the candidate itself: the profile
-    must carry real fetched evidence (a bio, a follower count, a knowledge
-    panel — not just a URL that parsed), and the model must be clearly, not
-    marginally, confident. A weak or bare candidate still goes to a human.
-
-    This is a deliberate precision trade: custom mode will confirm some profiles
-    Wikipedia mode would have escalated. Every other guard still applies.
+    ``"strict"`` (Wikipedia mode) refuses every thin Verify. ``"evidence"`` (custom
+    mode) can't use that gate — those subjects have no Wikipedia page by definition —
+    so the burden moves onto the candidate: it must carry real fetched evidence (bio,
+    follower count, knowledge panel) and clear confidence, or it still goes to a human.
     """
     if thin_gate != GATE_EVIDENCE:
         return _THIN_STRICT_REASON
@@ -836,20 +824,11 @@ def verify_platform(
                 reason = f"{block} {reason}".strip()
                 print(f"  [VERIFY] {platform} authenticity guard -> manual review")
 
-    # "Wrong" is an assertion about identity, and a name-ONLY record does not
-    # support it. The model kept rejecting real profiles for being MORE specific
-    # than the ground truth ("a four-member band … contradicts 'Talent'"), which
-    # is not a contradiction at all. When the record is thin and the candidate
-    # still carries the subject's name, that claim becomes Manual Review: we
-    # genuinely do not know, and saying so is the honest answer. A candidate whose
-    # name does NOT match is left as Wrong — that judgement stands on its own.
-    #
-    # Gate on the ACTUAL thinness of this row, not just the run-wide evidence gate:
-    # a Custom-mode run applies GATE_EVIDENCE to every row, including rows that DO
-    # have a Wikipedia record. For those, a "Wrong" citing a real contradiction
-    # ("a different Grace Kelly, a jazz musician, vs the actress / Princess of
-    # Monaco") is well-founded and must stand — only a genuinely name-only record
-    # lacks the facts to support it. Mirrors the Verified-downgrade guard below.
+    # A "Wrong" that only rejects a profile for being MORE specific than a name-ONLY
+    # record isn't a real contradiction, so (name still present) soften it to Manual.
+    # Gate on this row's ACTUAL thinness, not the run-wide evidence gate: a real
+    # contradiction against a full Wikipedia record (a different Grace Kelly) stays
+    # Wrong. Mirrors the Verified-downgrade guard below.
     if (status == STATUS_WRONG and thin_gate == GATE_EVIDENCE
             and _ground_truth_is_thin(wiki_meta) and best):
         chosen = next((c for c in candidates if c.get("url") == best), None)
@@ -872,13 +851,10 @@ def verify_platform(
             status = STATUS_MANUAL
             reason = f"{block} {reason or ''}".strip()
 
-    # FINAL OVERRIDE. An EXPLICIT non-official token in the chosen handle itself
-    # ("…Unofficial", "…Fanpage", "parody", "tribute") is a self-declaration that
-    # the account is NOT the person's own — definitive, whatever the model and the
-    # softening guards above concluded (verified, manual_review, or a low-confidence
-    # downgrade all collapse to a rejection). Runs last so nothing re-escalates a
-    # self-answering case to a human. Softer signals (bio framing, name order,
-    # follower count) are untouched and still go to Manual Review above.
+    # FINAL OVERRIDE. An explicit non-official token in the chosen handle itself
+    # ("…Unofficial", "…Fanpage", "parody", "tribute") self-declares the account is
+    # NOT the person's own, so it collapses to Wrong whatever the guards above
+    # concluded. Runs last so nothing re-escalates a self-answering case to a human.
     if best and status != STATUS_WRONG:
         chosen = next((c for c in candidates if c.get("url") == best), None)
         token = _handle_declares_non_official(chosen) if chosen else ""
