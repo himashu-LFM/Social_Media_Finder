@@ -131,10 +131,25 @@ def profile_is_missing(url: str, platform: str) -> bool:
 
 _PRIVATE_RE = re.compile(r'"is_private"\s*:\s*true|"isPrivate"\s*:\s*true', re.I)
 
+# A YouTube channel page embeds its stable channel id (UC + 22 chars) in several
+# places — the inline JSON ("channelId"/"externalId") and the canonical
+# /channel/UC... link. The id is rename-proof, so it is what lets two URL forms
+# of the same channel (…/@handle and …/channel/UC...) be recognised as one.
+_YT_CHANNEL_ID_JSON_RE = re.compile(r'"(?:channelId|externalId)"\s*:\s*"(UC[\w-]{22})"')
+_YT_CHANNEL_ID_PATH_RE = re.compile(r'/channel/(UC[\w-]{22})')
+
 
 def _page_is_private(html: str) -> bool:
     """True only when the page JSON explicitly declares the account private."""
     return bool(html) and bool(_PRIVATE_RE.search(html))
+
+
+def _youtube_channel_id_from_html(html: str) -> str:
+    """Extract a YouTube channel id (UC...) from page HTML, or '' if none found."""
+    if not html:
+        return ""
+    m = _YT_CHANNEL_ID_JSON_RE.search(html) or _YT_CHANNEL_ID_PATH_RE.search(html)
+    return m.group(1) if m else ""
 
 
 def _fetch_html(url: str) -> str:
@@ -241,6 +256,14 @@ def fetch_profile_metadata(url: str, platform: str) -> Dict[str, Any]:
     # in the page JSON — an absent flag stays unknown.
     if _page_is_private(html):
         meta["private"] = True
+
+    # YouTube channel id (UC...): the rename-proof identity of the channel, used to
+    # collapse different URL forms of the same channel into one. Free — the HTML is
+    # already fetched. Absent for non-YouTube pages or when the page carries no id.
+    if platform == "YouTube":
+        cid = _youtube_channel_id_from_html(html)
+        if cid:
+            meta["channel_id"] = cid
 
     # Every social profile this page links to. Free: the HTML is already here,
     # and it is what lets the pipeline check whether a discovered candidate links

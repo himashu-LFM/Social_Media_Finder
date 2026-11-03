@@ -70,6 +70,7 @@ _META_KEYS: Dict[str, List[str]] = {
     "bio": ["biography", "bio", "description", "about"],
     "verified": ["verified", "isVerified", "is_verified"],
     "followers": ["followersCount", "followers", "followers_count", "subscriberCount"],
+    "private": ["private", "isPrivate", "is_private"],
 }
 
 

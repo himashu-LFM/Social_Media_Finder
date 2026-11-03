@@ -104,3 +104,45 @@ def test_non_flagged_choice_is_untouched():
                                 status=vp.STATUS_VERIFIED, confidence=95)
     out = vp._route_private_to_manual(result, [cand])
     assert out.status == vp.STATUS_VERIFIED
+
+
+# ── Apify privacy flag (client-supplied input handle, read via Apify) ─────────
+
+def test_apify_meta_maps_isPrivate_to_private():
+    from app.discovery import apify as apify_service
+    assert apify_service._get_meta({"username": "jane", "isPrivate": True}).get("private") is True
+    assert apify_service._get_meta({"username": "nasa", "isPrivate": False}).get("private") is False
+
+
+def _wiki_meta(name="Jane Doe"):
+    from app.identity import wikipedia as wiki
+    return wiki.WikiMetadata(talent=name, name=name)
+
+
+def test_client_supplied_private_input_handle_routed_to_manual(monkeypatch):
+    from app.discovery import apify as apify_service
+    from app.pipeline import options as so
+    monkeypatch.setattr(apify_service, "instagram_configured", lambda: True)
+    monkeypatch.setattr(apify_service, "instagram_profile",
+                        lambda url: {"display_name": "Jane Doe", "private": True})
+    out = vp._validate_input_handle("Instagram", "https://www.instagram.com/janedoe",
+                                    _wiki_meta(), so.DEFAULT, talent="Jane Doe")
+    assert out.status == vp.STATUS_MANUAL
+    assert out.best_candidate == "https://www.instagram.com/janedoe"
+    assert "private" in out.reason.lower()
+
+
+def test_client_supplied_public_input_handle_is_not_forced_to_manual(monkeypatch):
+    # A public account with a name match must NOT be routed to Manual by this guard.
+    from app.discovery import apify as apify_service
+    from app.pipeline import options as so
+    monkeypatch.setattr(apify_service, "instagram_configured", lambda: True)
+    monkeypatch.setattr(apify_service, "instagram_profile",
+                        lambda url: {"display_name": "Jane Doe", "private": False})
+    monkeypatch.setattr(vp.verification_service, "verify_platform",
+                        lambda *a, **k: VerificationResult(
+                            platform="Instagram", best_candidate=a[2][0]["url"],
+                            status=vp.STATUS_VERIFIED, confidence=95))
+    out = vp._validate_input_handle("Instagram", "https://www.instagram.com/janedoe",
+                                    _wiki_meta(), so.DEFAULT, talent="Jane Doe")
+    assert out.status == vp.STATUS_VERIFIED

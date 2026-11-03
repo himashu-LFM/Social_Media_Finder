@@ -295,6 +295,44 @@ def _route_private_to_manual(result: VerificationResult,
     return result
 
 
+def _collapse_youtube_duplicates(candidates: List[dict]) -> List[dict]:
+    """
+    Merge YouTube candidates that resolve to the SAME channel id (UC...).
+
+    Discovery can surface two URL forms of one channel — e.g. Wikidata declares
+    ``/channel/UC...`` while Serper returns ``/@handle`` — and they normalise to
+    different strings, so both enter the candidate set and then compete as if they
+    were two accounts. Once enrichment has read each page's channel id, this
+    collapses them to a single candidate on the canonical ``/channel/UC...`` URL
+    (one standard form), merging their evidence and keeping the first candidate's
+    discovery source (so input/Wikidata priority is preserved).
+
+    Candidates whose channel id could not be resolved (page blocked, non-channel
+    URL) pass through untouched — no behaviour change when resolution fails.
+    """
+    by_id: Dict[str, dict] = {}
+    out: List[dict] = []
+    for cand in candidates:
+        cid = (cand.get("meta") or {}).get("channel_id")
+        if not cid:
+            out.append(cand)
+            continue
+        if cid in by_id:
+            kept = by_id[cid]
+            for k, v in (cand.get("meta") or {}).items():
+                if v not in ("", None):
+                    kept["meta"].setdefault(k, v)
+            print(f"  [YT-DEDUPE] same channel {cid}: dropped duplicate "
+                  f"{cand.get('url','')} (kept {kept['url']})")
+            continue
+        merged = dict(cand)
+        merged["meta"] = dict(cand.get("meta") or {})
+        merged["url"] = social_urls.profile_url_from_handle(cid, "YouTube") or cand.get("url", "")
+        by_id[cid] = merged
+        out.append(merged)
+    return out
+
+
 def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
             candidates: List[dict],
             options: search_options.SearchOptions = search_options.DEFAULT,
@@ -316,6 +354,8 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
             reason=("The only Instagram profile(s) found are private accounts, which "
                     "cannot be tracked — discarded."),
         )
+    if platform == "YouTube":
+        candidates = _collapse_youtube_duplicates(candidates)
     result = verification_service.verify_platform(
         platform, wiki_meta.to_prompt_dict(), candidates,
         is_person=wiki_meta.is_person, thin_gate=options.thin_gate,
@@ -837,6 +877,17 @@ def _validate_input_handle(
             reason=("The supplied profile could not be confirmed (it may not exist) — "
                     "manual review needed."),
         )
+    # Apify reported the client-supplied profile is private. A private account
+    # can't be tracked and its content can't be confirmed, so it goes to Manual
+    # Review rather than being auto-trusted — the consistent counterpart to the
+    # OG-scrape private routing applied to DISCOVERED candidates.
+    if platform == "Instagram" and meta.get("private"):
+        return VerificationResult(
+            platform=platform, best_candidate=url, status=STATUS_MANUAL, confidence=60,
+            decision="manual_review", source="Input file (private account)",
+            reason=("The account is private, so its content can't be confirmed or "
+                    "tracked — manual review needed."),
+        )
     # Surname guard before the LLM, which a shared first name can talk past.
     # Instagram only (a YouTube channel often drops the surname in a show name).
     if platform == "Instagram" and talent and _input_surname_mismatch(meta, url, wiki_meta, talent):
@@ -1225,6 +1276,8 @@ def _gather_serper_candidates(
     if candidates:
         _enrich_candidates(candidates, platform)
         candidates = _filter_private_instagram(candidates, platform)
+        if platform == "YouTube":
+            candidates = _collapse_youtube_duplicates(candidates)
     return candidates, searched, errored
 
 
