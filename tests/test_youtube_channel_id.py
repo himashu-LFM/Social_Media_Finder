@@ -110,3 +110,20 @@ def test_collapse_runs_inside_verify(monkeypatch):
     vp._verify("YouTube", wiki.WikiMetadata(talent="X", name="X"), cands, so.DEFAULT)
     # The LLM saw ONE canonical candidate, not the two competing forms.
     assert seen["urls"] == ["https://www.youtube.com/channel/" + CID]
+
+
+def test_input_youtube_handle_is_normalized_to_channel_id(monkeypatch):
+    from app.identity import wikipedia as wiki
+    from app.pipeline import options as so
+    # Reading the supplied @handle resolves its channel id.
+    monkeypatch.setattr(vp.profile_metadata, "fetch_profile_metadata",
+                        lambda url, platform: {"display_name": "Dyl & Friends", "channel_id": CID})
+    monkeypatch.setattr(vp.verification_service, "verify_platform",
+                        lambda platform, gt, cands, **k: vp.VerificationResult(
+                            platform=platform, best_candidate=cands[0]["url"],
+                            status=vp.STATUS_VERIFIED, confidence=95))
+    out = vp._validate_input_handle("YouTube", "https://www.youtube.com/@dylandfriends",
+                                    wiki.WikiMetadata(talent="Dyl & Friends", name="Dyl & Friends"),
+                                    so.DEFAULT, talent="Dyl & Friends")
+    assert out.status == vp.STATUS_VERIFIED
+    assert out.best_candidate == "https://www.youtube.com/channel/" + CID

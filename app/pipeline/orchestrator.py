@@ -363,6 +363,9 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
     result = _guard_ambiguous_identity(
         result, candidates, wiki_meta.name or wiki_meta.talent, platform
     )
+    result = _guard_subentity(
+        result, candidates, wiki_meta.name or wiki_meta.talent, platform
+    )
     result = _route_private_to_manual(result, candidates)
     # Label where the chosen link came from, for the "<Platform> Source" column.
     _label_verify_source(result, candidates)
@@ -460,6 +463,167 @@ def _guard_ambiguous_identity(
         evidence=result.evidence,
         rejected=result.rejected,
         decision=result.decision,
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Sub-entity (campus / branch) guard — gap #4
+# ────────────────────────────────────────────────────────────────────────────
+# A college/university row often names a specific campus or branch, written as a
+# qualifier the parent's name lacks: "Rutgers University (Camden)", "University
+# of California, Santa Barbara", "University at Buffalo", or — flagged by a system
+# suffix — "Binghamton University - SUNY". Our acceptance paths key on name-token
+# overlap, so the parent's big account (or the system's, or a sibling campus's)
+# can slip through for the campus. This guard runs on a VERIFIED result and, when
+# the subject is such a sub-entity, requires the chosen account to actually carry
+# the campus signal — re-pointing to a candidate that does, or routing to Manual
+# Review rather than silently stamping the parent/system as the campus.
+#
+# Scope is deliberately the educational sub-entity: the guard engages only when
+# the name contains an institution word, so a person ("King, Jr.") never looks
+# like a campus, and a flagship campus that genuinely shares the parent-named
+# account is sent to Manual (a human confirms) rather than wrongly auto-accepted.
+# Concatenated sub-brands with no separator ("NYU Tisch") are out of scope for v1
+# — they need a parent->children lexicon.
+
+# Known university-system acronyms. A trailing "- SUNY" marks the entity as a
+# sub-unit of a system (so the system's own account must not be taken for it); an
+# unknown trailing tag like "- DAR" is just dataset noise and creates no qualifier.
+_UNIVERSITY_SYSTEMS = frozenset({"suny", "cuny", "csu", "cu"})
+
+# A name is treated as an educational institution — the only kind the sub-entity
+# guard engages for — when it contains one of these words.
+_INSTITUTION_WORDS = frozenset({
+    "university", "college", "institute", "school", "academy",
+    "polytechnic", "seminary", "conservatory",
+})
+
+# Generic tokens dropped when reducing a campus name to its distinctive part.
+_ORG_GENERIC_TOKENS = frozenset({"university", "college", "of", "the", "at", "and"})
+
+
+def _sig_tokens(text: str) -> set:
+    """Lower-cased alphanumeric tokens of length > 1."""
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 1}
+
+
+def _subentity_identity(talent: str) -> "tuple[set, str]":
+    """
+    ``(qualifier_tokens, full_acronym)`` when ``talent`` names an educational
+    campus/branch, else ``(set(), "")``.
+
+    ``qualifier_tokens`` are the distinctive campus tokens a candidate must
+    evidence (``{camden}``, ``{santa, barbara}``, ``{stony, brook}``).
+    ``full_acronym`` is the initialism of the whole campus name (``"ucla"``,
+    ``"sbu"``) that a campus's acronym handle may match instead of the tokens.
+
+    Qualifier source, in priority order: parentheses ``(Camden)``, a comma
+    ``, Santa Barbara``, the word ``at`` (``University at Buffalo``), or — only
+    when a known system suffix (``- SUNY``) marks the entity as a sub-unit — the
+    base name's own distinctive tokens (``Binghamton University`` -> ``{binghamton}``).
+    An unknown trailing tag (``- DAR``) is dropped and yields no qualifier.
+    """
+    name = (talent or "").strip()
+    if not (set(re.findall(r"[a-z0-9]+", name.lower())) & _INSTITUTION_WORDS):
+        return set(), ""
+
+    paren = re.search(r"\(([^)]+)\)", name)
+    qualifier = _sig_tokens(paren.group(1)) if paren else set()
+    base = re.sub(r"\([^)]*\)", " ", name)
+
+    suffix_is_system = False
+    tail_m = re.search(r"[-–—]\s*([A-Za-z0-9&.]+)\s*$", base)
+    if tail_m:
+        tail = re.sub(r"[^a-z0-9]", "", tail_m.group(1).lower())
+        suffix_is_system = tail in _UNIVERSITY_SYSTEMS
+        base = base[:tail_m.start()]
+
+    if not qualifier and "," in base:
+        qualifier = _sig_tokens(base.split(",", 1)[1])
+    if not qualifier:
+        at_m = re.search(r"\bat\b", base.lower())
+        if at_m:
+            qualifier = {t for t in _sig_tokens(base[at_m.end():])
+                         if t not in _ORG_GENERIC_TOKENS}
+    if not qualifier and suffix_is_system:
+        qualifier = {t for t in _sig_tokens(base) if t not in _ORG_GENERIC_TOKENS}
+
+    if not qualifier:
+        return set(), ""
+
+    # Full acronym: initials of the whole campus name, with the parenthetical
+    # CONTENT kept but the trailing system/tag suffix removed, so
+    # "University of California, Santa Barbara - DAR" -> "ucsb" and
+    # "Rutgers University (Camden)" -> "ruc".
+    clean = re.sub(r"[()]", " ", name)
+    clean = re.sub(r"[-–—]\s*[A-Za-z0-9&.]+\s*$", " ", clean)
+    acro_tokens = [t for t in re.findall(r"[a-z0-9]+", clean.lower())
+                   if t not in {"of", "the", "at", "and"}]
+    acronym = "".join(t[0] for t in acro_tokens if t)
+    return qualifier, acronym
+
+
+def _guard_subentity(
+    result: VerificationResult, candidates: List[dict], talent: str, platform: str,
+) -> VerificationResult:
+    """
+    Keep an educational sub-entity from resolving to its parent/system/sibling.
+
+    No-op unless the result is VERIFIED and ``talent`` names a campus/branch. When
+    it does, the chosen account must carry the campus signal (a qualifier token in
+    its handle or displayed name, or a handle equal to the campus acronym). If it
+    doesn't, prefer a candidate that does (explicit match before acronym,
+    independently-found before client-supplied); failing that, downgrade to Manual
+    Review rather than stamp the parent/system as the campus.
+    """
+    if result.status != STATUS_VERIFIED or not result.best_candidate:
+        return result
+    qualifier, acronym = _subentity_identity(talent)
+    if not qualifier:
+        return result
+
+    def _evidence(cand: dict) -> str:
+        handle = re.sub(r"[^a-z0-9]", "", _handle_from_url(cand.get("url", "")).lower())
+        meta = cand.get("meta") or {}
+        shown = _name_tokens(" ".join(str(meta.get(k, "")) for k in
+                             ("display_name", "serper_title", "title", "knowledge_graph")))
+        if (qualifier & shown) or any(q in handle for q in qualifier):
+            return "explicit"
+        if acronym and len(acronym) >= 3 and handle == acronym:
+            return "acronym"
+        return ""
+
+    chosen = next((c for c in candidates if c.get("url") == result.best_candidate), None)
+    if chosen is not None and _evidence(chosen):
+        return result
+
+    qdesc = " ".join(sorted(qualifier))
+
+    def _rank(cand: dict) -> tuple:
+        order = {"explicit": 0, "acronym": 1}
+        indep = 0 if cand.get("source") not in ("input", "handle_fanout") else 1
+        return (order.get(_evidence(cand), 9), indep)
+
+    better = sorted((c for c in candidates if _evidence(c)), key=_rank)
+    if better:
+        pick = better[0]
+        print(f"  [SUB-ENTITY] {platform} | {talent}: chosen account missed campus "
+              f"'{qdesc}' -> re-pointed to {pick.get('url')}")
+        return replace(
+            result, best_candidate=pick["url"], status=STATUS_VERIFIED,
+            decision="verified",
+            reason=(f"Resolved to the specific campus/branch ('{qdesc}'), not the parent "
+                    f"or system account. " + (result.reason or "")).strip(),
+        )
+
+    print(f"  [SUB-ENTITY] {platform} | {talent}: chosen account presents as the parent/"
+          f"system, not the '{qdesc}' campus -> manual review")
+    return replace(
+        result, status=STATUS_MANUAL, confidence=min(result.confidence, 70),
+        decision="manual_review",
+        reason=(f"Subject is the '{qdesc}' campus/branch, but the chosen account presents "
+                f"as the parent or system — confirm it is the specific campus, not the "
+                f"parent. " + (result.reason or "")).strip(),
     )
 
 
@@ -877,10 +1041,15 @@ def _validate_input_handle(
             reason=("The supplied profile could not be confirmed (it may not exist) — "
                     "manual review needed."),
         )
-    # Apify reported the client-supplied profile is private. A private account
-    # can't be tracked and its content can't be confirmed, so it goes to Manual
-    # Review rather than being auto-trusted — the consistent counterpart to the
-    # OG-scrape private routing applied to DISCOVERED candidates.
+    # Normalise a validated YouTube input handle to its canonical channel-ID URL
+    # (…/channel/UC...), the one standard form, so a client-supplied or bio-sourced
+    # handle matches what discovery produces and the same channel never appears in
+    # two spellings. Only when the id was actually resolved from the page.
+    if platform == "YouTube" and meta.get("channel_id"):
+        canonical = social_urls.profile_url_from_handle(meta["channel_id"], "YouTube")
+        if canonical:
+            url = canonical
+    # Ignore a private Instagram account: we can't read its name/bio, so we can't
     if platform == "Instagram" and meta.get("private"):
         return VerificationResult(
             platform=platform, best_candidate=url, status=STATUS_MANUAL, confidence=60,
@@ -1507,11 +1676,11 @@ def _row_serper_corroborate_phase(
                 platform=platform, status=STATUS_STOPPED, reason=CANCELLED_REASON)
         else:
             cands, searched, errored = g
-            results[platform] = _route_private_to_manual(
-                _decide_no_wiki_platform(
-                    talent, platform, cands, searched, errored,
-                    known_profiles, anchor_slugs, mutual_handles),
-                cands)
+            decided = _decide_no_wiki_platform(
+                talent, platform, cands, searched, errored,
+                known_profiles, anchor_slugs, mutual_handles)
+            decided = _guard_subentity(decided, cands, talent, platform)
+            results[platform] = _route_private_to_manual(decided, cands)
         if platform_progress:
             platform_progress(platform, "done")
     return results
@@ -1784,6 +1953,41 @@ def _assemble_row_out(results: Dict[str, VerificationResult],
     return out
 
 
+# Format/show/group words in a title that mark it as a show, group or brand
+# rather than a single person — so person-only checks (the surname guard) don't
+# misfire on it when the client gave no explicit category. Strong markers only:
+# an ambiguous word must not flip a real person to "organization".
+_ORG_NAME_MARKERS = frozenset({
+    "podcast", "show", "radio", "fm", "tv", "network", "channel", "media",
+    "music", "band", "records", "label", "productions", "studios", "orchestra",
+    "ensemble", "collective", "news", "magazine", "inc", "ltd", "llc",
+    "corporation", "company", "fc", "united",
+})
+
+
+def _thin_is_person(talent: str, input_metadata: Optional[dict]) -> "tuple[bool, str]":
+    """
+    Best-effort (is_person, entity_type) for a row with no Wikipedia record.
+
+    The client's explicit category wins when present. When it is missing — common
+    in the brand-definition export — fall back to the NAME: a title that reads as a
+    show, group or brand (contains '&', or a format word such as 'Podcast' /
+    'Radio') is treated as a non-person, so the person-only surname guard skips it
+    instead of inventing a surname like 'Podcast'. Conservative: an unmarked name
+    stays a person, so a genuine wrong-handle on a person is still caught.
+    """
+    meta = dict(input_metadata or {})
+    is_person, entity_type = wikipedia_service._infer_entity_type(meta)
+    category = wikipedia_service._meta_get(meta, "title_category", "category", "brand_type")
+    if category:                       # explicit taxonomy is authoritative
+        return is_person, entity_type
+    name = (talent or "").lower()
+    tokens = set(re.findall(r"[a-z0-9]+", name))
+    if "&" in name or (tokens & _ORG_NAME_MARKERS):
+        return False, "organization (inferred from name)"
+    return is_person, entity_type
+
+
 def _thin_ground_truth(
     talent: str, input_metadata: Optional[dict] = None,
     input_handles: Optional[Dict[str, str]] = None,
@@ -1793,8 +1997,9 @@ def _thin_ground_truth(
     Used to validate bio-sourced profiles against the subject's name and the
     category the client supplied, when there is no richer Wikipedia record.
     """
+    is_person, entity_type = _thin_is_person(talent, input_metadata)
     return wikipedia_service.WikiMetadata(
-        talent=talent, name=talent,
+        talent=talent, name=talent, is_person=is_person, entity_type=entity_type,
         input_metadata=dict(input_metadata or {}),
         client_recorded_profiles=dict(input_handles or {}),
     )

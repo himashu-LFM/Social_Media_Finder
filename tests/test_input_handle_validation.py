@@ -230,3 +230,40 @@ def test_instagram_surname_in_bio_is_not_flagged(monkeypatch):
     out = vp._validate_input_handle(
         "Instagram", "https://www.instagram.com/thejaneshow", gt, so.DEFAULT, "Jane Doe")
     assert out.status == vs.STATUS_VERIFIED      # bio contains "Doe" -> not flagged
+
+
+# ── #3: entity-aware thin ground truth for no-Wikipedia rows ──────────────────
+
+def test_thin_is_person_detects_show_or_group_names():
+    assert vp._thin_is_person("Dyl & Friends Podcast", None)[0] is False
+    assert vp._thin_is_person("ABC Radio National", None)[0] is False
+    assert vp._thin_is_person("The Daily Show", None)[0] is False
+
+
+def test_thin_is_person_keeps_plain_person_names():
+    assert vp._thin_is_person("Emily Vernem", None)[0] is True
+    assert vp._thin_is_person("Billy Garvey", None)[0] is True
+
+
+def test_explicit_person_category_overrides_name_markers():
+    # The client's taxonomy wins: a person stays a person despite a format word.
+    assert vp._thin_is_person("Jane Radio", {"title_category": "Talent"})[0] is True
+
+
+def test_surname_guard_skips_inferred_org_name():
+    # "Dyl & Friends Podcast" reads as a show -> the guard must not invent a
+    # 'Podcast' surname and flag the host's handle on that basis.
+    gt = vp._thin_ground_truth("Dyl & Friends Podcast")
+    assert gt.is_person is False
+    assert vp._input_surname_mismatch(
+        {"display_name": "Dylan Buckley", "username": "dylbuckley"},
+        "https://instagram.com/dylbuckley", gt, "Dyl & Friends Podcast") is False
+
+
+def test_surname_guard_still_fires_on_person_with_wrong_handle():
+    # "Emily Vernem" given a different account (dylandfriends) -> still flagged.
+    gt = vp._thin_ground_truth("Emily Vernem")
+    assert gt.is_person is True
+    assert vp._input_surname_mismatch(
+        {"display_name": "Dyl & Friends", "username": "dylandfriends"},
+        "https://instagram.com/dylandfriends", gt, "Emily Vernem") is True
