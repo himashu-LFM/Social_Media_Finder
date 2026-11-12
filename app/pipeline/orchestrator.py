@@ -307,46 +307,62 @@ def _route_private_to_manual(result: VerificationResult,
     return result
 
 
+# Display preference for a YouTube URL: a readable @handle beats a legacy
+# /user//c name, which beats a bare /channel/UC... id. De-dupe keys on the channel
+# id but OUTPUTS the most human-friendly form, so the result matches handle-style
+# references and reads cleanly (a /channel/UC... is only used when nothing else exists).
+def _yt_display_rank(url: str) -> int:
+    s = (url or "").lower()
+    if "youtube.com/@" in s:
+        return 0
+    if "/user/" in s or "/c/" in s:
+        return 1
+    if "/channel/" in s:
+        return 2
+    return 3
+
+
 def _collapse_youtube_duplicates(candidates: List[dict]) -> List[dict]:
     """
-    Merge YouTube candidates with the SAME channel id (UC...) into one canonical
-    ``/channel/UC...`` candidate, so two URL forms of one channel (``/@handle`` and
-    ``/channel/UC...``) don't compete as separate accounts. Evidence is merged and
-    the first candidate's source kept; candidates with no resolved id pass through.
+    Merge YouTube candidates with the SAME channel id (UC...) so two URL forms of one
+    channel (``/@handle`` and ``/channel/UC...``) don't compete as separate accounts.
+    The kept candidate keeps the first one's discovery source and the union of their
+    evidence, but its URL is the most human-friendly form among them (``/@handle``
+    preferred; a ``/channel/UC...`` only when no handle form was found). Candidates
+    with no resolved channel id pass through unchanged.
     """
-    def _is_handle_url(u: str) -> bool:
-        # A @handle or /user/ or /c/ URL carries a name; /channel/UC... does not.
-        return bool(u) and "/channel/" not in u.lower()
-
-    by_id: Dict[str, dict] = {}
-    out: List[dict] = []
+    order: List[tuple] = []          # ("solo", cand) | ("group", cid)
+    groups: Dict[str, List[dict]] = {}
     for cand in candidates:
         cid = (cand.get("meta") or {}).get("channel_id")
         if not cid:
-            out.append(cand)
+            order.append(("solo", cand))
             continue
-        if cid in by_id:
-            kept = by_id[cid]
+        if cid not in groups:
+            groups[cid] = []
+            order.append(("group", cid))
+        groups[cid].append(cand)
+
+    out: List[dict] = []
+    for kind, ref in order:
+        if kind == "solo":
+            out.append(ref)
+            continue
+        grp = groups[ref]
+        base = dict(grp[0])                       # first candidate: keep its source/priority
+        base["meta"] = dict(grp[0].get("meta") or {})
+        for cand in grp[1:]:
             for k, v in (cand.get("meta") or {}).items():
                 if v not in ("", None):
-                    kept["meta"].setdefault(k, v)
-            # Preserve a handle-bearing URL for downstream checks (e.g. the campus
-            # guard reads the qualifier from the @handle, which /channel/UC... lacks).
-            cand_url = cand.get("url", "")
-            if _is_handle_url(cand_url):
-                kept["meta"].setdefault("collapsed_from_url", cand_url)
-            print(f"  [YT-DEDUPE] same channel {cid}: dropped duplicate "
-                  f"{cand.get('url','')} (kept {kept['url']})")
-            continue
-        merged = dict(cand)
-        merged["meta"] = dict(cand.get("meta") or {})
-        original_url = cand.get("url", "")
-        canonical = social_urls.profile_url_from_handle(cid, "YouTube") or original_url
-        if canonical != original_url and _is_handle_url(original_url):
-            merged["meta"].setdefault("collapsed_from_url", original_url)
-        merged["url"] = canonical
-        by_id[cid] = merged
-        out.append(merged)
+                    base["meta"].setdefault(k, v)
+        urls = [c.get("url", "") for c in grp if c.get("url")]
+        best = min(urls, key=_yt_display_rank) if urls else ""
+        if _yt_display_rank(best) >= 2:           # only a bare /channel/ form available
+            best = social_urls.profile_url_from_handle(ref, "YouTube") or best
+        base["url"] = best
+        if len(grp) > 1:
+            print(f"  [YT-DEDUPE] channel {ref}: {len(grp)} forms -> {best}")
+        out.append(base)
     return out
 
 
@@ -1039,14 +1055,10 @@ def _validate_input_handle(
             reason=("The supplied profile could not be confirmed (it may not exist) — "
                     "manual review needed."),
         )
-    # Normalise a validated YouTube input handle to its canonical channel-ID URL
-    # (…/channel/UC...), the one standard form, so a client-supplied or bio-sourced
-    # handle matches what discovery produces and the same channel never appears in
-    # two spellings. Only when the id was actually resolved from the page.
-    if platform == "YouTube" and meta.get("channel_id"):
-        canonical = social_urls.profile_url_from_handle(meta["channel_id"], "YouTube")
-        if canonical:
-            url = canonical
+    # A validated YouTube input handle is kept in its given @handle / user form (more
+    # readable, and it matches handle-style references); de-duplication against
+    # discovery happens by channel id in _collapse_youtube_duplicates, so we no longer
+    # rewrite it to the /channel/UC... form here.
     # Ignore a private Instagram account: we can't read its name/bio, so we can't
     if platform == "Instagram" and meta.get("private"):
         return VerificationResult(

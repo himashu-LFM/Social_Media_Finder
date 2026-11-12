@@ -142,6 +142,11 @@ _PRIVATE_FALSE_RE = re.compile(r'"is_private"\s*:\s*false|"isPrivate"\s*:\s*fals
 # lets two URL forms of one channel be recognised as the same.
 _YT_CHANNEL_ID_JSON_RE = re.compile(r'"(?:channelId|externalId)"\s*:\s*"(UC[\w-]{22})"')
 _YT_CHANNEL_ID_PATH_RE = re.compile(r'/channel/(UC[\w-]{22})')
+# The canonical <link> / og:url tag names the page's OWN channel — unlike the inline
+# JSON, which also lists recommended channels (its first match is often not the owner).
+_YT_OWN_ID_TAG_RE = re.compile(
+    r'''<(?:link|meta)\b[^>]*\b(?:rel=["']canonical["']|property=["']og:url["'])[^>]*>''',
+    re.I)
 
 
 def _page_is_private(html: str) -> bool:
@@ -156,9 +161,18 @@ def _page_is_private(html: str) -> bool:
 
 
 def _youtube_channel_id_from_html(html: str) -> str:
-    """Extract a YouTube channel id (UC...) from page HTML, or '' if none found."""
+    """The page's OWN channel id (UC...), or '' if none found.
+
+    Reads the canonical <link>/og:url first — those name the page's own channel —
+    before the inline JSON, whose first match is often a RECOMMENDED channel, not the
+    owner (that mis-pick was rewriting correct channels to wrong ones).
+    """
     if not html:
         return ""
+    for tag in _YT_OWN_ID_TAG_RE.findall(html):
+        m = _YT_CHANNEL_ID_PATH_RE.search(tag)
+        if m:
+            return m.group(1)
     m = _YT_CHANNEL_ID_JSON_RE.search(html) or _YT_CHANNEL_ID_PATH_RE.search(html)
     return m.group(1) if m else ""
 
@@ -277,7 +291,10 @@ def fetch_profile_metadata(url: str, platform: str) -> Dict[str, Any]:
     # collapse different URL forms of the same channel into one. Free — the HTML is
     # already fetched. Absent for non-YouTube pages or when the page carries no id.
     if platform == "YouTube":
-        cid = _youtube_channel_id_from_html(html)
+        # The URL's own /channel/UC... id is authoritative; parse HTML only for a
+        # /@handle or /user/ form that doesn't already carry the id.
+        m = _YT_CHANNEL_ID_PATH_RE.search(url)
+        cid = m.group(1) if m else _youtube_channel_id_from_html(html)
         if cid:
             meta["channel_id"] = cid
 
