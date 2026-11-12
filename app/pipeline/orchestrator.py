@@ -146,16 +146,35 @@ def _is_cancelled(should_cancel: Optional[Callable[[], bool]]) -> bool:
 
 def _add_candidate(candidates: List[dict], seen: set, platform: str, url: str,
                    source: str, meta: Optional[dict] = None) -> None:
-    """Append a validated, de-duplicated candidate to the working list."""
+    """Append a validated, de-duplicated candidate to the working list.
+
+    On a duplicate URL we do NOT silently drop the newcomer: we MERGE any evidence
+    it carries into the candidate already stored, filling only keys the stored one
+    lacks (never overwriting, never changing its URL or source). This matters for
+    gap #1 — the client-supplied handle is added first, with no fetched content;
+    when the SAME URL is also the independent Serper hit, dropping the Serper copy
+    left the content-less ``input`` candidate to face the verifier's evidence
+    floor, which wrongly routed a search-corroborated handle to Manual Review.
+    """
     if not url or social_urls.platform_from_url(url) != platform:
         return
     if not social_urls.is_valid_profile_url(url, platform):
         return
     norm = social_urls.normalize_profile_url(url, platform)
+    new_meta = dict(meta or {})
     if norm in seen:
+        if new_meta:
+            existing = next((c for c in candidates if c["url"] == norm), None)
+            if existing is not None:
+                dst = existing.setdefault("meta", {})
+                for key, value in new_meta.items():
+                    if value in ("", None, [], {}):
+                        continue
+                    if dst.get(key) in ("", None, [], {}):
+                        dst[key] = value
         return
     seen.add(norm)
-    candidates.append({"url": norm, "source": source, "meta": dict(meta or {})})
+    candidates.append({"url": norm, "source": source, "meta": new_meta})
 
 
 def _serper_primary_candidate(
@@ -706,8 +725,12 @@ def _tag_backlinks(candidates: List[dict], input_handles: Dict[str, str],
     real Instagram, which is exactly the "about them, not them" trap that caused
     the earlier false positives, so the LLM and every authenticity guard still
     run. What changes is that the candidate now clears the evidence gate.
+
+    Runs in every mode (gap #1): a page that links back to the client's own
+    profile is independent evidence in any run. ``options`` is kept for signature
+    stability.
     """
-    if not options.is_custom or not input_handles:
+    if not input_handles:
         return
     for cand in candidates:
         published = (cand.get("meta") or {}).get("profile_links") or {}
@@ -1817,9 +1840,12 @@ def _tag_cross_platform_match(cand: dict, platform: str,
     the CLIENT supplied. This compares against handles this run verified on its
     own, so the corroboration is only as strong as those verdicts — which is why
     it is evidence for the adjudicator rather than a verdict of its own.
+
+    Runs in every mode (gap #1): a Verified handle on another platform is
+    independent evidence regardless of how the run was configured, and without it
+    a correct FB/X/TikTok handle with no fetchable content is downgraded to Manual
+    by the verifier's evidence floor. ``options`` is kept for signature stability.
     """
-    if not options.is_custom:
-        return
     handle = _handle_from_url(cand.get("url", ""))
     if not handle or len(handle) < _MIN_ANCHOR_HANDLE_LEN:
         return
