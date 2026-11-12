@@ -164,6 +164,29 @@ def test_plain_org_result_is_left_untouched():
     assert out.best_candidate == "https://x.com/UofPenn"
 
 
+def test_short_qualifier_substring_in_handle_is_not_evidence():
+    # 'park' (from 'College Park') must NOT match a coincidental substring like
+    # 'sparkle'; with no real campus signal the parent-style account is downgraded.
+    result = _verified("https://www.instagram.com/marylandsparkle", platform="Instagram")
+    cands = [_cand("https://www.instagram.com/marylandsparkle", "Maryland Sparkle")]
+    out = _guard_subentity(result, cands, "University of Maryland, College Park", "Instagram")
+    assert out.status == STATUS_MANUAL
+
+
+def test_collapsed_youtube_handle_still_satisfies_campus_guard():
+    # After YouTube de-dupe rewrites the URL to /channel/UC..., the campus qualifier
+    # must still be found via the preserved ``collapsed_from_url`` handle.
+    channel = "https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv"
+    result = _verified(channel)
+    cands = [{
+        "url": channel, "source": "serper",
+        "meta": {"collapsed_from_url": "https://www.youtube.com/@RutgersUniversityCamden"},
+    }]
+    out = _guard_subentity(result, cands, "Rutgers University (Camden)", "YouTube")
+    assert out.status == STATUS_VERIFIED
+    assert out.best_candidate == channel
+
+
 def test_non_verified_result_is_left_untouched():
     # The guard only acts on a Verified result; a Manual one is already surfaced.
     result = VerificationResult(

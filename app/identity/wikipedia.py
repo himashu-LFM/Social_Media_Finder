@@ -156,13 +156,9 @@ class WikiMetadata:
         if self.input_metadata:
             # Identity details supplied directly in the spreadsheet.
             data["provided_metadata"] = self.input_metadata
-        # Tell the LLM whether this is a person or an organization/brand.
-        #
-        # When the only source is a generic client category ("Talent"), that says
-        # the subject is a performer — not that they are one human being. Plenty
-        # are bands or duos. Asserting "person" from it made the model reject real
-        # band profiles as contradicting the ground truth, so where nothing more
-        # specific is known we say exactly that instead of guessing.
+        # Tell the LLM person vs organization. A generic category ("Talent") means
+        # performer, not necessarily one human (could be a band/duo), so when nothing
+        # more specific is known we say "person or group (unspecified)" rather than guess.
         data["entity_type"] = self.entity_type or (
             "person or group (unspecified)" if self.is_person else "organization")
         # Drop empty top-level fields to keep the payload tight.
@@ -598,13 +594,12 @@ def fetch_wiki_metadata(
             if not platform.startswith("_"):
                 meta.social_links[platform] = url
 
-        # Step 2 — scrape the official website's footer/header for first-party
-        # social links, for any platform Wikidata did not already declare. This
-        # is the authoritative fallback the pipeline was missing: for a brand
-        # like FC Dallas it recovers the real Facebook/Instagram/X/YouTube from
-        # its own site. Wikidata (higher confidence) is never overwritten.
+        # Step 2 — scrape the official website for first-party social links Wikidata
+        # didn't declare (e.g. FC Dallas). Wikidata (higher confidence) is never overwritten.
         _TARGET_PLATFORMS = ("Instagram", "Facebook", "YouTube", "TikTok", "X")
-        if meta.official_website:
+        # Crawl only when some target platform is undeclared — a fully-declared row
+        # would gain only a rarely-needed fallback for one HTTP request per row.
+        if meta.official_website and any(p not in meta.social_links for p in _TARGET_PLATFORMS):
             try:
                 site_socials = wd.crawl_official_website(meta.official_website, talent)
             except Exception:  # noqa: BLE001 — a failed scrape must never abort the row
@@ -618,9 +613,8 @@ def fetch_wiki_metadata(
                 if platform not in meta.social_links:
                     meta.social_links[platform] = url                 # fill undeclared
                 elif url != meta.social_links[platform]:
-                    # Website lists a different handle than Wikidata — keep it as a
-                    # fallback (e.g. Wikidata 'upitt' vs the site's real 'h2pitt') so
-                    # it can replace the Wikidata one if that turns out dead.
+                    # Website lists a different handle — keep as a fallback in case the
+                    # Wikidata one is dead (e.g. 'upitt' vs the site's 'h2pitt').
                     meta.website_social_links.setdefault(platform, url)
 
         # Reference identity sources beyond Wikipedia (IMDb, Spotify, TMDb).

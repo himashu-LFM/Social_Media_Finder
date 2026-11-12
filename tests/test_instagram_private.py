@@ -35,6 +35,20 @@ def test_blocked_fetch_is_not_private():
     assert pm._page_is_private("") is False
 
 
+def test_public_profile_with_a_private_suggested_account_is_not_flagged():
+    # Instagram embeds OTHER accounts (suggested/related) in its page JSON. A public
+    # subject whose page also carries a PRIVATE suggested account must NOT be flagged
+    # private — the page has both is_private:true (the other account) and
+    # is_private:false (the subject), which is ambiguous, so we defer.
+    public_with_private_suggestion = (
+        '<html><head><meta property="og:title" content="NASA (@nasa)"></head><body>'
+        '<script>{"user":{"username":"nasa","is_private":false},'
+        '"suggested":[{"username":"someone","is_private":true}]}</script>'
+        '</body></html>'
+    )
+    assert pm._page_is_private(public_with_private_suggestion) is False
+
+
 # ── Discard filter ───────────────────────────────────────────────────────────
 
 def _cand(url="https://www.instagram.com/x", source="serper", **meta):

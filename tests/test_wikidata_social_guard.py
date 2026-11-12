@@ -25,16 +25,27 @@ def _entity(**props):
 # ── Fix A ────────────────────────────────────────────────────────────────────
 
 def test_domain_value_is_flagged_not_a_handle():
-    assert wd._social_value_is_not_a_handle("uga.edu") is True          # bare domain
-    assert wd._social_value_is_not_a_handle("https://facebook.com/x") is True
-    assert wd._social_value_is_not_a_handle("pages/Name/123") is True   # a path
+    # Bare-domain detection is platform-aware: a dotted TLD is a mis-filed domain on
+    # a platform whose handles can't end in one (Facebook/X/YouTube).
+    assert wd._social_value_is_not_a_handle("uga.edu", platform="Facebook") is True
+    assert wd._social_value_is_not_a_handle("https://facebook.com/x") is True   # a URL (any platform)
+    assert wd._social_value_is_not_a_handle("pages/Name/123") is True           # a path (any platform)
     assert wd._social_value_is_not_a_handle("uga.edu", website_host="uga.edu") is True
 
 
 def test_real_handles_are_not_flagged():
-    assert wd._social_value_is_not_a_handle("universityofga") is False
-    assert wd._social_value_is_not_a_handle("john.smith") is False      # dotted handle
-    assert wd._social_value_is_not_a_handle("@HowardU") is False
+    assert wd._social_value_is_not_a_handle("universityofga", platform="Facebook") is False
+    assert wd._social_value_is_not_a_handle("john.smith", platform="Instagram") is False  # dotted handle
+    assert wd._social_value_is_not_a_handle("@HowardU", platform="Facebook") is False
+
+
+def test_dotted_tld_username_kept_on_instagram_and_tiktok():
+    # Instagram/TikTok allow periods in real usernames, so a dotted-TLD value there
+    # is a legitimate handle and must not be dropped — but the same value on Facebook
+    # is still a mis-filed domain.
+    assert wd._social_value_is_not_a_handle("studio.tv", platform="Instagram") is False
+    assert wd._social_value_is_not_a_handle("studio.tv", platform="TikTok") is False
+    assert wd._social_value_is_not_a_handle("studio.tv", platform="Facebook") is True
 
 
 def test_website_in_facebook_field_is_dropped_others_kept():

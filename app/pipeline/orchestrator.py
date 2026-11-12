@@ -148,13 +148,9 @@ def _add_candidate(candidates: List[dict], seen: set, platform: str, url: str,
                    source: str, meta: Optional[dict] = None) -> None:
     """Append a validated, de-duplicated candidate to the working list.
 
-    On a duplicate URL we do NOT silently drop the newcomer: we MERGE any evidence
-    it carries into the candidate already stored, filling only keys the stored one
-    lacks (never overwriting, never changing its URL or source). This matters for
-    gap #1 — the client-supplied handle is added first, with no fetched content;
-    when the SAME URL is also the independent Serper hit, dropping the Serper copy
-    left the content-less ``input`` candidate to face the verifier's evidence
-    floor, which wrongly routed a search-corroborated handle to Manual Review.
+    On a duplicate URL, merge the newcomer's evidence into the stored candidate
+    (fill-only, never overwrite) so a client handle that Serper also found keeps
+    that evidence instead of facing the evidence floor empty (gap #1).
     """
     if not url or social_urls.platform_from_url(url) != platform:
         return
@@ -272,12 +268,9 @@ _PRIVATE_REVIEW_FLAG = "_private_needs_review"
 
 def _filter_private_instagram(candidates: List[dict], platform: str) -> List[dict]:
     """
-    Instagram only. A private account can't be scraped or tracked, and a DISCOVERED
-    one is usually a personal/namesake page, not the official profile — so discard
-    it outright. Keep (but flag for Manual Review) a private account that is either
-    verified — a blue-check private account is almost certainly the real person — or
-    client-supplied, which we never silently drop. Needs enrichment to have run;
-    a blocked fetch leaves no ``private`` flag, so the account is kept (conservative).
+    Instagram only. Discard a DISCOVERED private account (usually a namesake); keep
+    but flag for Manual Review a private account that is verified or client-supplied.
+    A blocked fetch leaves no ``private`` flag, so the account is kept (conservative).
     """
     if platform != "Instagram":
         return candidates
@@ -316,19 +309,15 @@ def _route_private_to_manual(result: VerificationResult,
 
 def _collapse_youtube_duplicates(candidates: List[dict]) -> List[dict]:
     """
-    Merge YouTube candidates that resolve to the SAME channel id (UC...).
-
-    Discovery can surface two URL forms of one channel — e.g. Wikidata declares
-    ``/channel/UC...`` while Serper returns ``/@handle`` — and they normalise to
-    different strings, so both enter the candidate set and then compete as if they
-    were two accounts. Once enrichment has read each page's channel id, this
-    collapses them to a single candidate on the canonical ``/channel/UC...`` URL
-    (one standard form), merging their evidence and keeping the first candidate's
-    discovery source (so input/Wikidata priority is preserved).
-
-    Candidates whose channel id could not be resolved (page blocked, non-channel
-    URL) pass through untouched — no behaviour change when resolution fails.
+    Merge YouTube candidates with the SAME channel id (UC...) into one canonical
+    ``/channel/UC...`` candidate, so two URL forms of one channel (``/@handle`` and
+    ``/channel/UC...``) don't compete as separate accounts. Evidence is merged and
+    the first candidate's source kept; candidates with no resolved id pass through.
     """
+    def _is_handle_url(u: str) -> bool:
+        # A @handle or /user/ or /c/ URL carries a name; /channel/UC... does not.
+        return bool(u) and "/channel/" not in u.lower()
+
     by_id: Dict[str, dict] = {}
     out: List[dict] = []
     for cand in candidates:
@@ -341,12 +330,21 @@ def _collapse_youtube_duplicates(candidates: List[dict]) -> List[dict]:
             for k, v in (cand.get("meta") or {}).items():
                 if v not in ("", None):
                     kept["meta"].setdefault(k, v)
+            # Preserve a handle-bearing URL for downstream checks (e.g. the campus
+            # guard reads the qualifier from the @handle, which /channel/UC... lacks).
+            cand_url = cand.get("url", "")
+            if _is_handle_url(cand_url):
+                kept["meta"].setdefault("collapsed_from_url", cand_url)
             print(f"  [YT-DEDUPE] same channel {cid}: dropped duplicate "
                   f"{cand.get('url','')} (kept {kept['url']})")
             continue
         merged = dict(cand)
         merged["meta"] = dict(cand.get("meta") or {})
-        merged["url"] = social_urls.profile_url_from_handle(cid, "YouTube") or cand.get("url", "")
+        original_url = cand.get("url", "")
+        canonical = social_urls.profile_url_from_handle(cid, "YouTube") or original_url
+        if canonical != original_url and _is_handle_url(original_url):
+            merged["meta"].setdefault("collapsed_from_url", original_url)
+        merged["url"] = canonical
         by_id[cid] = merged
         out.append(merged)
     return out
@@ -485,33 +483,16 @@ def _guard_ambiguous_identity(
     )
 
 
-# ────────────────────────────────────────────────────────────────────────────
-#  Sub-entity (campus / branch) guard — gap #4
-# ────────────────────────────────────────────────────────────────────────────
-# A college/university row often names a specific campus or branch, written as a
-# qualifier the parent's name lacks: "Rutgers University (Camden)", "University
-# of California, Santa Barbara", "University at Buffalo", or — flagged by a system
-# suffix — "Binghamton University - SUNY". Our acceptance paths key on name-token
-# overlap, so the parent's big account (or the system's, or a sibling campus's)
-# can slip through for the campus. This guard runs on a VERIFIED result and, when
-# the subject is such a sub-entity, requires the chosen account to actually carry
-# the campus signal — re-pointing to a candidate that does, or routing to Manual
-# Review rather than silently stamping the parent/system as the campus.
-#
-# Scope is deliberately the educational sub-entity: the guard engages only when
-# the name contains an institution word, so a person ("King, Jr.") never looks
-# like a campus, and a flagship campus that genuinely shares the parent-named
-# account is sent to Manual (a human confirms) rather than wrongly auto-accepted.
-# Concatenated sub-brands with no separator ("NYU Tisch") are out of scope for v1
-# — they need a parent->children lexicon.
+# ── Sub-entity (campus / branch) guard — gap #4 ──────────────────────────────
+# Stops a campus ("Rutgers University (Camden)", "... - SUNY") from resolving to
+# its parent/system account: on a VERIFIED result it re-points to the account that
+# carries the campus signal, else routes to Manual. Educational, separator-style
+# names only; concatenated sub-brands ("NYU Tisch") are out of scope for v1.
 
-# Known university-system acronyms. A trailing "- SUNY" marks the entity as a
-# sub-unit of a system (so the system's own account must not be taken for it); an
-# unknown trailing tag like "- DAR" is just dataset noise and creates no qualifier.
+# A trailing "- SUNY" marks a sub-unit of a system; an unknown tag like "- DAR" does not.
 _UNIVERSITY_SYSTEMS = frozenset({"suny", "cuny", "csu", "cu"})
 
-# A name is treated as an educational institution — the only kind the sub-entity
-# guard engages for — when it contains one of these words.
+# The guard engages only for names containing one of these institution words.
 _INSTITUTION_WORDS = frozenset({
     "university", "college", "institute", "school", "academy",
     "polytechnic", "seminary", "conservatory",
@@ -528,19 +509,11 @@ def _sig_tokens(text: str) -> set:
 
 def _subentity_identity(talent: str) -> "tuple[set, str]":
     """
-    ``(qualifier_tokens, full_acronym)`` when ``talent`` names an educational
-    campus/branch, else ``(set(), "")``.
-
-    ``qualifier_tokens`` are the distinctive campus tokens a candidate must
-    evidence (``{camden}``, ``{santa, barbara}``, ``{stony, brook}``).
-    ``full_acronym`` is the initialism of the whole campus name (``"ucla"``,
-    ``"sbu"``) that a campus's acronym handle may match instead of the tokens.
-
-    Qualifier source, in priority order: parentheses ``(Camden)``, a comma
-    ``, Santa Barbara``, the word ``at`` (``University at Buffalo``), or — only
-    when a known system suffix (``- SUNY``) marks the entity as a sub-unit — the
-    base name's own distinctive tokens (``Binghamton University`` -> ``{binghamton}``).
-    An unknown trailing tag (``- DAR``) is dropped and yields no qualifier.
+    ``(qualifier_tokens, full_acronym)`` for an educational campus/branch, else
+    ``(set(), "")``. Qualifier source by priority: parentheses, comma, the word
+    ``at``, or — with a known system suffix (``- SUNY``) — the base's own tokens;
+    an unknown trailing tag (``- DAR``) is dropped. Acronym is the campus initialism
+    (``ucla``/``sbu``) a handle may match instead of the tokens.
     """
     name = (talent or "").strip()
     if not (set(re.findall(r"[a-z0-9]+", name.lower())) & _INSTITUTION_WORDS):
@@ -570,10 +543,8 @@ def _subentity_identity(talent: str) -> "tuple[set, str]":
     if not qualifier:
         return set(), ""
 
-    # Full acronym: initials of the whole campus name, with the parenthetical
-    # CONTENT kept but the trailing system/tag suffix removed, so
-    # "University of California, Santa Barbara - DAR" -> "ucsb" and
-    # "Rutgers University (Camden)" -> "ruc".
+    # Full acronym: initials of the whole campus name, keeping parenthetical content
+    # but dropping the trailing system/tag suffix ("... Santa Barbara - DAR" -> "ucsb").
     clean = re.sub(r"[()]", " ", name)
     clean = re.sub(r"[-–—]\s*[A-Za-z0-9&.]+\s*$", " ", clean)
     acro_tokens = [t for t in re.findall(r"[a-z0-9]+", clean.lower())
@@ -588,12 +559,9 @@ def _guard_subentity(
     """
     Keep an educational sub-entity from resolving to its parent/system/sibling.
 
-    No-op unless the result is VERIFIED and ``talent`` names a campus/branch. When
-    it does, the chosen account must carry the campus signal (a qualifier token in
-    its handle or displayed name, or a handle equal to the campus acronym). If it
-    doesn't, prefer a candidate that does (explicit match before acronym,
-    independently-found before client-supplied); failing that, downgrade to Manual
-    Review rather than stamp the parent/system as the campus.
+    No-op unless VERIFIED and ``talent`` names a campus. The chosen account must
+    carry the campus signal (qualifier token in handle/display name, or the campus
+    acronym); else prefer a candidate that does, or downgrade to Manual Review.
     """
     if result.status != STATUS_VERIFIED or not result.best_candidate:
         return result
@@ -602,13 +570,21 @@ def _guard_subentity(
         return result
 
     def _evidence(cand: dict) -> str:
-        handle = re.sub(r"[^a-z0-9]", "", _handle_from_url(cand.get("url", "")).lower())
         meta = cand.get("meta") or {}
+        # Check the candidate URL AND any pre-collapse handle URL — YouTube de-dupe
+        # rewrites the URL to /channel/UC..., which drops the @handle the qualifier
+        # lives in (``collapsed_from_url`` preserves it).
+        urls = [cand.get("url", ""), meta.get("collapsed_from_url", "")]
+        handles = {re.sub(r"[^a-z0-9]", "", _handle_from_url(u).lower()) for u in urls if u}
         shown = _name_tokens(" ".join(str(meta.get(k, "")) for k in
                              ("display_name", "serper_title", "title", "knowledge_graph")))
-        if (qualifier & shown) or any(q in handle for q in qualifier):
+        # Substring match on the handle only for distinctive (>= 5-char) tokens, so a
+        # short qualifier ('los', 'park') can't match a coincidental substring
+        # ('sparkle'); short tokens still count as a whole token in the shown name.
+        handle_hit = any(q in h for h in handles for q in qualifier if len(q) >= 5)
+        if (qualifier & shown) or handle_hit:
             return "explicit"
-        if acronym and len(acronym) >= 3 and handle == acronym:
+        if acronym and len(acronym) >= 3 and any(h == acronym for h in handles):
             return "acronym"
         return ""
 
@@ -726,9 +702,8 @@ def _tag_backlinks(candidates: List[dict], input_handles: Dict[str, str],
     the earlier false positives, so the LLM and every authenticity guard still
     run. What changes is that the candidate now clears the evidence gate.
 
-    Runs in every mode (gap #1): a page that links back to the client's own
-    profile is independent evidence in any run. ``options`` is kept for signature
-    stability.
+    Runs in every mode (gap #1): a back-link to the client's own profile is
+    independent evidence. ``options`` kept for signature stability.
     """
     if not input_handles:
         return
@@ -1183,13 +1158,9 @@ def _row_bio_link_phase(
     }
     adopted: Dict[str, VerificationResult] = {}
 
-    # The client's Instagram and YouTube handles are the declared source of truth,
-    # but we no longer trust them blindly: each is confirmed to actually belong to
-    # the talent (read the profile's own name, let the LLM compare it to the name +
-    # category) before being adopted as Verified. A different-named profile (e.g.
-    # "Stephanie Miller" -> stephclairesmith) is flagged Manual Review instead.
-    # Facebook / X / TikTok input handles are NOT adopted here; they fall through to
-    # the Serper phases and are re-verified like any discovered link.
+    # Client IG/YouTube handles are the declared source of truth but not trusted
+    # blindly: each is confirmed to belong to the talent before adoption (a mismatch
+    # -> Manual). FB/X/TikTok input handles are re-verified in the Serper phases.
     for platform, url in input_handles.items():
         if platform in _TRUSTED_INPUT_PLATFORMS and url and url not in rejected:
             adopted[platform] = _validate_input_handle(platform, url, gt, options, talent)
@@ -1243,13 +1214,9 @@ def _row_bio_link_phase(
         print(f"  [BIO-LINKS] '{talent}': {len(adopted)} platform(s) resolved "
               f"-> {', '.join(sorted(adopted))}")
 
-    # Instagram is the column clients fill in, yet an anonymous read of it returns
-    # almost nothing. So when a platform is still missing and the file gave an
-    # Instagram handle, read that profile with the cookie-backed Apify actor. It
-    # is the only reliable Instagram reader — but it is PAID, so it runs last
-    # (after the free YouTube/Instagram reads above) and only for the gaps they
-    # left. Its links are sourced from the client's own bio, so they go through the
-    # same name/category validation as the free bio links before being trusted.
+    # An anonymous IG read returns almost nothing, so when a platform is still
+    # missing read the IG bio with the paid cookie-backed Apify actor (runs last,
+    # only for the gaps); its links are validated like the free bio links.
     ig_url = anchor_handles.get("Instagram", "")
     missing = [p for p in PLATFORMS if p not in adopted]
     if ig_url and missing and apify_service.instagram_configured():
@@ -1841,10 +1808,8 @@ def _tag_cross_platform_match(cand: dict, platform: str,
     own, so the corroboration is only as strong as those verdicts — which is why
     it is evidence for the adjudicator rather than a verdict of its own.
 
-    Runs in every mode (gap #1): a Verified handle on another platform is
-    independent evidence regardless of how the run was configured, and without it
-    a correct FB/X/TikTok handle with no fetchable content is downgraded to Manual
-    by the verifier's evidence floor. ``options`` is kept for signature stability.
+    Runs in every mode (gap #1): a Verified handle on another platform is independent
+    evidence that clears the evidence floor. ``options`` kept for signature stability.
     """
     handle = _handle_from_url(cand.get("url", ""))
     if not handle or len(handle) < _MIN_ANCHOR_HANDLE_LEN:
@@ -1979,10 +1944,8 @@ def _assemble_row_out(results: Dict[str, VerificationResult],
     return out
 
 
-# Format/show/group words in a title that mark it as a show, group or brand
-# rather than a single person — so person-only checks (the surname guard) don't
-# misfire on it when the client gave no explicit category. Strong markers only:
-# an ambiguous word must not flip a real person to "organization".
+# Words that mark a title as a show/group/brand (not a person), so the person-only
+# surname guard skips it when the client gave no category. Strong markers only.
 _ORG_NAME_MARKERS = frozenset({
     "podcast", "show", "radio", "fm", "tv", "network", "channel", "media",
     "music", "band", "records", "label", "productions", "studios", "orchestra",
@@ -1993,14 +1956,9 @@ _ORG_NAME_MARKERS = frozenset({
 
 def _thin_is_person(talent: str, input_metadata: Optional[dict]) -> "tuple[bool, str]":
     """
-    Best-effort (is_person, entity_type) for a row with no Wikipedia record.
-
-    The client's explicit category wins when present. When it is missing — common
-    in the brand-definition export — fall back to the NAME: a title that reads as a
-    show, group or brand (contains '&', or a format word such as 'Podcast' /
-    'Radio') is treated as a non-person, so the person-only surname guard skips it
-    instead of inventing a surname like 'Podcast'. Conservative: an unmarked name
-    stays a person, so a genuine wrong-handle on a person is still caught.
+    Best-effort (is_person, entity_type) for a row with no Wikipedia record. The
+    client's category wins; absent it, a name reading as a show/group/brand ('&' or
+    a format word) is treated as non-person. An unmarked name stays a person.
     """
     meta = dict(input_metadata or {})
     is_person, entity_type = wikipedia_service._infer_entity_type(meta)

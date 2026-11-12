@@ -120,15 +120,9 @@ def _run_actor(actor_input: dict) -> List[dict]:
     return data if isinstance(data, list) else []
 
 
-# ────────────────────────────────────────────────────────────────────────────
-#  Instagram cookieless reader
-# ────────────────────────────────────────────────────────────────────────────
-#
-# A client-supplied Instagram profile is trusted, but IG serves logged-out
-# scrapers a stripped page so the internal reader recovers almost nothing. A
-# cookie-backed Apify actor reads the bio reliably; we then classify the links
-# it lists and follow any Linktree among them (aggregators.follow) to recover
-# the handles IG so often lists only there.
+# ── Instagram cookieless reader ──────────────────────────────────────────────
+# IG serves logged-out scrapers a stripped page, so a cookie-backed Apify actor
+# reads the bio; we then classify its links and follow any Linktree among them.
 
 def instagram_configured() -> bool:
     """True when the token and a dedicated Instagram actor id are both set."""

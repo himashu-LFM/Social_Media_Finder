@@ -64,7 +64,13 @@ def test_drop_missing_keeps_a_real_facebook_candidate(monkeypatch):
 
 IG_REAL = ('<html><head><title>WashU (&#064;washu) &#x2022; Instagram photos and videos</title>'
            '<meta property="og:title" content="WashU (@washu)"></head></html>')
-IG_DEAD = '<html><head><title>Instagram</title></head><body></body></html>'
+# A genuinely missing username: the generic shell PLUS an explicit not-found marker.
+IG_DEAD = ('<html><head><title>Instagram</title></head><body>'
+           "Sorry, this page isn't available. The link you followed may be broken, "
+           "or the page may have been removed.</body></html>")
+# A bare shell with no marker — what IG ALSO returns for a blocked/rate-limited view
+# of a REAL profile, so it must NOT be treated as dead.
+IG_SHELL = '<html><head><title>Instagram</title></head><body></body></html>'
 
 
 def test_ig_real_profile_is_not_dead(monkeypatch):
@@ -75,6 +81,13 @@ def test_ig_real_profile_is_not_dead(monkeypatch):
 def test_ig_dead_username_is_dead(monkeypatch):
     pm.clear_cache(); monkeypatch.setattr(pm, "_fetch_html", lambda u: IG_DEAD)
     assert pm._instagram_page_is_dead("https://www.instagram.com/runewark") is True
+
+
+def test_ig_generic_shell_is_not_dead(monkeypatch):
+    # No og:title AND no not-found marker: indistinguishable from a blocked fetch of
+    # a real profile, so the probe must keep it rather than drop a correct account.
+    pm.clear_cache(); monkeypatch.setattr(pm, "_fetch_html", lambda u: IG_SHELL)
+    assert pm._instagram_page_is_dead("https://www.instagram.com/realbutblocked") is False
 
 
 def test_ig_blocked_fetch_is_not_dead(monkeypatch):
@@ -89,3 +102,27 @@ def test_drop_missing_drops_a_dead_instagram_candidate(monkeypatch):
                         and pm._instagram_page_is_dead(url))
     cands = [{"url": "https://www.instagram.com/runewark", "source": "wikidata", "meta": {}}]
     assert vp._drop_missing_profiles(cands, "Instagram") == []
+
+
+# ── _fetch_html caches within a run (no double-fetch of FB/IG pages) ──────────
+
+def test_fetch_html_is_cached_within_a_run(monkeypatch):
+    """The liveness probe and enrichment both call _fetch_html for the same FB/IG
+    page; it must download once per URL per run, not once per caller."""
+    pm.clear_cache()
+    calls = {"n": 0}
+
+    class _Resp:
+        ok = True
+        content = b"x"
+        text = '<html><meta property="og:title" content="X"></html>'
+
+    def _fake_get(method, url, **kw):
+        calls["n"] += 1
+        return _Resp()
+
+    monkeypatch.setattr(pm, "request_with_retry", _fake_get)
+    first = pm._fetch_html("https://www.facebook.com/somepage")
+    second = pm._fetch_html("https://www.facebook.com/somepage")
+    assert first == second
+    assert calls["n"] == 1   # second call served from cache

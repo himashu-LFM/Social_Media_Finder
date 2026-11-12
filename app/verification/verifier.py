@@ -97,12 +97,8 @@ _THIN_EVIDENCE_MIN_CONFIDENCE = max(
     0, min(100, int(os.environ.get("THIN_EVIDENCE_MIN_CONFIDENCE", "85"))))
 
 
-#: Entity types that describe a performer rather than a company. The loosened
-#: gate below is for ORGANISATIONS, where a brand name plus an industry really
-#: does disambiguate. A person — or a band, which carries exactly the same
-#: namesake risk as a person — must not slip through it. Reading the honest
-#: "person or group (unspecified)" as a company did precisely that, switching
-#: the gate off for every non-Wikipedia row in the file.
+#: Performer (not company) entity types. The loosened gate is for ORGANISATIONS; a
+#: person — or a band, same namesake risk — must not slip through it.
 _PERSONISH_ENTITY_TYPES = frozenset({
     "", "person", "human", "person or group (unspecified)",
     "band", "musical group", "duo", "group", "talent",
@@ -149,17 +145,10 @@ def _candidate_has_evidence(cand: Dict[str, Any]) -> bool:
     return any(meta.get(k) not in ("", None, [], {}) for k in _EVIDENCE_META_KEYS)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-#  Authenticity guards
-#
-#  A profile can describe the right person accurately and still not BE that
-#  person. Fan pages quote real credits; tribute accounts state real facts.
-#  Everything below separates "this content is ABOUT them" from "this account
-#  IS them" — the distinction the LLM alone was not reliably making.
-#
-#  All guards are one-directional: they can only downgrade Verified to Manual
-#  Review, never promote. A false trigger costs coverage, never precision.
-# ────────────────────────────────────────────────────────────────────────────
+# ── Authenticity guards ──────────────────────────────────────────────────────
+# A profile can accurately describe the right person without BEING them (fan/tribute
+# pages). These separate "about them" from "is them"; all are one-directional —
+# they downgrade Verified to Manual only, never promote.
 
 # Phrases where an account DECLARES ITSELF to be about someone rather than
 # authored by them. Deliberately narrow: plain third person is not enough,
@@ -248,14 +237,9 @@ _NON_OFFICIAL_HANDLE_TOKENS = (
     "fansite", "fanspot", "tribute", "parody", "notaffiliated",
 )
 
-# Evidence that is genuinely about the account holder rather than a search blurb.
-#
-# ``anchor_handle_match`` is set by the pipeline when a candidate's handle is an
-# exact match for a DISTINCTIVE handle the client already confirmed on another
-# platform. Artists register the same handle everywhere, so "mettya_bizin on
-# Facebook" given a client-confirmed "mettya_bizin on Instagram" is a real,
-# first-party-ish signal — not the bare URL match the prompt warns about, which
-# is a handle matching a *declared* (possibly stale) handle from metadata.
+# Evidence genuinely about the account holder, not a search blurb.
+# ``anchor_handle_match`` = the candidate reuses a distinctive handle the client
+# confirmed on another platform (artists reuse handles) — a first-party-ish signal.
 _STRONG_EVIDENCE_KEYS = ("bio", "knowledge_graph", "verified", "followers",
                          "subscribers", "anchor_handle_match",
                          "backlink_to_client_profile")

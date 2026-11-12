@@ -63,19 +63,20 @@ _COUNT_RE = r"([\d][\d.,]*\s*[KMB]?)"
 _EXISTENCE_CHECK_PLATFORMS = frozenset({"YouTube", "X"})
 
 _MISSING_CACHE: Dict[str, bool] = {}
+# Cache fetched HTML per run so the liveness probe (``profile_is_missing``) and
+# enrichment (``fetch_profile_metadata``) don't each download the same FB/IG page.
+_HTML_CACHE: Dict[str, str] = {}
 
 
 def clear_cache() -> None:
     _CACHE.clear()
     _MISSING_CACHE.clear()
+    _HTML_CACHE.clear()
 
 
 def _facebook_page_is_dead(url: str) -> bool:
-    """
-    Facebook 200s for every url, so a 404 probe is useless. A REAL page carries an
-    og:title (its name); a missing vanity returns the generic "Facebook" shell with
-    none. Conservative: any OG tag -> exists; a blocked/empty fetch -> kept.
-    """
+    """Facebook 200s for everything, so a 404 probe is useless: a real page has an
+    og:title, a dead vanity returns the generic shell. Blocked/empty fetch -> kept."""
     html = _fetch_html(url)
     if not html:
         return False
@@ -85,28 +86,32 @@ def _facebook_page_is_dead(url: str) -> bool:
     return "<title>facebook</title>" in low
 
 
+# IG's generic shell appears for BOTH a missing username and a blocked view of a REAL
+# profile, so only an explicit not-found marker (not a missing og:title) proves absence.
+_IG_NOT_FOUND_RE = re.compile(
+    r"this page isn[’']?t available|the link you followed may be broken|"
+    r"page not found",
+    re.I,
+)
+
+
 def _instagram_page_is_dead(url: str) -> bool:
-    """
-    Same signal as Facebook: a real profile has an og:title, a missing username
-    returns the generic "Instagram" shell with none. Conservative — any OG tag ->
-    exists; a blocked/empty fetch -> kept (IG blocks more, so it keeps more often).
-    """
+    """Dead only when the body carries an explicit not-found marker: an og:title means
+    alive, and a bare shell/blocked fetch is kept (it's also what a real profile returns)."""
     html = _fetch_html(url)
     if not html:
         return False
     low = html.lower()
     if 'property="og:title"' in low or 'property="og:description"' in low:
         return False
-    return "<title>instagram</title>" in low
+    return bool(_IG_NOT_FOUND_RE.search(html))
 
 
 def profile_is_missing(url: str, platform: str) -> bool:
     """
-    True ONLY when the platform definitively reports the profile does not exist.
-    Conservative — any inconclusive/failed response returns False, so it can only
-    drop a candidate we are certain about. YouTube/X use a 404 probe; Facebook and
-    Instagram 200 for everything, so they use an og:title liveness check (which
-    catches a Verified-but-dead vanity like ``facebook.com/uga.edu``).
+    True ONLY when the platform definitively reports the profile does not exist
+    (conservative: any inconclusive response -> False). YouTube/X use a 404 probe;
+    Facebook/Instagram use an og:title liveness check (they 200 for everything).
     """
     if not url:
         return False
@@ -129,19 +134,25 @@ def profile_is_missing(url: str, platform: str) -> bool:
     return missing
 
 
-_PRIVATE_RE = re.compile(r'"is_private"\s*:\s*true|"isPrivate"\s*:\s*true', re.I)
+_PRIVATE_TRUE_RE = re.compile(r'"is_private"\s*:\s*true|"isPrivate"\s*:\s*true', re.I)
+_PRIVATE_FALSE_RE = re.compile(r'"is_private"\s*:\s*false|"isPrivate"\s*:\s*false', re.I)
 
-# A YouTube channel page embeds its stable channel id (UC + 22 chars) in several
-# places — the inline JSON ("channelId"/"externalId") and the canonical
-# /channel/UC... link. The id is rename-proof, so it is what lets two URL forms
-# of the same channel (…/@handle and …/channel/UC...) be recognised as one.
+# A YouTube channel's stable id (UC + 22 chars) lives in the inline JSON
+# ("channelId"/"externalId") and the /channel/UC... link; it is rename-proof, so it
+# lets two URL forms of one channel be recognised as the same.
 _YT_CHANNEL_ID_JSON_RE = re.compile(r'"(?:channelId|externalId)"\s*:\s*"(UC[\w-]{22})"')
 _YT_CHANNEL_ID_PATH_RE = re.compile(r'/channel/(UC[\w-]{22})')
 
 
 def _page_is_private(html: str) -> bool:
-    """True only when the page JSON explicitly declares the account private."""
-    return bool(html) and bool(_PRIVATE_RE.search(html))
+    """
+    True only when the page unambiguously declares the account private: a private
+    flag AND no public flag. IG can embed other accounts, so a page with both flags
+    is ambiguous and deferred (Apify's per-account field still catches those).
+    """
+    if not html:
+        return False
+    return bool(_PRIVATE_TRUE_RE.search(html)) and not bool(_PRIVATE_FALSE_RE.search(html))
 
 
 def _youtube_channel_id_from_html(html: str) -> str:
@@ -153,7 +164,10 @@ def _youtube_channel_id_from_html(html: str) -> str:
 
 
 def _fetch_html(url: str) -> str:
-    """Fetch page HTML, trying each UA until OpenGraph tags appear."""
+    """Fetch page HTML, trying each UA until OpenGraph tags appear. Cached per run so a
+    page that is both liveness-probed and enriched is downloaded once, not twice."""
+    if url in _HTML_CACHE:
+        return _HTML_CACHE[url]
     last = ""
     for ua in _USER_AGENTS:
         try:
@@ -170,9 +184,11 @@ def _fetch_html(url: str) -> str:
             last = html
             lowered = html.lower()
             if "og:title" in lowered or "og:description" in lowered:
+                _HTML_CACHE[url] = html
                 return html
         except Exception as exc:  # noqa: BLE001 — enrichment must never raise
             print(f"  [PROFILE] fetch failed {url[:70]}… : {exc.__class__.__name__}")
+    _HTML_CACHE[url] = last
     return last
 
 

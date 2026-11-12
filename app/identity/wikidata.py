@@ -356,22 +356,27 @@ def _host_of(url: str) -> str:
     return m.group(1).rstrip("/") if m else ""
 
 
-def _social_value_is_not_a_handle(value: str, website_host: str = "") -> bool:
+# Platforms whose usernames never end in a web TLD, so a dotted-TLD value there is a
+# mis-filed domain. IG/TikTok allow dots in usernames, so the heuristic skips them.
+_DOTLESS_HANDLE_PLATFORMS = frozenset({"Facebook", "X", "YouTube"})
+
+
+def _social_value_is_not_a_handle(value: str, website_host: str = "",
+                                  platform: str = "") -> bool:
     """
-    True when a Wikidata social-ID value is a URL, path, or bare domain mis-filed
-    into a social field (e.g. UGA's Facebook-ID P2013 = 'uga.edu', the website),
-    which would otherwise become a dead 'facebook.com/uga.edu'. A real handle is a
-    bare username, so a dotted handle like 'john.smith' (no web TLD) is not flagged.
+    True when a value is a URL, path, or bare domain mis-filed into a social field
+    (e.g. a Facebook-ID of 'uga.edu'). The bare-domain check applies only to
+    dotless-handle platforms, so a valid dotted IG/TikTok username is not dropped.
     """
     v = (value or "").strip().lower().lstrip("@")
     if not v:
         return True
     if "/" in v or ":" in v or " " in v:
         return True                       # a URL or a path, not a bare handle
-    if _WEB_TLD_RE.search(v):
-        return True                       # a bare domain ('uga.edu')
     if website_host and v == website_host:
         return True                       # literally the entity's own website host
+    if platform in _DOTLESS_HANDLE_PLATFORMS and _WEB_TLD_RE.search(v):
+        return True                       # a bare domain ('uga.edu') on a dotless platform
     return False
 
 
@@ -408,7 +413,7 @@ def _extract_wikidata_socials(entity: dict) -> Dict[str, Tuple[str, str, str]]:
             value = snak["datavalue"]["value"]
             if isinstance(value, str) and value.strip():
                 handle = value.strip().lstrip("@")
-                if _social_value_is_not_a_handle(handle, website_host):
+                if _social_value_is_not_a_handle(handle, website_host, platform):
                     print(f"  [WIKI] {platform} {prop}={value!r} is not a handle "
                           f"(URL/domain mis-filed) — ignored.")
                     continue
@@ -423,7 +428,7 @@ def _extract_wikidata_socials(entity: dict) -> Dict[str, Tuple[str, str, str]]:
             snak = claims[WIKIDATA_YT_HANDLE_PROP][0]["mainsnak"]
             if snak.get("snaktype") == "value":
                 handle = snak["datavalue"]["value"].strip().lstrip("@")
-                if handle and not _social_value_is_not_a_handle(handle, website_host):
+                if handle and not _social_value_is_not_a_handle(handle, website_host, "YouTube"):
                     results["YouTube"] = (
                         f"https://www.youtube.com/@{handle}",
                         handle,
