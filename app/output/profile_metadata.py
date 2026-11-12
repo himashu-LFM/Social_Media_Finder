@@ -58,41 +58,75 @@ _HANDLE_IN_TEXT = re.compile(r"\(@([A-Za-z0-9_.]+)\)")
 _COUNT_RE = r"([\d][\d.,]*\s*[KMB]?)"
 
 
-# Platforms where a plain GET reliably separates a real profile from a missing
-# one. Calibrated against known-good and known-bad handles:
-#   YouTube / X                  -> 404 when missing, 200 when real  (reliable)
-#   Instagram / Facebook / TikTok -> 200 for everything, even nonsense (useless)
-# Only the reliable two are probed; the rest would produce false "exists".
+# Status-code (404) existence platforms. Facebook/Instagram 200 for everything, so
+# they get their own og:title checks in ``profile_is_missing``; TikTok has no signal.
 _EXISTENCE_CHECK_PLATFORMS = frozenset({"YouTube", "X"})
 
 _MISSING_CACHE: Dict[str, bool] = {}
+# Cache fetched HTML per run so the liveness probe (``profile_is_missing``) and
+# enrichment (``fetch_profile_metadata``) don't each download the same FB/IG page.
+_HTML_CACHE: Dict[str, str] = {}
 
 
 def clear_cache() -> None:
     _CACHE.clear()
     _MISSING_CACHE.clear()
+    _HTML_CACHE.clear()
+
+
+def _facebook_page_is_dead(url: str) -> bool:
+    """Facebook 200s for everything, so a 404 probe is useless: a real page has an
+    og:title, a dead vanity returns the generic shell. Blocked/empty fetch -> kept."""
+    html = _fetch_html(url)
+    if not html:
+        return False
+    low = html.lower()
+    if 'property="og:title"' in low or 'property="og:description"' in low:
+        return False
+    return "<title>facebook</title>" in low
+
+
+# IG's generic shell appears for BOTH a missing username and a blocked view of a REAL
+# profile, so only an explicit not-found marker (not a missing og:title) proves absence.
+_IG_NOT_FOUND_RE = re.compile(
+    r"this page isn[’']?t available|the link you followed may be broken|"
+    r"page not found",
+    re.I,
+)
+
+
+def _instagram_page_is_dead(url: str) -> bool:
+    """Dead only when the body carries an explicit not-found marker: an og:title means
+    alive, and a bare shell/blocked fetch is kept (it's also what a real profile returns)."""
+    html = _fetch_html(url)
+    if not html:
+        return False
+    low = html.lower()
+    if 'property="og:title"' in low or 'property="og:description"' in low:
+        return False
+    return bool(_IG_NOT_FOUND_RE.search(html))
 
 
 def profile_is_missing(url: str, platform: str) -> bool:
     """
-    True ONLY when the platform definitively reports the profile does not exist.
-
-    Deliberately conservative: an unreliable platform, a network error, a
-    timeout, or any non-404 response all return False ("not proven missing"),
-    so this can only ever drop a candidate we are certain about. It exists
-    because Serper context for a URL is NOT proof the URL resolves — searching
-    "youtube.com/@someone" happily returns pages about that person even when the
-    channel was never created, which previously produced Verified 404s.
+    True ONLY when the platform definitively reports the profile does not exist
+    (conservative: any inconclusive response -> False). YouTube/X use a 404 probe;
+    Facebook/Instagram use an og:title liveness check (they 200 for everything).
     """
-    if platform not in _EXISTENCE_CHECK_PLATFORMS or not url:
+    if not url:
         return False
     if url in _MISSING_CACHE:
         return _MISSING_CACHE[url]
     missing = False
     try:
-        resp = requests.get(url, headers={**_BASE_HEADERS, "User-Agent": _USER_AGENTS[0]},
-                            timeout=_TIMEOUT, allow_redirects=True)
-        missing = resp.status_code == 404
+        if platform == "Facebook":
+            missing = _facebook_page_is_dead(url)
+        elif platform == "Instagram":
+            missing = _instagram_page_is_dead(url)
+        elif platform in _EXISTENCE_CHECK_PLATFORMS:
+            resp = requests.get(url, headers={**_BASE_HEADERS, "User-Agent": _USER_AGENTS[0]},
+                                timeout=_TIMEOUT, allow_redirects=True)
+            missing = resp.status_code == 404
     except Exception as exc:  # noqa: BLE001 — never let a probe fail a candidate
         print(f"  [EXISTS] probe failed {url[:60]}… : {exc.__class__.__name__}")
         missing = False
@@ -100,8 +134,54 @@ def profile_is_missing(url: str, platform: str) -> bool:
     return missing
 
 
+_PRIVATE_TRUE_RE = re.compile(r'"is_private"\s*:\s*true|"isPrivate"\s*:\s*true', re.I)
+_PRIVATE_FALSE_RE = re.compile(r'"is_private"\s*:\s*false|"isPrivate"\s*:\s*false', re.I)
+
+# A YouTube channel's stable id (UC + 22 chars) lives in the inline JSON
+# ("channelId"/"externalId") and the /channel/UC... link; it is rename-proof, so it
+# lets two URL forms of one channel be recognised as the same.
+_YT_CHANNEL_ID_JSON_RE = re.compile(r'"(?:channelId|externalId)"\s*:\s*"(UC[\w-]{22})"')
+_YT_CHANNEL_ID_PATH_RE = re.compile(r'/channel/(UC[\w-]{22})')
+# The canonical <link> / og:url tag names the page's OWN channel — unlike the inline
+# JSON, which also lists recommended channels (its first match is often not the owner).
+_YT_OWN_ID_TAG_RE = re.compile(
+    r'''<(?:link|meta)\b[^>]*\b(?:rel=["']canonical["']|property=["']og:url["'])[^>]*>''',
+    re.I)
+
+
+def _page_is_private(html: str) -> bool:
+    """
+    True only when the page unambiguously declares the account private: a private
+    flag AND no public flag. IG can embed other accounts, so a page with both flags
+    is ambiguous and deferred (Apify's per-account field still catches those).
+    """
+    if not html:
+        return False
+    return bool(_PRIVATE_TRUE_RE.search(html)) and not bool(_PRIVATE_FALSE_RE.search(html))
+
+
+def _youtube_channel_id_from_html(html: str) -> str:
+    """The page's OWN channel id (UC...), or '' if none found.
+
+    Reads the canonical <link>/og:url first — those name the page's own channel —
+    before the inline JSON, whose first match is often a RECOMMENDED channel, not the
+    owner (that mis-pick was rewriting correct channels to wrong ones).
+    """
+    if not html:
+        return ""
+    for tag in _YT_OWN_ID_TAG_RE.findall(html):
+        m = _YT_CHANNEL_ID_PATH_RE.search(tag)
+        if m:
+            return m.group(1)
+    m = _YT_CHANNEL_ID_JSON_RE.search(html) or _YT_CHANNEL_ID_PATH_RE.search(html)
+    return m.group(1) if m else ""
+
+
 def _fetch_html(url: str) -> str:
-    """Fetch page HTML, trying each UA until OpenGraph tags appear."""
+    """Fetch page HTML, trying each UA until OpenGraph tags appear. Cached per run so a
+    page that is both liveness-probed and enriched is downloaded once, not twice."""
+    if url in _HTML_CACHE:
+        return _HTML_CACHE[url]
     last = ""
     for ua in _USER_AGENTS:
         try:
@@ -118,9 +198,11 @@ def _fetch_html(url: str) -> str:
             last = html
             lowered = html.lower()
             if "og:title" in lowered or "og:description" in lowered:
+                _HTML_CACHE[url] = html
                 return html
         except Exception as exc:  # noqa: BLE001 — enrichment must never raise
             print(f"  [PROFILE] fetch failed {url[:70]}… : {exc.__class__.__name__}")
+    _HTML_CACHE[url] = last
     return last
 
 
@@ -199,6 +281,22 @@ def fetch_profile_metadata(url: str, platform: str) -> Dict[str, Any]:
     if re.search(r'"is_verified"\s*:\s*true|"isVerified"\s*:\s*true|"verified"\s*:\s*true',
                  html, re.I):
         meta["verified"] = True
+
+    # Private flag (Instagram): set only on an explicit "is_private":true embedded
+    # in the page JSON — an absent flag stays unknown.
+    if _page_is_private(html):
+        meta["private"] = True
+
+    # YouTube channel id (UC...): the rename-proof identity of the channel, used to
+    # collapse different URL forms of the same channel into one. Free — the HTML is
+    # already fetched. Absent for non-YouTube pages or when the page carries no id.
+    if platform == "YouTube":
+        # The URL's own /channel/UC... id is authoritative; parse HTML only for a
+        # /@handle or /user/ form that doesn't already carry the id.
+        m = _YT_CHANNEL_ID_PATH_RE.search(url)
+        cid = m.group(1) if m else _youtube_channel_id_from_html(html)
+        if cid:
+            meta["channel_id"] = cid
 
     # Every social profile this page links to. Free: the HTML is already here,
     # and it is what lets the pipeline check whether a discovered candidate links

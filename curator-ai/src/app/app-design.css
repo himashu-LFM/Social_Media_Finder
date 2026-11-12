@@ -338,6 +338,14 @@
   min-width: 0;
   flex: 1 1 280px;
   max-width: 360px;
+  /* Follow the scroll so the Review cell stays pinned top-right instead of
+     scrolling away with the table. Docks just below the 56px sticky header;
+     if the panel is taller than the viewport it scrolls inside itself. */
+  position: sticky;
+  top: 72px;
+  align-self: flex-start;
+  max-height: calc(100dvh - 88px);
+  overflow-y: auto;
 }
 
 .sc-card {
@@ -1257,7 +1265,7 @@
   .sc-header { padding: 0 14px; }
   .sc-stages,
   .sc-subbar { padding: 8px 14px; }
-  .sc-aside { max-width: none; }
+  .sc-aside { max-width: none; position: static; max-height: none; overflow-y: visible; }
 }
 
 @media (prefers-reduced-motion: reduce) {

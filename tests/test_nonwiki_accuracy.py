@@ -149,10 +149,13 @@ def test_url_form_differences_still_match():
     assert cands[0]["meta"].get("backlink_to_client_profile")
 
 
-def test_wikipedia_mode_does_not_backlink():
+def test_backlink_evidence_now_applies_in_wikipedia_mode_too():
+    # Gap #1: a page that links back to the client's own profile is independent
+    # evidence in any mode, so the default (Wikipedia) flow now gets it too —
+    # this is what rescues correct FB/X/TikTok cells from the evidence floor.
     cands = _yt({"Instagram": CLIENT["Instagram"]})
     vp._tag_backlinks(cands, CLIENT, so.DEFAULT)
-    assert "backlink_to_client_profile" not in cands[0]["meta"]
+    assert cands[0]["meta"]["backlink_to_client_profile"] == CLIENT["Instagram"]
 
 
 def _confirmed_yt(links, backlink=True):
