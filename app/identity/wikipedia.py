@@ -30,6 +30,12 @@ from typing import Any, Dict, List, Optional
 
 from app.identity import wikidata as wd
 
+
+def _norm_social(u: str) -> str:
+    """Scheme/host/case-insensitive key for deciding if two profile URLs are the same
+    account. Handles on all five platforms are case-insensitive, so lowercasing is safe."""
+    return re.sub(r"^https?://(www\.)?", "", (u or "").strip().lower()).rstrip("/")
+
 # Reuse the shared HTTP session + timeout from wikidata_lookup so we keep a
 # single set of headers / connection pool across the Wikipedia services.
 _SESSION = wd._SESSION
@@ -612,9 +618,11 @@ def fetch_wiki_metadata(
                     continue
                 if platform not in meta.social_links:
                     meta.social_links[platform] = url                 # fill undeclared
-                elif url != meta.social_links[platform]:
-                    # Website lists a different handle — keep as a fallback in case the
-                    # Wikidata one is dead (e.g. 'upitt' vs the site's 'h2pitt').
+                elif _norm_social(url) != _norm_social(meta.social_links[platform]):
+                    # Website lists a genuinely different handle — keep as a fallback in
+                    # case the Wikidata one is dead (e.g. 'upitt' vs the site's 'h2pitt').
+                    # Compared case/scheme-insensitively so 'UPitt' vs 'upitt' (the same
+                    # account) doesn't spawn a rival candidate and force Manual Review.
                     meta.website_social_links.setdefault(platform, url)
 
         # Reference identity sources beyond Wikipedia (IMDb, Spotify, TMDb).

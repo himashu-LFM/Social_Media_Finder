@@ -368,13 +368,19 @@ def _social_value_is_not_a_handle(value: str, website_host: str = "",
     (e.g. a Facebook-ID of 'uga.edu'). The bare-domain check applies only to
     dotless-handle platforms, so a valid dotted IG/TikTok username is not dropped.
     """
-    v = (value or "").strip().lower().lstrip("@")
+    raw = (value or "").strip()
+    v = raw.lower().lstrip("@")
     if not v:
         return True
     if "/" in v or ":" in v or " " in v:
         return True                       # a URL or a path, not a bare handle
     if website_host and v == website_host:
         return True                       # literally the entity's own website host
+    # A YouTube value that arrived @-prefixed is a handle by construction — YouTube
+    # @handles may contain dots (e.g. '@news.tv'), so the bare-domain heuristic (which
+    # exists to reject a mis-filed domain like 'uga.edu') must not drop it.
+    if platform == "YouTube" and raw.startswith("@"):
+        return False
     if platform in _DOTLESS_HANDLE_PLATFORMS and _WEB_TLD_RE.search(v):
         return True                       # a bare domain ('uga.edu') on a dotless platform
     return False

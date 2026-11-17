@@ -48,6 +48,14 @@ def test_dotted_tld_username_kept_on_instagram_and_tiktok():
     assert wd._social_value_is_not_a_handle("studio.tv", platform="Facebook") is True
 
 
+def test_youtube_at_handle_with_tld_is_kept():
+    # YouTube @handles can contain dots (e.g. '@news.tv'). An @-prefixed value is a
+    # handle by construction, so the bare-domain heuristic must not drop it...
+    assert wd._social_value_is_not_a_handle("@news.tv", platform="YouTube") is False
+    # ...but a bare (no-@) dotted-domain value on YouTube is still a mis-filed domain.
+    assert wd._social_value_is_not_a_handle("news.tv", platform="YouTube") is True
+
+
 def test_website_in_facebook_field_is_dropped_others_kept():
     ent = _entity(P2013="uga.edu", P2003="universityofga",
                   P2002="universityofga", P856="https://uga.edu")
@@ -64,6 +72,15 @@ def test_a_real_facebook_handle_still_resolves():
 
 
 # ── Fix C ────────────────────────────────────────────────────────────────────
+
+def test_case_only_difference_is_not_a_rival_handle():
+    # 'UPitt' and 'upitt' are the SAME account — the website fallback compares
+    # case/scheme-insensitively so a case difference can't spawn a rival candidate
+    # (which would trip the ambiguity guard and force needless Manual Review).
+    assert wk._norm_social("https://www.facebook.com/UPitt") == \
+        wk._norm_social("http://facebook.com/upitt/")
+    assert wk._norm_social("https://x.com/UPitt") != wk._norm_social("https://x.com/h2pitt")
+
 
 def test_website_fallback_is_added_as_a_candidate(monkeypatch):
     meta = wk.WikiMetadata(talent="University of Pittsburgh",

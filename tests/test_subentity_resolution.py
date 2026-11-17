@@ -81,6 +81,24 @@ def test_plain_or_parent_org_has_no_qualifier(name):
 
 
 @pytest.mark.parametrize("name", [
+    "Old School (film)",          # 'school' opens the gate, but '(film)' is a disambig tag
+    "The Academy (film)",         # 'academy' opens the gate, '(film)' is a tag
+    "School Spirits (TV series)", # 'school' opens the gate, '(TV series)' is a tag
+])
+def test_disambiguation_parenthetical_is_not_a_campus(name):
+    # A Wikipedia '(film)'/'(TV series)' tag must never read as a campus qualifier —
+    # with the downgrade-only guard that would send a correct film/TV account to Manual.
+    assert _subentity_identity(name) == (set(), "")
+
+
+def test_endash_wikidata_label_alone_yields_no_qualifier():
+    # The guard runs on the CLIENT talent name, which carries the campus in parens/comma
+    # form ("Rutgers University (Camden)"). A bare Wikidata en-dash LABEL is not relied on
+    # as the qualifier source, so it resolves to no campus here — by design.
+    assert _subentity_identity("Rutgers University–Camden") == (set(), "")
+
+
+@pytest.mark.parametrize("name", [
     "Martin Luther King, Jr.",   # comma-suffix on a PERSON — no institution word
     "Beyonce",
     "Coca-Cola",                 # hyphenated brand, not a campus
@@ -177,20 +195,6 @@ def test_short_qualifier_substring_in_handle_is_not_evidence():
     cands = [_cand("https://www.instagram.com/marylandsparkle", "Maryland Sparkle")]
     out = _guard_subentity(result, cands, "University of Maryland, College Park", "Instagram")
     assert out.status == STATUS_MANUAL
-
-
-def test_collapsed_youtube_handle_still_satisfies_campus_guard():
-    # After YouTube de-dupe rewrites the URL to /channel/UC..., the campus qualifier
-    # must still be found via the preserved ``collapsed_from_url`` handle.
-    channel = "https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv"
-    result = _verified(channel)
-    cands = [{
-        "url": channel, "source": "serper",
-        "meta": {"collapsed_from_url": "https://www.youtube.com/@RutgersUniversityCamden"},
-    }]
-    out = _guard_subentity(result, cands, "Rutgers University (Camden)", "YouTube")
-    assert out.status == STATUS_VERIFIED
-    assert out.best_candidate == channel
 
 
 def test_non_verified_result_is_left_untouched():

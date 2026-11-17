@@ -409,6 +409,7 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
 _VERIFY_SOURCE_LABELS = {
     "input": "Input file + LLM",
     "wikidata": "Wikidata + LLM",
+    "official_website": "Official website + LLM",
     "serper": "Serper + LLM",
     "apify": "Apify + LLM",
     "handle_fanout": "Input handle reused + LLM",
@@ -513,6 +514,15 @@ _INSTITUTION_WORDS = frozenset({
     "university", "college", "institute", "school", "academy",
     "polytechnic", "seminary", "conservatory",
 })
+# Wikipedia disambiguation parentheticals describe WHAT a thing is (a film, a band),
+# not a campus/branch — so "Old School (film)" must not read "(film)" as a campus
+# qualifier (the institution word "school" would otherwise open the gate).
+_DISAMBIG_PARENS = frozenset({
+    "film", "movie", "tv", "television", "series", "miniseries", "sitcom",
+    "album", "song", "single", "ep", "mixtape", "soundtrack", "band", "group",
+    "duo", "musician", "singer", "rapper", "dj", "producer", "novel", "book",
+    "comics", "character", "video", "game", "franchise", "company", "brand", "podcast",
+})
 
 # Generic tokens dropped when reducing a campus name to its distinctive part.
 _ORG_GENERIC_TOKENS = frozenset({"university", "college", "of", "the", "at", "and"})
@@ -537,6 +547,9 @@ def _subentity_identity(talent: str) -> "tuple[set, str]":
 
     paren = re.search(r"\(([^)]+)\)", name)
     qualifier = _sig_tokens(paren.group(1)) if paren else set()
+    # A disambiguation tag ('(film)', '(TV series)') is not a campus qualifier.
+    if qualifier and qualifier <= _DISAMBIG_PARENS:
+        qualifier = set()
     base = re.sub(r"\([^)]*\)", " ", name)
 
     suffix_is_system = False
@@ -589,11 +602,8 @@ def _guard_subentity(
 
     def _evidence(cand: dict) -> str:
         meta = cand.get("meta") or {}
-        # Check the candidate URL AND any pre-collapse handle URL — YouTube de-dupe
-        # rewrites the URL to /channel/UC..., which drops the @handle the qualifier
-        # lives in (``collapsed_from_url`` preserves it).
-        urls = [cand.get("url", ""), meta.get("collapsed_from_url", "")]
-        handles = {re.sub(r"[^a-z0-9]", "", _handle_from_url(u).lower()) for u in urls if u}
+        handle = re.sub(r"[^a-z0-9]", "", _handle_from_url(cand.get("url", "")).lower())
+        handles = {handle} if handle else set()
         shown = _name_tokens(" ".join(str(meta.get(k, "")) for k in
                              ("display_name", "serper_title", "title", "knowledge_graph")))
         # Substring match on the handle only for distinctive (>= 5-char) tokens, so a
@@ -890,6 +900,10 @@ def _resolve_platform_serper(
         return VerificationResult(platform=platform, status=STATUS_NOT_FOUND, reason=reason)
 
     _tag_anchor_handle_matches(candidates, fanout_slugs or [], options)
+    # Enrich BEFORE back-link tagging: _tag_backlinks reads meta['profile_links'],
+    # which enrichment populates. (_verify re-enriches, but skips already-enriched
+    # candidates, so this is one fetch, not two.)
+    _enrich_candidates(candidates, platform)
     _tag_backlinks(candidates, input_handles_for_backlink or {}, options)
     return _verify(platform, wiki_meta, candidates, options)
 

@@ -219,3 +219,31 @@ def test_wikipedia_mode_adopts_nothing():
     results = _confirmed_yt({"TikTok": "https://www.tiktok.com/@mettya_bizin"})
     assert vp._adopt_backlink_discoveries(
         "Meccha Bijin", results, CLIENT, {}, so.DEFAULT) == results
+
+
+# ── _thin_is_person: name-based org inference (no Wikipedia, no client category) ──
+# A band/duo/brand with no Wikipedia record and no client category must be treated as
+# a non-person, so the person-only surname guard doesn't wrongly reject it. An explicit
+# client category always wins; a plain unmarked personal name stays a person.
+
+def test_thin_amp_name_is_inferred_organization():
+    is_person, etype = vp._thin_is_person("Simon & Garfunkel", None)
+    assert is_person is False
+    assert "organization" in etype
+
+
+def test_thin_format_word_name_is_inferred_organization():
+    for name in ("The Daily Show", "Lo-Fi Beats Radio", "Arsenal FC"):
+        is_person, _ = vp._thin_is_person(name, None)
+        assert is_person is False, name
+
+
+def test_thin_plain_personal_name_stays_a_person():
+    is_person, _ = vp._thin_is_person("Jacob Collier", None)
+    assert is_person is True
+
+
+def test_thin_explicit_client_category_overrides_name_inference():
+    # Client taxonomy is authoritative: 'Talent' -> person even with '&' in the name.
+    is_person, _ = vp._thin_is_person("Jay & Co", {"title_category": "Talent"})
+    assert is_person is True
