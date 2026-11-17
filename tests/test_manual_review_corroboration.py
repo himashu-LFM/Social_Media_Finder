@@ -70,6 +70,40 @@ def test_backlink_tags_in_default_mode():
     assert vs._candidate_has_evidence(cand) is True
 
 
+def test_wiki_path_enriches_before_tagging_backlinks(monkeypatch):
+    """Ordering regression: on the Wikipedia path _resolve_platform_serper must enrich
+    candidates (which populates meta['profile_links']) BEFORE _tag_backlinks runs, or the
+    back-link is never seen. The candidate starts with NO profile_links — only the (mocked)
+    enrichment adds them — so this fails if the tag runs before the enrich."""
+    from app.identity import wikipedia as wk              # noqa: E402
+
+    ig = "https://www.instagram.com/ucberkeley"
+    monkeypatch.setattr(
+        vp, "_serper_primary_candidate",
+        lambda *a, **k: ([{"url": "https://www.youtube.com/@ucberkeley",
+                           "source": "serper", "meta": {}}], False))
+
+    def fake_enrich(cands, platform):                     # the real fetch would do this
+        for c in cands:
+            c.setdefault("meta", {})["profile_links"] = {"Instagram": ig}
+    monkeypatch.setattr(vp, "_enrich_candidates", fake_enrich)
+
+    captured = {}
+
+    def fake_verify(platform, wiki_meta, candidates, options=so.DEFAULT):
+        captured["cands"] = candidates                    # snapshot after tagging
+        return vs.VerificationResult(platform=platform, best_candidate=candidates[0]["url"],
+                                     status=vs.STATUS_VERIFIED)
+    monkeypatch.setattr(vp, "_verify", fake_verify)
+
+    vp._resolve_platform_serper(
+        "UC Berkeley", "YouTube",
+        wk.WikiMetadata(talent="UC Berkeley", name="UC Berkeley", found=True),
+        input_handles_for_backlink={"Instagram": ig})
+
+    assert captured["cands"][0]["meta"].get("backlink_to_client_profile") == ig
+
+
 # ── Lever B: dedup merges evidence instead of dropping it ─────────────────────
 def test_add_candidate_merges_serper_evidence_onto_client_handle():
     cands: list = []

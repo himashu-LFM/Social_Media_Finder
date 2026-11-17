@@ -1084,7 +1084,8 @@ def _validate_input_handle(
     # readable, and it matches handle-style references); de-duplication against
     # discovery happens by channel id in _collapse_youtube_duplicates, so we no longer
     # rewrite it to the /channel/UC... form here.
-    # Ignore a private Instagram account: we can't read its name/bio, so we can't
+    # A private Instagram account can't be read (no name/bio to confirm against), but a
+    # client-supplied one isn't discarded — it goes to Manual Review for a human to check.
     if platform == "Instagram" and meta.get("private"):
         return VerificationResult(
             platform=platform, best_candidate=url, status=STATUS_MANUAL, confidence=60,
