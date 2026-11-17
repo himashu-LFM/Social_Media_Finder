@@ -228,8 +228,9 @@ def save_job(job_id: str, job: Dict[str, Any], rows: Optional[List[dict]] = None
             cur.execute(
                 """
                 INSERT INTO job (id, status, source_filename, names, rows,
-                                 output_path, serper_output_path, error)
-                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s)
+                                 output_path, serper_output_path, error,
+                                 started_at, finished_at, duration_seconds)
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     status             = EXCLUDED.status,
                     source_filename    = COALESCE(EXCLUDED.source_filename, job.source_filename),
@@ -237,12 +238,16 @@ def save_job(job_id: str, job: Dict[str, Any], rows: Optional[List[dict]] = None
                     rows               = COALESCE(EXCLUDED.rows, job.rows),
                     output_path        = COALESCE(EXCLUDED.output_path, job.output_path),
                     serper_output_path = COALESCE(EXCLUDED.serper_output_path, job.serper_output_path),
-                    error              = COALESCE(EXCLUDED.error, job.error)
+                    error              = COALESCE(EXCLUDED.error, job.error),
+                    started_at         = COALESCE(EXCLUDED.started_at, job.started_at),
+                    finished_at        = COALESCE(EXCLUDED.finished_at, job.finished_at),
+                    duration_seconds   = COALESCE(EXCLUDED.duration_seconds, job.duration_seconds)
                 """,
                 (job_id, job.get("status", "queued"), job.get("source_filename"),
                  json.dumps(job.get("names", [])),
                  json.dumps(rows) if rows is not None else None,
-                 job.get("output_path"), job.get("serper_output_path"), job.get("error")),
+                 job.get("output_path"), job.get("serper_output_path"), job.get("error"),
+                 job.get("started_at"), job.get("finished_at"), job.get("duration_seconds")),
             )
     except Exception as exc:  # noqa: BLE001
         print(f"  [DB] save_job({job_id[:8]}…) failed: {exc.__class__.__name__}: {exc}")
@@ -256,7 +261,8 @@ def load_job(job_id: str) -> Optional[Dict[str, Any]]:
         with _connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "SELECT status, source_filename, names, output_path, "
-                "serper_output_path, error FROM job WHERE id = %s", (job_id,))
+                "serper_output_path, error, started_at, finished_at, "
+                "duration_seconds FROM job WHERE id = %s", (job_id,))
             row = cur.fetchone()
         return dict(row) if row else None
     except Exception as exc:  # noqa: BLE001

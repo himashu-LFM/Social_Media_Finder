@@ -536,9 +536,10 @@ def _sig_tokens(text: str) -> set:
 def _subentity_identity(talent: str) -> "tuple[set, str]":
     """
     ``(qualifier_tokens, full_acronym)`` for an educational campus/branch, else
-    ``(set(), "")``. Qualifier source by priority: parentheses, comma, the word
-    ``at``, or — with a known system suffix (``- SUNY``) — the base's own tokens;
-    an unknown trailing tag (``- DAR``) is dropped. Acronym is the campus initialism
+    ``(set(), "")``. Qualifier source by priority: parentheses, an EN/EM-dash tail
+    (the Wikidata campus form, ``Rutgers University–Camden``), comma, the word ``at``,
+    or — with a known hyphen system suffix (``- SUNY``) — the base's own tokens; an
+    unknown trailing hyphen tag (``- DAR``) is dropped. Acronym is the campus initialism
     (``ucla``/``sbu``) a handle may match instead of the tokens.
     """
     name = (talent or "").strip()
@@ -552,12 +553,22 @@ def _subentity_identity(talent: str) -> "tuple[set, str]":
         qualifier = set()
     base = re.sub(r"\([^)]*\)", " ", name)
 
+    # Trailing campus/branch suffix. Wikidata writes a campus with an EN/EM-dash
+    # ("Rutgers University–Camden") and the tail there IS the campus (this is the form
+    # the guard sees on a Wikipedia row, via wiki_meta.name). A client row instead uses
+    # a hyphen before a known system ("- SUNY" -> keep the base's tokens) or a dataset
+    # tag ("- DAR" -> drop).
     suffix_is_system = False
-    tail_m = re.search(r"[-–—]\s*([A-Za-z0-9&.]+)\s*$", base)
+    tail_m = re.search(r"([-–—])\s*([A-Za-z0-9&.][A-Za-z0-9&. ]*?)\s*$", base)
     if tail_m:
-        tail = re.sub(r"[^a-z0-9]", "", tail_m.group(1).lower())
-        suffix_is_system = tail in _UNIVERSITY_SYSTEMS
+        sep, tail_raw = tail_m.group(1), tail_m.group(2)
         base = base[:tail_m.start()]
+        if sep in "–—":
+            if not qualifier:
+                qualifier = {t for t in _sig_tokens(tail_raw)
+                             if t not in _ORG_GENERIC_TOKENS}
+        else:
+            suffix_is_system = re.sub(r"[^a-z0-9]", "", tail_raw.lower()) in _UNIVERSITY_SYSTEMS
 
     if not qualifier and "," in base:
         qualifier = _sig_tokens(base.split(",", 1)[1])
@@ -573,9 +584,10 @@ def _subentity_identity(talent: str) -> "tuple[set, str]":
         return set(), ""
 
     # Full acronym: initials of the whole campus name, keeping parenthetical content
-    # but dropping the trailing system/tag suffix ("... Santa Barbara - DAR" -> "ucsb").
+    # and an en-dash campus ("Rutgers University–Camden" -> "ruc") but dropping a
+    # trailing HYPHEN system/tag suffix ("... Santa Barbara - DAR" -> "ucsb").
     clean = re.sub(r"[()]", " ", name)
-    clean = re.sub(r"[-–—]\s*[A-Za-z0-9&.]+\s*$", " ", clean)
+    clean = re.sub(r"-\s*[A-Za-z0-9&.]+\s*$", " ", clean)
     acro_tokens = [t for t in re.findall(r"[a-z0-9]+", clean.lower())
                    if t not in {"of", "the", "at", "and"}]
     acronym = "".join(t[0] for t in acro_tokens if t)

@@ -62,6 +62,9 @@ def _verified(url: str, platform: str = "YouTube") -> VerificationResult:
     # System suffix, no inner separator -> base's own distinctive tokens
     ("Stony Brook University - SUNY", {"stony", "brook"}, "sbu"),
     ("Binghamton University - SUNY", {"binghamton"}, "bu"),
+    # En-dash tail = the Wikidata campus form (the shape the guard sees on a wiki row)
+    ("Rutgers University–Camden", {"camden"}, "ruc"),
+    ("Texas A&M University–Commerce", {"commerce"}, "tamuc"),
 ])
 def test_qualifier_extracted_for_each_campus_pattern(name, qualifier, acronym):
     q, a = _subentity_identity(name)
@@ -91,11 +94,20 @@ def test_disambiguation_parenthetical_is_not_a_campus(name):
     assert _subentity_identity(name) == (set(), "")
 
 
-def test_endash_wikidata_label_alone_yields_no_qualifier():
-    # The guard runs on the CLIENT talent name, which carries the campus in parens/comma
-    # form ("Rutgers University (Camden)"). A bare Wikidata en-dash LABEL is not relied on
-    # as the qualifier source, so it resolves to no campus here — by design.
-    assert _subentity_identity("Rutgers University–Camden") == (set(), "")
+def test_endash_wikidata_label_resolves_the_campus():
+    # The guard runs on wiki_meta.name, which on a Wikipedia row is the Wikidata label
+    # ("Rutgers University–Camden", en-dash, no parens). The en-dash tail must be read AS
+    # the campus so the guard actually engages on those rows (not just the client's
+    # parenthesis/comma form).
+    q, a = _subentity_identity("Rutgers University–Camden")
+    assert q == {"camden"}
+    assert a == "ruc"
+
+
+def test_hyphen_dataset_tag_is_still_dropped_not_a_campus():
+    # A client hyphen tag ("- DAR") must NOT become a campus qualifier, even though an
+    # en-dash tail now does — the two are deliberately distinguished by dash type.
+    assert _subentity_identity("University of Pennsylvania - DAR") == (set(), "")
 
 
 @pytest.mark.parametrize("name", [

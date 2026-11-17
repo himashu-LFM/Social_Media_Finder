@@ -1153,11 +1153,22 @@ def get_job(job_id: str,
             user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     with _jobs_lock:
         job = _jobs.get(job_id)
+    restored = False
     if not job:
         # Not in memory: either this process restarted, or another instance owns
         # it. Postgres is the durable record, so try there before 404-ing.
         job = db_service.load_job(job_id)
-        if job:
-            return {"job_id": job_id, "restored_from_db": True, **job}
-        raise HTTPException(status_code=404, detail="Unknown job_id.")
-    return {"job_id": job_id, **job}
+        if not job:
+            raise HTTPException(status_code=404, detail="Unknown job_id.")
+        restored = True
+    resp: dict[str, Any] = {"job_id": job_id, **job}
+    if restored:
+        resp["restored_from_db"] = True
+    # Server-computed elapsed for a still-running job, so the client can tick the
+    # timer from an authoritative value instead of mixing its own clock with the
+    # backend's epoch (which skews when the two clocks disagree). Once the run ends
+    # duration_seconds is authoritative, so no elapsed is sent.
+    started = job.get("started_at")
+    if started and job.get("duration_seconds") is None:
+        resp["elapsed_seconds"] = round(time.time() - float(started), 1)
+    return resp

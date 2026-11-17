@@ -79,6 +79,7 @@ type JobPollPayload = {
   started_at?: number | null;
   finished_at?: number | null;
   duration_seconds?: number | null;
+  elapsed_seconds?: number | null;
 };
 
 /** Seconds -> "m:ss" (or "h:mm:ss" past an hour) for the execution timer. */
@@ -95,6 +96,10 @@ const EMPTY_PLATFORM_PROGRESS: RowPlatformProgress = {
   currentPlatform: null,
   completedPlatforms: [],
 };
+
+// Consecutive failed job-status polls tolerated before surfacing a backend error.
+// Keeps one transient blip from freezing the timer or flashing a disconnect notice.
+const MAX_POLL_FAILURES = 3;
 
 function platformProgressFromEntry(entry: JobPollPayload["names"][number]): RowPlatformProgress {
   return {
@@ -140,11 +145,18 @@ export function ProcessingRunner() {
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previousDoneCountRef = useRef(0);
   const previousActiveIndexRef = useRef(-1);
+  // Transient poll failures are tolerated: one blip must not freeze the timer or
+  // flash an error. Only a sustained outage surfaces backendError.
+  const consecutiveFailuresRef = useRef(0);
 
-  // Execution timer. ``startMsRef`` anchors the run start (the backend's
-  // ``started_at`` once it arrives — reload-safe — else the client clock);
-  // ``elapsedSeconds`` ticks live while running; ``finalSeconds`` is the
-  // backend's authoritative total once the run ends.
+  // Execution timer. The backend sends an authoritative ``elapsed_seconds`` each
+  // poll; we tick from that plus the local time since it arrived, so the client
+  // clock is only ever used for the sub-poll delta — never mixed with the server's
+  // epoch (which skews when the clocks disagree). ``serverElapsedRef`` is that last
+  // server value and ``serverElapsedAtRef`` the Date.now() when we received it.
+  // ``startMsRef`` is the fallback anchor for the demo run (no backend elapsed).
+  const serverElapsedRef = useRef<number | null>(null);
+  const serverElapsedAtRef = useRef<number>(0);
   const startMsRef = useRef<number | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [finalSeconds, setFinalSeconds] = useState<number | null>(null);
@@ -294,14 +306,23 @@ export function ProcessingRunner() {
           return;
         }
         if (!res.ok) {
-          setBackendError(`Job status error (${res.status})`);
+          // A transient non-404 (e.g. a brief 5xx) must not freeze the run — retry
+          // quietly and only surface an error after several consecutive failures.
+          consecutiveFailuresRef.current += 1;
+          if (consecutiveFailuresRef.current >= MAX_POLL_FAILURES) {
+            setBackendError(`Job status error (${res.status})`);
+          }
           return;
         }
         const data = (await res.json()) as JobPollPayload;
-        // Timer: anchor to the backend's start (reload-safe), and take its
-        // authoritative total once the run ends.
-        if (typeof data.started_at === "number") {
-          startMsRef.current = data.started_at * 1000;
+        // A good poll clears any transient error and resets the failure count.
+        consecutiveFailuresRef.current = 0;
+        setBackendError((prev) => (prev ? null : prev));
+        // Timer: tick from the backend's authoritative elapsed (reload-safe, no
+        // clock mixing); take its final total once the run ends.
+        if (typeof data.elapsed_seconds === "number") {
+          serverElapsedRef.current = data.elapsed_seconds;
+          serverElapsedAtRef.current = Date.now();
         }
         if (typeof data.duration_seconds === "number") {
           setFinalSeconds(data.duration_seconds);
@@ -358,11 +379,16 @@ export function ProcessingRunner() {
           }
         }
       } catch {
-        setBackendError("Cannot reach the Python API.");
-        pushToast("Python API disconnected.", "error");
-        if (pollTimerRef.current) {
-          clearInterval(pollTimerRef.current);
-          pollTimerRef.current = null;
+        // Network blip — tolerate a few before declaring the API unreachable, so a
+        // single dropped request doesn't stop polling or freeze the timer.
+        consecutiveFailuresRef.current += 1;
+        if (consecutiveFailuresRef.current >= MAX_POLL_FAILURES) {
+          setBackendError("Cannot reach the Python API.");
+          pushToast("Python API disconnected.", "error");
+          if (pollTimerRef.current) {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+          }
         }
       }
     }
@@ -411,10 +437,12 @@ export function ProcessingRunner() {
       pushToast("Could not reach the API to stop the run.", "error");
     }
   }
-  // Live execution timer: ticks once a second while a run is in progress. The
-  // final total comes from the backend (``finalSeconds``); this only drives the
-  // live count-up. Anchors to the client clock if the backend start hasn't been
-  // seen yet (e.g. the demo run, or before the first poll).
+  // Live execution timer: ticks once a second while a run is in progress. The final
+  // total comes from the backend (``finalSeconds``); this only drives the live
+  // count-up. For a backend run it extrapolates from the last server-reported
+  // ``elapsed_seconds`` plus the local time since — so the client clock is used only
+  // for the sub-poll delta, not mixed with the server epoch. The demo run (no backend
+  // elapsed) falls back to a plain client anchor.
   useEffect(() => {
     const active =
       (source === "python" || source === "demo") &&
@@ -423,9 +451,15 @@ export function ProcessingRunner() {
       !runCancelled &&
       !backendError;
     if (!active) return;
-    if (startMsRef.current === null) startMsRef.current = Date.now();
-    const tick = () =>
-      setElapsedSeconds(Math.floor((Date.now() - (startMsRef.current as number)) / 1000));
+    const tick = () => {
+      if (serverElapsedRef.current !== null) {
+        const sinceServer = (Date.now() - serverElapsedAtRef.current) / 1000;
+        setElapsedSeconds(Math.floor(serverElapsedRef.current + Math.max(0, sinceServer)));
+      } else {
+        if (startMsRef.current === null) startMsRef.current = Date.now();
+        setElapsedSeconds(Math.floor((Date.now() - startMsRef.current) / 1000));
+      }
+    };
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
