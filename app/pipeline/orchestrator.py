@@ -577,7 +577,9 @@ def _guard_subentity(
 
     No-op unless VERIFIED and ``talent`` names a campus. The chosen account must
     carry the campus signal (qualifier token in handle/display name, or the campus
-    acronym); else prefer a candidate that does, or downgrade to Manual Review.
+    acronym); if it doesn't, the cell is downgraded to Manual Review (a candidate
+    that does carry the signal is named in the reason as a lead). It only ever
+    downgrades — never re-points to a VERIFIED the LLM didn't choose.
     """
     if result.status != STATUS_VERIFIED or not result.best_candidate:
         return result
@@ -615,18 +617,15 @@ def _guard_subentity(
         indep = 0 if cand.get("source") not in ("input", "handle_fanout") else 1
         return (order.get(_evidence(cand), 9), indep)
 
+    # A guard only ever DOWNGRADES. It must not re-point to a candidate the LLM did
+    # not choose and mark it Verified — that would skip the evidence floor, the fan/
+    # parody override and the ambiguity guard, and could bless a namesake/parody that
+    # merely carries the campus token (e.g. "rutgerscamdenparody"). If another
+    # candidate does carry the campus signal, name it in the reason so the analyst can
+    # check it, but the cell goes to Manual Review, not Verified.
     better = sorted((c for c in candidates if _evidence(c)), key=_rank)
-    if better:
-        pick = better[0]
-        print(f"  [SUB-ENTITY] {platform} | {talent}: chosen account missed campus "
-              f"'{qdesc}' -> re-pointed to {pick.get('url')}")
-        return replace(
-            result, best_candidate=pick["url"], status=STATUS_VERIFIED,
-            decision="verified",
-            reason=(f"Resolved to the specific campus/branch ('{qdesc}'), not the parent "
-                    f"or system account. " + (result.reason or "")).strip(),
-        )
-
+    hint = (f" A candidate that matches the campus was found ({better[0].get('url')}) — "
+            f"confirm it." if better else "")
     print(f"  [SUB-ENTITY] {platform} | {talent}: chosen account presents as the parent/"
           f"system, not the '{qdesc}' campus -> manual review")
     return replace(
@@ -634,7 +633,7 @@ def _guard_subentity(
         decision="manual_review",
         reason=(f"Subject is the '{qdesc}' campus/branch, but the chosen account presents "
                 f"as the parent or system — confirm it is the specific campus, not the "
-                f"parent. " + (result.reason or "")).strip(),
+                f"parent.{hint} " + (result.reason or "")).strip(),
     )
 
 
@@ -1681,8 +1680,13 @@ def _row_serper_corroborate_phase(
             decided = _decide_no_wiki_platform(
                 talent, platform, cands, searched, errored,
                 known_profiles, anchor_slugs, mutual_handles)
-            decided = _guard_subentity(decided, cands, talent, platform)
-            results[platform] = _route_private_to_manual(decided, cands)
+            # Guard over the dis-corroboration SURVIVORS only — a namesake already
+            # rejected inside _decide_no_wiki_platform must not be reconsidered here
+            # (or named as the campus account).
+            kept = [c for c in cands
+                    if not _contradicts_known_profiles(c, known_profiles)]
+            decided = _guard_subentity(decided, kept, talent, platform)
+            results[platform] = _route_private_to_manual(decided, kept)
         if platform_progress:
             platform_progress(platform, "done")
     return results
@@ -1881,10 +1885,17 @@ def _corroborate_row(
             # evidence gate would immediately re-block the cell for having no
             # fetchable metadata — which is exactly why it needed rescuing.
             _tag_cross_platform_match(cand, platform, verified_handles, options)
+            if platform == "Instagram" and (cand.get("meta") or {}).get("private"):
+                cand[_PRIVATE_REVIEW_FLAG] = True
             res = verification_service.verify_platform(
                 platform, gt, [cand], is_person=wiki_meta.is_person,
                 thin_gate=options.thin_gate,
             )
+            # Corroboration must not promote a cell past the guards that sent it to
+            # Manual in the first place: a campus subject's parent/system account, or
+            # a private client IG, stays Manual even when the rest of the row agrees.
+            res = _guard_subentity(res, [cand], talent, platform)
+            res = _route_private_to_manual(res, [cand])
         except Exception as exc:  # noqa: BLE001
             print(f"  [CORROBORATE] {platform} | {talent} error: {exc.__class__.__name__}")
             return platform, results[platform]

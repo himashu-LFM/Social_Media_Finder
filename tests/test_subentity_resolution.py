@@ -7,8 +7,9 @@ used to let the parent's big account — or the system's, or a sibling campus's 
 stand in for the campus. These tests pin the two pieces of the fix:
 
   * ``_subentity_identity`` — extracting the distinguishing qualifier + acronym.
-  * ``_guard_subentity`` — re-pointing a Verified result to the campus account, or
-    routing it to Manual Review when none of the candidates is the campus.
+  * ``_guard_subentity`` — a Verified result whose account isn't the campus is routed
+    to Manual Review (never silently re-pointed to a candidate the LLM didn't choose);
+    a candidate that does match the campus is named in the reason as a lead.
 
 Plus a lock on the Wikidata ground-truth extraction: only the 5 target social
 platforms are emitted, each to its own cell (an image/website claim is not one).
@@ -91,7 +92,7 @@ def test_non_institution_names_are_never_treated_as_campuses(name):
     assert _subentity_identity(name) == (set(), "")
 
 
-# ── _guard_subentity: re-point or downgrade ──────────────────────────────────
+# ── _guard_subentity: downgrade-only (never promotes an unchosen candidate) ───
 def test_parent_account_alone_is_downgraded_to_manual():
     # Rutgers (Camden) with only the parent Rutgers channel discovered.
     result = _verified("https://www.youtube.com/user/Rutgers")
@@ -103,21 +104,25 @@ def test_parent_account_alone_is_downgraded_to_manual():
     assert out.best_candidate == "https://www.youtube.com/user/Rutgers"
 
 
-def test_repoints_to_the_campus_account_when_one_is_present():
-    # Parent chosen, but the Camden campus account is in the candidate set.
+def test_campus_account_present_but_unchosen_is_named_not_promoted():
+    # Parent chosen, but the Camden campus account is in the candidate set. A guard
+    # never promotes an account the LLM didn't choose (that would skip the evidence
+    # floor and the parody/ambiguity guards): the cell goes to Manual, naming the lead.
     result = _verified("https://www.youtube.com/user/Rutgers")
     cands = [
         _cand("https://www.youtube.com/user/Rutgers", "Rutgers University"),
         _cand("https://www.youtube.com/@RutgersUniversityCamden", "Rutgers University-Camden"),
     ]
     out = _guard_subentity(result, cands, "Rutgers University (Camden) - DAR", "YouTube")
-    assert out.status == STATUS_VERIFIED
-    assert out.best_candidate == "https://www.youtube.com/@RutgersUniversityCamden"
+    assert out.status == STATUS_MANUAL
+    assert out.best_candidate == "https://www.youtube.com/user/Rutgers"  # not re-pointed
+    assert "RutgersUniversityCamden" in out.reason   # the campus lead is named
 
 
-def test_prefers_main_campus_over_a_sibling_sub_channel():
-    # UCSB: the discovered winner was the news sub-channel; the main channel is
-    # also present and carries the 'santa barbara' qualifier explicitly.
+def test_sibling_sub_channel_is_downgraded_and_names_the_main_campus():
+    # UCSB: the discovered winner was the news sub-channel; the main channel is also
+    # present. The guard downgrades to Manual and names the main channel as the lead,
+    # rather than silently re-pointing to it.
     result = _verified("https://www.youtube.com/user/UCSBNews")
     cands = [
         _cand("https://www.youtube.com/user/UCSBNews", "UCSB News"),
@@ -125,8 +130,9 @@ def test_prefers_main_campus_over_a_sibling_sub_channel():
     ]
     out = _guard_subentity(
         result, cands, "University of California, Santa Barbara - DAR", "YouTube")
-    assert out.status == STATUS_VERIFIED
-    assert out.best_candidate == "https://www.youtube.com/@ucsantabarbara"
+    assert out.status == STATUS_MANUAL
+    assert out.best_candidate == "https://www.youtube.com/user/UCSBNews"
+    assert "ucsantabarbara" in out.reason
 
 
 def test_system_account_is_downgraded_for_a_system_campus():

@@ -104,11 +104,12 @@ def test_drop_missing_drops_a_dead_instagram_candidate(monkeypatch):
     assert vp._drop_missing_profiles(cands, "Instagram") == []
 
 
-# ── _fetch_html caches within a run (no double-fetch of FB/IG pages) ──────────
+# ── pages parse once per run; the cache holds facts, not raw HTML ─────────────
 
-def test_fetch_html_is_cached_within_a_run(monkeypatch):
-    """The liveness probe and enrichment both call _fetch_html for the same FB/IG
-    page; it must download once per URL per run, not once per caller."""
+def test_page_is_parsed_once_per_run(monkeypatch):
+    """The liveness probe and enrichment hit the same FB/IG page; it must download
+    once per URL per run. The per-run cache holds the small parsed facts, never the
+    raw HTML (which would grow unbounded across a large run)."""
     pm.clear_cache()
     calls = {"n": 0}
 
@@ -122,7 +123,32 @@ def test_fetch_html_is_cached_within_a_run(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr(pm, "request_with_retry", _fake_get)
-    first = pm._fetch_html("https://www.facebook.com/somepage")
-    second = pm._fetch_html("https://www.facebook.com/somepage")
-    assert first == second
-    assert calls["n"] == 1   # second call served from cache
+    url = "https://www.facebook.com/somepage"
+    first = pm._load_page(url)
+    second = pm._load_page(url)
+    assert first is second    # same cached facts object
+    assert calls["n"] == 1    # downloaded once, shared by both callers
+
+
+def test_failed_fetch_is_not_cached(monkeypatch):
+    """A transient failure must not be frozen for the run as 'dead': a later call
+    re-attempts the fetch rather than returning a cached miss."""
+    pm.clear_cache()
+    calls = {"n": 0}
+
+    class _Resp:
+        ok = False
+        status_code = 503
+        content = b""
+        text = ""
+
+    def _fake_get(method, url, **kw):
+        calls["n"] += 1
+        return _Resp()
+
+    monkeypatch.setattr(pm, "request_with_retry", _fake_get)
+    url = "https://www.facebook.com/blocked"
+    assert pm._load_page(url) is None
+    first_total = calls["n"]
+    assert pm._load_page(url) is None
+    assert calls["n"] > first_total   # not cached -> re-attempted

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import html as _html
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -63,27 +63,25 @@ _COUNT_RE = r"([\d][\d.,]*\s*[KMB]?)"
 _EXISTENCE_CHECK_PLATFORMS = frozenset({"YouTube", "X"})
 
 _MISSING_CACHE: Dict[str, bool] = {}
-# Cache fetched HTML per run so the liveness probe (``profile_is_missing``) and
-# enrichment (``fetch_profile_metadata``) don't each download the same FB/IG page.
-_HTML_CACHE: Dict[str, str] = {}
+# Per-run cache of the SMALL parsed facts of each page (``_load_page``), so the
+# liveness probe and enrichment share one download without retaining the raw HTML
+# (YT pages run ~1 MB — keeping every page for a 500-brand run would risk an OOM).
+_PAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def clear_cache() -> None:
     _CACHE.clear()
     _MISSING_CACHE.clear()
-    _HTML_CACHE.clear()
+    _PAGE_CACHE.clear()
 
 
 def _facebook_page_is_dead(url: str) -> bool:
     """Facebook 200s for everything, so a 404 probe is useless: a real page has an
     og:title, a dead vanity returns the generic shell. Blocked/empty fetch -> kept."""
-    html = _fetch_html(url)
-    if not html:
+    facts = _load_page(url)
+    if facts is None:
         return False
-    low = html.lower()
-    if 'property="og:title"' in low or 'property="og:description"' in low:
-        return False
-    return "<title>facebook</title>" in low
+    return (not facts["og_present"]) and facts["fb_shell"]
 
 
 # IG's generic shell appears for BOTH a missing username and a blocked view of a REAL
@@ -98,13 +96,10 @@ _IG_NOT_FOUND_RE = re.compile(
 def _instagram_page_is_dead(url: str) -> bool:
     """Dead only when the body carries an explicit not-found marker: an og:title means
     alive, and a bare shell/blocked fetch is kept (it's also what a real profile returns)."""
-    html = _fetch_html(url)
-    if not html:
+    facts = _load_page(url)
+    if facts is None:
         return False
-    low = html.lower()
-    if 'property="og:title"' in low or 'property="og:description"' in low:
-        return False
-    return bool(_IG_NOT_FOUND_RE.search(html))
+    return (not facts["og_present"]) and facts["ig_not_found"]
 
 
 def profile_is_missing(url: str, platform: str) -> bool:
@@ -178,10 +173,9 @@ def _youtube_channel_id_from_html(html: str) -> str:
 
 
 def _fetch_html(url: str) -> str:
-    """Fetch page HTML, trying each UA until OpenGraph tags appear. Cached per run so a
-    page that is both liveness-probed and enriched is downloaded once, not twice."""
-    if url in _HTML_CACHE:
-        return _HTML_CACHE[url]
+    """Fetch page HTML, trying each UA until OpenGraph tags appear. Not cached here —
+    the per-run dedup lives in ``_load_page`` (small parsed facts), so the raw HTML
+    (YT pages run ~1 MB) is never retained for the whole run."""
     last = ""
     for ua in _USER_AGENTS:
         try:
@@ -198,12 +192,47 @@ def _fetch_html(url: str) -> str:
             last = html
             lowered = html.lower()
             if "og:title" in lowered or "og:description" in lowered:
-                _HTML_CACHE[url] = html
                 return html
         except Exception as exc:  # noqa: BLE001 — enrichment must never raise
             print(f"  [PROFILE] fetch failed {url[:70]}… : {exc.__class__.__name__}")
-    _HTML_CACHE[url] = last
     return last
+
+
+def _load_page(url: str) -> Optional[Dict[str, Any]]:
+    """Fetch a page once and return its SMALL parsed facts — never the raw HTML.
+
+    Cached per run so the liveness probe and enrichment share one download. A failed
+    fetch returns ``None`` and is NOT cached, so a transient block/throttle can be
+    retried on a later pass rather than frozen as 'dead' for the rest of the run.
+    """
+    if url in _PAGE_CACHE:
+        return _PAGE_CACHE[url]
+    html = _fetch_html(url)
+    if not html:
+        return None
+    low = html.lower()
+    links: Dict[str, str] = {}
+    try:
+        # Imported lazily — bio_links imports this module, so a top-level import
+        # would be circular.
+        from app.discovery import bio_links as bio_link_service
+        links = bio_link_service.links_by_platform(html, exclude_url=url) or {}
+    except Exception as exc:  # noqa: BLE001 — enrichment must never raise
+        print(f"  [PROFILE] link scan failed {url[:60]}… : {exc.__class__.__name__}")
+    facts: Dict[str, Any] = {
+        "og_present": 'property="og:title"' in low or 'property="og:description"' in low,
+        "fb_shell": "<title>facebook</title>" in low,
+        "ig_not_found": bool(_IG_NOT_FOUND_RE.search(html)),
+        "tags": _extract_meta_tags(html),
+        "verified": bool(re.search(
+            r'"is_verified"\s*:\s*true|"isVerified"\s*:\s*true|"verified"\s*:\s*true',
+            html, re.I)),
+        "is_private": _page_is_private(html),
+        "channel_id": _youtube_channel_id_from_html(html),
+        "profile_links": links,
+    }
+    _PAGE_CACHE[url] = facts
+    return facts
 
 
 def _extract_meta_tags(html: str) -> Dict[str, str]:
@@ -243,12 +272,12 @@ def fetch_profile_metadata(url: str, platform: str) -> Dict[str, Any]:
         return _CACHE[url]
 
     meta: Dict[str, Any] = {"username": social_urls.handle_from_url(url, platform)}
-    html = _fetch_html(url)
-    if not html:
+    facts = _load_page(url)
+    if facts is None:
         _CACHE[url] = meta
         return meta
 
-    tags = _extract_meta_tags(html)
+    tags = facts["tags"]
     title = _html.unescape(tags.get("og:title") or tags.get("twitter:title") or "")
     description = _html.unescape(
         tags.get("og:description") or tags.get("twitter:description") or ""
@@ -277,38 +306,22 @@ def fetch_profile_metadata(url: str, platform: str) -> Dict[str, Any]:
     if image:
         meta["image"] = image
 
-    # Verified badge — only set when the page exposes a clear signal.
-    if re.search(r'"is_verified"\s*:\s*true|"isVerified"\s*:\s*true|"verified"\s*:\s*true',
-                 html, re.I):
+    # Parsed once in _load_page: verified badge, private flag (IG — explicit
+    # "is_private":true only), and every social profile the page links to (the
+    # back-link signal the pipeline checks against the client's own handles).
+    if facts["verified"]:
         meta["verified"] = True
-
-    # Private flag (Instagram): set only on an explicit "is_private":true embedded
-    # in the page JSON — an absent flag stays unknown.
-    if _page_is_private(html):
+    if facts["is_private"]:
         meta["private"] = True
-
-    # YouTube channel id (UC...): the rename-proof identity of the channel, used to
-    # collapse different URL forms of the same channel into one. Free — the HTML is
-    # already fetched. Absent for non-YouTube pages or when the page carries no id.
     if platform == "YouTube":
-        # The URL's own /channel/UC... id is authoritative; parse HTML only for a
-        # /@handle or /user/ form that doesn't already carry the id.
+        # The URL's own /channel/UC... id is authoritative; the page's own id (from
+        # _load_page) is used only for a /@handle or /user/ form that lacks one.
         m = _YT_CHANNEL_ID_PATH_RE.search(url)
-        cid = m.group(1) if m else _youtube_channel_id_from_html(html)
+        cid = m.group(1) if m else facts["channel_id"]
         if cid:
             meta["channel_id"] = cid
-
-    # Every social profile this page links to. Free: the HTML is already here,
-    # and it is what lets the pipeline check whether a discovered candidate links
-    # BACK to a profile the client gave us. Imported lazily — bio_link_service
-    # imports this module, so a top-level import would be circular.
-    try:
-        from app.discovery import bio_links as bio_link_service
-        links = bio_link_service.links_by_platform(html, exclude_url=url)
-        if links:
-            meta["profile_links"] = links
-    except Exception as exc:  # noqa: BLE001 — enrichment must never raise
-        print(f"  [PROFILE] link scan failed {url[:60]}… : {exc.__class__.__name__}")
+    if facts["profile_links"]:
+        meta["profile_links"] = facts["profile_links"]
 
     # Drop empty values so the LLM payload stays clean.
     meta = {k: v for k, v in meta.items() if v not in ("", None)}
