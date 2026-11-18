@@ -300,6 +300,7 @@ def _route_private_to_manual(result: VerificationResult,
     chosen = next((c for c in candidates if c.get("url") == result.best_candidate), None)
     if chosen and chosen.get(_PRIVATE_REVIEW_FLAG):
         result.status = STATUS_MANUAL
+        result.held = True            # deliberate hold — never re-promote in corroboration
         result.confidence = min(result.confidence or 60, 60)
         if "private" not in (result.reason or "").lower():
             result.reason = ("The account is private, so its content can't be confirmed "
@@ -651,7 +652,7 @@ def _guard_subentity(
     print(f"  [SUB-ENTITY] {platform} | {talent}: chosen account presents as the parent/"
           f"system, not the '{qdesc}' campus -> manual review")
     return replace(
-        result, status=STATUS_MANUAL, confidence=min(result.confidence, 70),
+        result, status=STATUS_MANUAL, held=True, confidence=min(result.confidence, 70),
         decision="manual_review",
         reason=(f"Subject is the '{qdesc}' campus/branch, but the chosen account presents "
                 f"as the parent or system — confirm it is the specific campus, not the "
@@ -1075,7 +1076,7 @@ def _validate_input_handle(
         if not flag_worthy:
             return _trusted_input_result(platform, url)  # couldn't read -> trust
         return VerificationResult(  # positively confirmed bad (e.g. 404)
-            platform=platform, best_candidate=url, status=STATUS_MANUAL,
+            platform=platform, best_candidate=url, status=STATUS_MANUAL, held=True,
             confidence=0, decision="manual_review", source="Input file (unconfirmed)",
             reason=("The supplied profile could not be confirmed (it may not exist) — "
                     "manual review needed."),
@@ -1088,8 +1089,8 @@ def _validate_input_handle(
     # client-supplied one isn't discarded — it goes to Manual Review for a human to check.
     if platform == "Instagram" and meta.get("private"):
         return VerificationResult(
-            platform=platform, best_candidate=url, status=STATUS_MANUAL, confidence=60,
-            decision="manual_review", source="Input file (private account)",
+            platform=platform, best_candidate=url, status=STATUS_MANUAL, held=True,
+            confidence=60, decision="manual_review", source="Input file (private account)",
             reason=("The account is private, so its content can't be confirmed or "
                     "tracked — manual review needed."),
         )
@@ -1098,8 +1099,8 @@ def _validate_input_handle(
     if platform == "Instagram" and talent and _input_surname_mismatch(meta, url, wiki_meta, talent):
         shown = str(meta.get("display_name") or "")[:60]
         return VerificationResult(
-            platform=platform, best_candidate=url, status=STATUS_MANUAL, confidence=0,
-            decision="manual_review", source="Input file (unverified)",
+            platform=platform, best_candidate=url, status=STATUS_MANUAL, held=True,
+            confidence=0, decision="manual_review", source="Input file (unverified)",
             reason=(f"The supplied profile's name ('{shown}') does not include the "
                     "talent's surname — likely a different person; manual review needed."),
         )
@@ -1885,7 +1886,13 @@ def _corroborate_row(
             if handle:
                 verified_handles[platform] = handle
 
-    rescue = [p for p, r in results.items() if r.status == STATUS_MANUAL and r.best_candidate]
+    # Rescue only cells that are Manual for an EVIDENCE shortfall (FB/X/TikTok expose
+    # no fetchable content). A cell a guard DELIBERATELY held for a human (``held``) —
+    # a private account, surname mismatch, unconfirmed input, distributor channel, or
+    # campus/parent mismatch — must never be re-promoted by corroboration, so it is
+    # excluded here rather than re-detected unreliably inside the rescue.
+    rescue = [p for p, r in results.items()
+              if r.status == STATUS_MANUAL and r.best_candidate and not r.held]
     if not verified_handles or not rescue:
         return results
 
@@ -1912,17 +1919,12 @@ def _corroborate_row(
             # evidence gate would immediately re-block the cell for having no
             # fetchable metadata — which is exactly why it needed rescuing.
             _tag_cross_platform_match(cand, platform, verified_handles, options)
-            if platform == "Instagram" and (cand.get("meta") or {}).get("private"):
-                cand[_PRIVATE_REVIEW_FLAG] = True
             res = verification_service.verify_platform(
                 platform, gt, [cand], is_person=wiki_meta.is_person,
                 thin_gate=options.thin_gate,
             )
-            # Corroboration must not promote a cell past the guards that sent it to
-            # Manual in the first place: a campus subject's parent/system account, or
-            # a private client IG, stays Manual even when the rest of the row agrees.
-            res = _guard_subentity(res, [cand], talent, platform)
-            res = _route_private_to_manual(res, [cand])
+            # No private/campus re-guarding needed here: deliberately-held cells were
+            # excluded from ``rescue`` above, so only evidence-shortfall cells reach this.
         except Exception as exc:  # noqa: BLE001
             print(f"  [CORROBORATE] {platform} | {talent} error: {exc.__class__.__name__}")
             return platform, results[platform]
@@ -1957,7 +1959,7 @@ def _apply_yt_distributor_override(
     results = dict(results)
     results["YouTube"] = VerificationResult(
         platform="YouTube", best_candidate=distributor_url,
-        status=STATUS_MANUAL, confidence=0, decision="manual_review",
+        status=STATUS_MANUAL, held=True, confidence=0, decision="manual_review",
         source="Input file (distributor channel)",
         reason=("The supplied YouTube link is a distributor/label channel shared "
                 "across titles, not this title's own channel, and no title-specific "

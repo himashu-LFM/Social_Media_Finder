@@ -145,15 +145,17 @@ def test_uncorroborated_client_handle_stays_without_evidence():
     assert vs._candidate_has_evidence(cands[0]) is False
 
 
-# ── corroboration re-applies the private-IG and sub-entity guards ─────────────
-# (Promotion to Verified during the rescue pass must not skip the guards that sent
-#  the cell to Manual in the first place.)
+# ── corroboration excludes deliberately-held cells from the rescue pass ───────
+# A cell a guard HELD for a human (private account, surname mismatch, unconfirmed
+# input, distributor channel, campus/parent mismatch) carries result.held=True and
+# must never be re-promoted; only an evidence-shortfall Manual is rescued. This is
+# decided from the held flag, not by re-detecting the condition inside the rescue.
 from app.identity import wikipedia as _wiki              # noqa: E402
 
 
-def _mr(url: str, status: str, platform: str) -> "vp.VerificationResult":
+def _mr(url: str, status: str, platform: str, held: bool = False) -> "vp.VerificationResult":
     return vp.VerificationResult(
-        platform=platform, best_candidate=url, status=status,
+        platform=platform, best_candidate=url, status=status, held=held,
         confidence=60 if status == vp.STATUS_MANUAL else 95,
         decision="manual_review" if status == vp.STATUS_MANUAL else "verified",
     )
@@ -164,36 +166,35 @@ def _always_verified(platform, gt, cands, **k):
                                  status=vp.STATUS_VERIFIED, confidence=95, decision="verified")
 
 
-def test_corroboration_keeps_private_instagram_in_manual(monkeypatch):
-    # A private client IG at Manual must NOT be promoted to Verified just because
-    # another platform on the row is Verified — the private guard is re-applied.
+def test_corroboration_excludes_a_held_private_instagram(monkeypatch):
+    # A private client IG was deliberately held (held=True). Corroboration must not even
+    # consider it for rescue — no re-detection of 'private' from an enrichment fetch. The
+    # stubbed verifier would flip anything it rescues to Verified; the cell must stay put.
     monkeypatch.setattr(vp, "_drop_missing_profiles", lambda cands, platform: cands)
-
-    def fake_enrich(cands, platform):
-        for c in cands:
-            c.setdefault("meta", {})["private"] = True   # enrichment reveals it's private
-    monkeypatch.setattr(vp, "_enrich_candidates", fake_enrich)
+    monkeypatch.setattr(vp, "_enrich_candidates", lambda cands, platform: None)
     monkeypatch.setattr(vp.verification_service, "verify_platform", _always_verified)
 
+    held_mr = _mr("https://www.instagram.com/client_private", vp.STATUS_MANUAL, "Instagram", held=True)
     results = {
-        "Instagram": _mr("https://www.instagram.com/client_private", vp.STATUS_MANUAL, "Instagram"),
+        "Instagram": held_mr,
         "YouTube": _mr("https://www.youtube.com/@client", vp.STATUS_VERIFIED, "YouTube"),
     }
     out = vp._corroborate_row(
         "Jane Doe", _wiki.WikiMetadata(talent="Jane Doe", name="Jane Doe"), results, DEFAULT)
     assert out["Instagram"].status == vp.STATUS_MANUAL
-    assert "private" in (out["Instagram"].reason or "").lower()
+    assert out["Instagram"] is held_mr          # untouched — never entered the rescue
 
 
-def test_corroboration_keeps_campus_parent_in_manual(monkeypatch):
-    # A campus subject whose Manual YouTube cell points at the PARENT channel must not
-    # be promoted by corroboration — the sub-entity guard is re-applied.
+def test_corroboration_excludes_a_held_campus_parent(monkeypatch):
+    # A campus subject's parent-channel Manual is held (held=True) and must stay Manual,
+    # not be promoted by corroboration.
     monkeypatch.setattr(vp, "_drop_missing_profiles", lambda cands, platform: cands)
     monkeypatch.setattr(vp, "_enrich_candidates", lambda cands, platform: None)
     monkeypatch.setattr(vp.verification_service, "verify_platform", _always_verified)
 
+    held_mr = _mr("https://www.youtube.com/user/Rutgers", vp.STATUS_MANUAL, "YouTube", held=True)
     results = {
-        "YouTube": _mr("https://www.youtube.com/user/Rutgers", vp.STATUS_MANUAL, "YouTube"),
+        "YouTube": held_mr,
         "Instagram": _mr("https://www.instagram.com/rutgerscamden", vp.STATUS_VERIFIED, "Instagram"),
     }
     out = vp._corroborate_row(
@@ -202,4 +203,22 @@ def test_corroboration_keeps_campus_parent_in_manual(monkeypatch):
                            name="Rutgers University (Camden) - DAR"),
         results, DEFAULT)
     assert out["YouTube"].status == vp.STATUS_MANUAL
-    assert "camden" in (out["YouTube"].reason or "").lower()
+    assert out["YouTube"] is held_mr
+
+
+def test_corroboration_still_rescues_an_evidence_shortfall_cell(monkeypatch):
+    # An ordinary evidence-shortfall Manual (held=False) — e.g. an X handle the LLM
+    # accepted but the evidence floor downgraded — is STILL rescued and can be promoted
+    # when another platform corroborates the row. Proves the exclusion didn't break the
+    # intended rescue.
+    monkeypatch.setattr(vp, "_drop_missing_profiles", lambda cands, platform: cands)
+    monkeypatch.setattr(vp, "_enrich_candidates", lambda cands, platform: None)
+    monkeypatch.setattr(vp.verification_service, "verify_platform", _always_verified)
+
+    results = {
+        "X": _mr("https://x.com/ucberkeley", vp.STATUS_MANUAL, "X"),               # held=False
+        "Instagram": _mr("https://www.instagram.com/ucberkeley", vp.STATUS_VERIFIED, "Instagram"),
+    }
+    out = vp._corroborate_row(
+        "UC Berkeley", _wiki.WikiMetadata(talent="UC Berkeley", name="UC Berkeley"), results, DEFAULT)
+    assert out["X"].status == vp.STATUS_VERIFIED

@@ -404,6 +404,12 @@ class VerificationResult:
     evidence: List[Any] = field(default_factory=list)
     rejected: List[Any] = field(default_factory=list)
     decision: str = ""
+    #: True when a guard DELIBERATELY held this cell for a human (private account,
+    #: surname mismatch, unconfirmed input, distributor channel, campus/parent
+    #: mismatch) — as opposed to a Manual caused only by an evidence shortfall.
+    #: Cross-platform corroboration must never re-promote a held cell, so it is
+    #: excluded from the rescue pass. Never exported to the workbook.
+    held: bool = False
     #: Human-readable origin of the chosen link, exported as the "<Platform>
     #: Source" column (e.g. "Serper (site-search)", "Phase 0 (YouTube bio)",
     #: "Input file", "Serper + LLM", "Apify + LLM", "Analyst (saved decision)").
