@@ -10,6 +10,9 @@ treated as dead, so a real page is never dropped on a flaky response.
 from app.output import profile_metadata as pm
 from app.pipeline import orchestrator as vp
 
+# The real enrichment fn, captured before conftest's autouse fixture stubs it.
+_REAL_FETCH = pm.fetch_profile_metadata
+
 REAL = ('<html><head><title>University of Georgia | Athens GA</title>'
         '<meta property="og:title" content="University of Georgia | Athens GA">'
         '</head></html>')
@@ -152,3 +155,51 @@ def test_failed_fetch_is_not_cached(monkeypatch):
     first_total = calls["n"]
     assert pm._load_page(url) is None
     assert calls["n"] > first_total   # not cached -> re-attempted
+
+
+# ── liveness stays cheap; the bio-link scan is enrichment-only ───────────────
+
+def test_liveness_probe_does_not_run_the_bio_link_scan(monkeypatch):
+    """A liveness probe must NOT trigger the expensive per-page bio-link scan — that
+    parse is enrichment-only. Only fetch_profile_metadata should call it."""
+    pm.clear_cache()
+    scans = {"n": 0}
+
+    import app.discovery.bio_links as bio_links
+
+    def _counting_scan(html, exclude_url=""):
+        scans["n"] += 1
+        return {}
+
+    monkeypatch.setattr(bio_links, "links_by_platform", _counting_scan)
+    monkeypatch.setattr(pm, "_fetch_html", lambda u: REAL)
+
+    url = "https://www.facebook.com/someorg"
+    pm._instagram_page_is_dead(url)          # a pure liveness probe
+    pm._facebook_page_is_dead(url)
+    assert scans["n"] == 0                    # liveness never scans bio links
+
+    _REAL_FETCH(url, "Facebook")              # enrichment DOES scan
+    assert scans["n"] == 1
+
+
+def test_fetch_html_dedupes_repeat_reads_within_a_run(monkeypatch):
+    """_fetch_html caches successful HTML per run, so a URL read more than once
+    (liveness probe + enrichment, or a bio_links/aggregators follow-up) downloads once."""
+    pm.clear_cache()
+    calls = {"n": 0}
+
+    class _Resp:
+        ok = True
+        content = b"x"
+        text = REAL
+
+    def _fake_get(method, url, **kw):
+        calls["n"] += 1
+        return _Resp()
+
+    monkeypatch.setattr(pm, "request_with_retry", _fake_get)
+    url = "https://www.facebook.com/dedupe"
+    assert pm._fetch_html(url) == REAL
+    assert pm._fetch_html(url) == REAL
+    assert calls["n"] == 1    # second read served from the bounded HTML cache

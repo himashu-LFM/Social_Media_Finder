@@ -253,6 +253,28 @@ def save_job(job_id: str, job: Dict[str, Any], rows: Optional[List[dict]] = None
         print(f"  [DB] save_job({job_id[:8]}…) failed: {exc.__class__.__name__}: {exc}")
 
 
+def save_job_rows(job_id: str, rows: List[dict]) -> None:
+    """Persist ONLY the result rows mid-run (an incremental checkpoint).
+
+    Lighter than ``save_job``: it touches just the ``rows`` column, so a long run
+    can save partial progress without rewriting the whole job record on every
+    tick. The job row already exists (the run writes a ``running`` lifecycle row
+    before any checkpoint), so a plain UPDATE is enough; if it somehow doesn't,
+    the UPDATE matches nothing and the next lifecycle ``save_job`` inserts it.
+    Never raises — persistence is best-effort.
+    """
+    if not is_configured():
+        return
+    try:
+        with _connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE job SET rows = %s::jsonb WHERE id = %s",
+                (json.dumps(rows), job_id),
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [DB] save_job_rows({job_id[:8]}…) failed: {exc.__class__.__name__}")
+
+
 def load_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Rehydrate a job the in-memory store no longer has (e.g. after a restart)."""
     if not is_configured():

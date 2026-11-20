@@ -63,16 +63,26 @@ _COUNT_RE = r"([\d][\d.,]*\s*[KMB]?)"
 _EXISTENCE_CHECK_PLATFORMS = frozenset({"YouTube", "X"})
 
 _MISSING_CACHE: Dict[str, bool] = {}
-# Per-run cache of the SMALL parsed facts of each page (``_load_page``), so the
+# Per-run cache of the SMALL liveness facts of each page (``_load_page``), so the
 # liveness probe and enrichment share one download without retaining the raw HTML
 # (YT pages run ~1 MB — keeping every page for a 500-brand run would risk an OOM).
 _PAGE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# Bounded per-run raw-HTML cache. Restores fetch dedup for a URL read more than once
+# in a run (the liveness probe + enrichment, and the bio_links / aggregators follow-up
+# fetches that call ``_fetch_html`` directly) while keeping memory capped: it is
+# FIFO-evicted at a fixed size, so it can't grow without bound across a large run the
+# way retaining every page's HTML would. Only successful (og-bearing) HTML is stored,
+# so a transient block is never frozen and can be retried.
+_HTML_CACHE: Dict[str, str] = {}
+_HTML_CACHE_MAXSIZE = 64
 
 
 def clear_cache() -> None:
     _CACHE.clear()
     _MISSING_CACHE.clear()
     _PAGE_CACHE.clear()
+    _HTML_CACHE.clear()
 
 
 def _facebook_page_is_dead(url: str) -> bool:
@@ -172,10 +182,25 @@ def _youtube_channel_id_from_html(html: str) -> str:
     return m.group(1) if m else ""
 
 
+def _html_cache_put(url: str, html: str) -> None:
+    """Store HTML in the bounded per-run cache, evicting the oldest entry when full."""
+    if url in _HTML_CACHE:
+        return
+    if len(_HTML_CACHE) >= _HTML_CACHE_MAXSIZE:
+        _HTML_CACHE.pop(next(iter(_HTML_CACHE)), None)
+    _HTML_CACHE[url] = html
+
+
 def _fetch_html(url: str) -> str:
-    """Fetch page HTML, trying each UA until OpenGraph tags appear. Not cached here —
-    the per-run dedup lives in ``_load_page`` (small parsed facts), so the raw HTML
-    (YT pages run ~1 MB) is never retained for the whole run."""
+    """Fetch page HTML, trying each UA until OpenGraph tags appear. Successful HTML is
+    kept in a small FIFO-bounded per-run cache so a URL read more than once in a run
+    (the liveness probe + enrichment, and bio_links / aggregators follow-ups) is
+    downloaded once, while memory stays capped — retaining every page would risk an OOM
+    on ~1 MB pages. A failed/blocked fetch is NOT cached, so a transient block can be
+    retried on a later pass rather than frozen as empty for the rest of the run."""
+    cached = _HTML_CACHE.get(url)
+    if cached is not None:
+        return cached
     last = ""
     for ua in _USER_AGENTS:
         try:
@@ -192,6 +217,7 @@ def _fetch_html(url: str) -> str:
             last = html
             lowered = html.lower()
             if "og:title" in lowered or "og:description" in lowered:
+                _html_cache_put(url, html)
                 return html
         except Exception as exc:  # noqa: BLE001 — enrichment must never raise
             print(f"  [PROFILE] fetch failed {url[:70]}… : {exc.__class__.__name__}")
@@ -199,11 +225,14 @@ def _fetch_html(url: str) -> str:
 
 
 def _load_page(url: str) -> Optional[Dict[str, Any]]:
-    """Fetch a page once and return its SMALL parsed facts — never the raw HTML.
+    """Fetch a page once and return only its CHEAP liveness facts — never raw HTML.
 
-    Cached per run so the liveness probe and enrichment share one download. A failed
-    fetch returns ``None`` and is NOT cached, so a transient block/throttle can be
-    retried on a later pass rather than frozen as 'dead' for the rest of the run.
+    The expensive enrichment parse (meta tags, verified / private flags, the YouTube
+    channel id, and the bio-link scan over the whole page) is NOT done here — it lives
+    in ``fetch_profile_metadata``, so a page that is only liveness-probed and never
+    enriched doesn't pay for it. Cached per run; the raw HTML download itself is shared
+    with enrichment through ``_fetch_html``'s cache. A failed fetch returns ``None`` and
+    is NOT cached, so a transient block/throttle can be retried on a later pass.
     """
     if url in _PAGE_CACHE:
         return _PAGE_CACHE[url]
@@ -211,25 +240,10 @@ def _load_page(url: str) -> Optional[Dict[str, Any]]:
     if not html:
         return None
     low = html.lower()
-    links: Dict[str, str] = {}
-    try:
-        # Imported lazily — bio_links imports this module, so a top-level import
-        # would be circular.
-        from app.discovery import bio_links as bio_link_service
-        links = bio_link_service.links_by_platform(html, exclude_url=url) or {}
-    except Exception as exc:  # noqa: BLE001 — enrichment must never raise
-        print(f"  [PROFILE] link scan failed {url[:60]}… : {exc.__class__.__name__}")
     facts: Dict[str, Any] = {
         "og_present": 'property="og:title"' in low or 'property="og:description"' in low,
         "fb_shell": "<title>facebook</title>" in low,
         "ig_not_found": bool(_IG_NOT_FOUND_RE.search(html)),
-        "tags": _extract_meta_tags(html),
-        "verified": bool(re.search(
-            r'"is_verified"\s*:\s*true|"isVerified"\s*:\s*true|"verified"\s*:\s*true',
-            html, re.I)),
-        "is_private": _page_is_private(html),
-        "channel_id": _youtube_channel_id_from_html(html),
-        "profile_links": links,
     }
     _PAGE_CACHE[url] = facts
     return facts
@@ -272,12 +286,15 @@ def fetch_profile_metadata(url: str, platform: str) -> Dict[str, Any]:
         return _CACHE[url]
 
     meta: Dict[str, Any] = {"username": social_urls.handle_from_url(url, platform)}
-    facts = _load_page(url)
-    if facts is None:
+    # Shares the one download with the liveness probe via _fetch_html's cache; the full
+    # parse below (incl. the bio-link scan) runs only on this enrichment path, never on
+    # a bare liveness probe.
+    html = _fetch_html(url)
+    if not html:
         _CACHE[url] = meta
         return meta
 
-    tags = facts["tags"]
+    tags = _extract_meta_tags(html)
     title = _html.unescape(tags.get("og:title") or tags.get("twitter:title") or "")
     description = _html.unescape(
         tags.get("og:description") or tags.get("twitter:description") or ""
@@ -306,22 +323,31 @@ def fetch_profile_metadata(url: str, platform: str) -> Dict[str, Any]:
     if image:
         meta["image"] = image
 
-    # Parsed once in _load_page: verified badge, private flag (IG — explicit
-    # "is_private":true only), and every social profile the page links to (the
-    # back-link signal the pipeline checks against the client's own handles).
-    if facts["verified"]:
+    # Enrichment-only signals, parsed here rather than on the liveness path: the
+    # verified badge, the IG private flag (explicit "is_private":true only), the
+    # YouTube channel id, and every social profile the page links to (the back-link
+    # signal the pipeline checks against the client's own handles).
+    if re.search(r'"is_verified"\s*:\s*true|"isVerified"\s*:\s*true|"verified"\s*:\s*true',
+                 html, re.I):
         meta["verified"] = True
-    if facts["is_private"]:
+    if _page_is_private(html):
         meta["private"] = True
     if platform == "YouTube":
-        # The URL's own /channel/UC... id is authoritative; the page's own id (from
-        # _load_page) is used only for a /@handle or /user/ form that lacks one.
+        # The URL's own /channel/UC... id is authoritative; the page's own id is used
+        # only for a /@handle or /user/ form that doesn't already carry the id.
         m = _YT_CHANNEL_ID_PATH_RE.search(url)
-        cid = m.group(1) if m else facts["channel_id"]
+        cid = m.group(1) if m else _youtube_channel_id_from_html(html)
         if cid:
             meta["channel_id"] = cid
-    if facts["profile_links"]:
-        meta["profile_links"] = facts["profile_links"]
+    try:
+        # Imported lazily — bio_links imports this module, so a top-level import
+        # would be circular.
+        from app.discovery import bio_links as bio_link_service
+        links = bio_link_service.links_by_platform(html, exclude_url=url)
+        if links:
+            meta["profile_links"] = links
+    except Exception as exc:  # noqa: BLE001 — enrichment must never raise
+        print(f"  [PROFILE] link scan failed {url[:60]}… : {exc.__class__.__name__}")
 
     # Drop empty values so the LLM payload stays clean.
     meta = {k: v for k, v in meta.items() if v not in ("", None)}

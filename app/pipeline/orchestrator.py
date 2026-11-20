@@ -918,7 +918,58 @@ def _resolve_platform_serper(
     # candidates, so this is one fetch, not two.)
     _enrich_candidates(candidates, platform)
     _tag_backlinks(candidates, input_handles_for_backlink or {}, options)
-    return _verify(platform, wiki_meta, candidates, options)
+    result = _verify(platform, wiki_meta, candidates, options)
+    # Lever #1: the client's OWN handle is their declared source of truth — do not
+    # let a different (official/campaign) account override it when the supplied
+    # handle itself checks out. Re-verified platforms (FB/X/TikTok) only.
+    return _prefer_supplied_handle(result, platform, known_url, candidates,
+                                   wiki_meta, options)
+
+
+def _prefer_supplied_handle(
+    result: VerificationResult, platform: str, known_url: str,
+    candidates: List[dict], wiki_meta: wikipedia_service.WikiMetadata,
+    options: search_options.SearchOptions,
+) -> VerificationResult:
+    """
+    Keep the client's SUPPLIED handle over a DIFFERENT discovered one — but only
+    when the supplied handle itself verifies (live + name-match, judged by the same
+    ``_verify`` guards and the evidence it already carries). The input file's handle
+    is the client's declared truth, so a different-but-also-valid 'official' account
+    must not silently replace it. When the supplied handle cannot be confirmed
+    (dead / wrong / a different person), the discovered result stands — a stale or
+    wrong supplied handle is never forced through, so this can only move a cell
+    toward the client's own answer, never away from a confirmed one.
+
+    Scope: the RE-VERIFIED platforms only (Facebook / X / TikTok). Instagram and
+    YouTube are confirmed as trusted anchors in Phase 0 and are untouched here.
+    """
+    if platform in _TRUSTED_INPUT_PLATFORMS or not known_url:
+        return result
+    supplied = social_urls.normalize_profile_url(known_url, platform).lower()
+    chosen = social_urls.normalize_profile_url(result.best_candidate or "", platform).lower()
+    if chosen == supplied:
+        return result          # verification already landed on the client's handle
+    input_cand = next(
+        (c for c in candidates
+         if social_urls.normalize_profile_url(c.get("url", ""), platform).lower() == supplied),
+        None,
+    )
+    if input_cand is None:
+        return result          # supplied handle isn't a live candidate (dropped/rejected)
+    # Judge the supplied handle ALONE, with the evidence it already carries.
+    verdict = _verify(platform, wiki_meta, [input_cand], options)
+    if verdict.status != STATUS_VERIFIED:
+        return result          # supplied handle not confirmable -> keep discovery's pick
+    print(f"  [INPUT-PREFERRED] {platform} | {wiki_meta.name or ''} -> kept client handle "
+          f"'{known_url}' over discovered '{result.best_candidate}'")
+    return VerificationResult(
+        platform=platform, best_candidate=verdict.best_candidate or known_url,
+        status=STATUS_VERIFIED, confidence=verdict.confidence or 90,
+        decision="verified", source="Input file (client handle kept)",
+        reason=("The client supplied this handle and it verifies as the talent, so it "
+                "is kept over a different discovered account."),
+    )
 
 
 def _apify_backup_platform(
@@ -1282,40 +1333,6 @@ def _row_bio_link_phase(
 # ────────────────────────────────────────────────────────────────────────────
 #  Custom-mode discovery helpers
 # ────────────────────────────────────────────────────────────────────────────
-
-# Excel columns (case-insensitive) that carry a talent's profession/category,
-# used to build the custom-mode query "<name> <profession> <prompt>". An explicit
-# ``profession``/``occupation`` column wins when present (cleanest signal);
-# otherwise fall back to the taxonomy columns.
-_PROFESSION_KEYS = (
-    "profession", "occupation",
-    "title_sub_category", "title_subcategory", "sub_category", "subcategory",
-    "title_category", "category",
-    "primary_genre", "genre", "role",
-)
-
-
-def _clean_profession(value: str) -> str:
-    """
-    Strip a 'Label - Value' prefix so the query stays clean.
-    e.g. 'Talent Type - Musician' -> 'Musician', 'Actor' -> 'Actor'.
-    """
-    parts = re.split(r"\s+[-–—]\s+|:\s+", value.strip())
-    return parts[-1].strip() if parts else value.strip()
-
-
-def _detect_profession(input_metadata: Optional[Dict[str, str]]) -> str:
-    """Best-effort profession/category term from the row's Excel columns."""
-    if not input_metadata:
-        return ""
-    lowered = {str(k).lower(): v for k, v in input_metadata.items()}
-    for key in _PROFESSION_KEYS:
-        val = lowered.get(key)
-        if isinstance(val, str) and val.strip():
-            return _clean_profession(val)
-    return ""
-
-
 
 # Confidence written when a no-Wikipedia Serper hit is corroborated (its profile
 # links back to a known handle, or it reuses a distinctive known handle). Sits
@@ -1923,8 +1940,13 @@ def _corroborate_row(
                 platform, gt, [cand], is_person=wiki_meta.is_person,
                 thin_gate=options.thin_gate,
             )
-            # No private/campus re-guarding needed here: deliberately-held cells were
-            # excluded from ``rescue`` above, so only evidence-shortfall cells reach this.
+            # Re-apply the campus guard to the PROMOTED result. The ``held`` exclusion
+            # above only covers a cell the guard ALREADY downgraded; a parent/system
+            # account that reached Manual via an evidence shortfall (held=False) isn't
+            # excluded, and rescue can promote it to Verified — so re-check it here. The
+            # guard reads the URL/display name (reliable), unlike the private flag, which
+            # ``held`` already handles; private is deliberately NOT re-detected here.
+            res = _guard_subentity(res, [cand], wiki_meta.name or talent, platform)
         except Exception as exc:  # noqa: BLE001
             print(f"  [CORROBORATE] {platform} | {talent} error: {exc.__class__.__name__}")
             return platform, results[platform]
@@ -2201,30 +2223,13 @@ def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
     return talent, wiki_url, input_metadata, input_handles, yt_distributor
 
 
-def process_row(
-    df: pd.DataFrame,
-    row_label: object,
-    platform_progress: Optional[Callable[[str, str], None]] = None,
-) -> None:
-    """Single-row entry point (in place). Kept for the sequential / CLI path."""
-    talent, wiki_url, input_metadata, input_handles, yt_distributor = _row_inputs(df, row_label)
-    if not talent:
-        return
-    print(f"\n{'=' * 65}\nProcessing: {talent}")
-    result = _resolve_row_result(talent, wiki_url, input_metadata,
-                                 apify_candidates=None, platform_progress=platform_progress,
-                                 input_handles=input_handles,
-                                 yt_distributor_url=yt_distributor)
-    for col, val in result.items():
-        df.at[row_label, col] = val
-
-
 def run_pipeline_on_dataframe(
     df: pd.DataFrame,
     row_status: Optional[Callable[[int, str], None]] = None,
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     options: search_options.SearchOptions = search_options.DEFAULT,
+    checkpoint: Optional[Callable[..., None]] = None,
 ) -> pd.DataFrame:
     """
     Process every row and return the populated frame — Serper primary, Apify backup.
@@ -2235,9 +2240,16 @@ def run_pipeline_on_dataframe(
       Phase B — ONE batched Apify pass for only the talents that had a
                 non-Verified platform, then re-verify just those platforms.
 
-    Workers only compute; the DataFrame is written on the main thread as Phase B
-    futures complete, so there are no concurrent pandas writes.
+    Workers only compute; the DataFrame is written on the main thread as Phase A
+    results arrive and as Phase B futures complete, so there are no concurrent
+    pandas writes.
     ``row_status(row_index, status)`` reports per-row lifecycle ("processing"/"done").
+    ``checkpoint(df, force=False)`` — when given — is called with the live frame as
+    rows fill in, so the caller can persist partial progress; it is the hook that
+    lets a stopped/crashed run keep the work done so far instead of losing it all.
+    It is forced once at the end of Phase A (before the batched Apify pass, the
+    riskiest stretch) so that checkpoint is never throttled away. Always invoked on
+    the main thread.
     """
     df = df.copy()
     for col in excel_service.ordered_columns():
@@ -2336,6 +2348,21 @@ def run_pipeline_on_dataframe(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for res in pool.map(_phase_a, rows):
             phase_a.append(res)
+            # Write this row's PROVISIONAL (Serper-only) result into the frame as
+            # soon as it is known — the same assembly the Serper companion uses
+            # below — so a checkpoint during Phase A, or a stop before the Apify
+            # batch, preserves it. Phase B overwrites it with the fuller result.
+            prov = _apply_yt_distributor_override(res["phase1"], res.get("yt_distributor", ""))
+            wiki_out = res["wiki_meta"].wikipedia_url or res.get("wiki_url", "")
+            for col, val in _assemble_row_out(prov, wiki_out).items():
+                df.at[res["row_label"], col] = val
+            if checkpoint:
+                checkpoint(df)
+    # Force a checkpoint now: Phase A is done but nothing fuller exists yet, and the
+    # batched Apify pass up next is the longest, most failure-prone stretch (a slow
+    # actor can stall it for minutes). This is the write that survives a stop there.
+    if checkpoint:
+        checkpoint(df, force=True)
 
     # ── One batched Apify pass for ONLY the talents with a non-Verified platform ──
     stopped = _is_cancelled(should_cancel)
@@ -2394,6 +2421,8 @@ def run_pipeline_on_dataframe(
                 df.at[row_label, col] = val
             if row_status:
                 row_status(idx, "done")
+            if checkpoint:
+                checkpoint(df)
             done += 1
             print(f"  [{done}/{total}] complete")
 
@@ -2417,6 +2446,7 @@ def run_pipeline_for_names(
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     options: search_options.SearchOptions = search_options.DEFAULT,
+    checkpoint: Optional[Callable[..., None]] = None,
 ) -> pd.DataFrame:
     """Names-only entry point (no Wikipedia URLs — metadata falls back to search)."""
     clean = [str(name).strip() for name in names if name and str(name).strip()]
@@ -2425,5 +2455,5 @@ def run_pipeline_for_names(
     df = excel_service.build_talent_df(clean)
     return run_pipeline_on_dataframe(
         df, row_status=row_status, platform_progress=platform_progress,
-        should_cancel=should_cancel, options=options,
+        should_cancel=should_cancel, options=options, checkpoint=checkpoint,
     )

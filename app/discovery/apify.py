@@ -43,12 +43,18 @@ from app.common.retry import request_with_retry
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "").strip()
 APIFY_ACTOR_ID = os.environ.get("APIFY_ACTOR_ID", "").strip()
 APIFY_ACTOR_INPUT = os.environ.get("APIFY_ACTOR_INPUT", "").strip()
-APIFY_TIMEOUT_SECONDS = int(os.environ.get("APIFY_TIMEOUT_SECONDS", "120"))
+# Per-run wait on run-sync-get-dataset-items. The actor is KILLED at this ceiling
+# and the endpoint returns 400, so it must comfortably exceed a chunk's real
+# runtime. A 5-name chunk was overrunning 120s (returned as a 400 "timed out" and
+# counted as 0 results); 300s leaves headroom for a slow chunk.
+APIFY_TIMEOUT_SECONDS = int(os.environ.get("APIFY_TIMEOUT_SECONDS", "300"))
 # Batch settings: how many names per actor run, and how many runs in parallel.
-# The actor rejects/times out on large runs, so we keep chunks small and get
-# throughput from running several chunks concurrently. A chunk that still fails
-# is auto-split (see _run_chunk), so a bad name never wipes out a whole batch.
-APIFY_CHUNK_SIZE = max(1, int(os.environ.get("APIFY_CHUNK_SIZE", "5")))
+# The actor times out on large runs, so we keep chunks small and get throughput
+# from running several chunks concurrently. A chunk that still fails is auto-split
+# (see _run_chunk), so a bad name never wipes out a whole batch. Kept at 3 (not 5)
+# because a 5-name chunk could exceed the timeout; fewer names per run finish well
+# inside it.
+APIFY_CHUNK_SIZE = max(1, int(os.environ.get("APIFY_CHUNK_SIZE", "3")))
 APIFY_CHUNK_WORKERS = max(1, int(os.environ.get("APIFY_CHUNK_WORKERS", "4")))
 
 _APIFY_BASE = "https://api.apify.com/v2"

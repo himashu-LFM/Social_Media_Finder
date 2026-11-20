@@ -44,6 +44,17 @@ _jobs: Dict[str, Dict[str, Any]] = {}
 # flight — partial results are still assembled and saved.
 _cancel_events: Dict[str, threading.Event] = {}
 
+# Incremental checkpointing: the pipeline calls back as rows fill in, but writing
+# every tick to the remote DB would make it the bottleneck. So a checkpoint is
+# persisted at most once per _CHECKPOINT_EVERY_CALLS callback calls OR once per
+# _CHECKPOINT_EVERY_SECONDS, whichever comes first (plus any ``force=True`` call,
+# e.g. the end-of-Phase-A boundary). The pipeline calls back ~twice per row (Phase A
+# then Phase B), so this is ~40 writes for a 500-row run.
+_CHECKPOINT_EVERY_CALLS = 25
+_CHECKPOINT_EVERY_SECONDS = 30.0
+# job_id -> {"t": last_write_epoch, "c": calls_since_last_write}
+_checkpoint_state: Dict[str, Dict[str, float]] = {}
+
 
 def _cancel_event(job_id: str) -> threading.Event:
     with _jobs_lock:
@@ -104,6 +115,7 @@ def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
             entry["completed_platforms"] = list(testing.PLATFORMS.keys())
         snapshot = dict(job)          # taken under the lock, immune to eviction
     _persist(job_id, rows, snapshot=snapshot)
+    _clear_checkpoint_state(job_id)
 
 UPLOAD_DIR = ROOT / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -282,6 +294,32 @@ def _frame_to_rows(df: Any) -> List[dict]:
         return []
 
 
+def _persist_partial(job_id: str, df: Any, force: bool = False) -> None:
+    """Throttled mid-run checkpoint of the result rows.
+
+    Called by the pipeline as rows fill in. Writes the current rows to Postgres at
+    most once per _CHECKPOINT_EVERY_CALLS calls or _CHECKPOINT_EVERY_SECONDS (plus
+    any forced call), so a stopped/crashed run keeps the work done so far instead
+    of losing it all. Best-effort end to end: serialisation returns [] on error and
+    ``save_job_rows`` never raises, so a checkpoint can never break the run.
+    """
+    now = time.time()
+    with _jobs_lock:
+        st = _checkpoint_state.setdefault(job_id, {"t": 0.0, "c": 0.0})
+        st["c"] += 1
+        due = (force or st["c"] >= _CHECKPOINT_EVERY_CALLS
+               or (now - st["t"]) >= _CHECKPOINT_EVERY_SECONDS)
+        if not due:
+            return
+        st["t"], st["c"] = now, 0.0
+    db_service.save_job_rows(job_id, _frame_to_rows(df))
+
+
+def _clear_checkpoint_state(job_id: str) -> None:
+    with _jobs_lock:
+        _checkpoint_state.pop(job_id, None)
+
+
 def _run_job(job_id: str, names: List[str],
              options: search_options.SearchOptions = search_options.DEFAULT) -> None:
     def row_status(row_index: int, status: str) -> None:
@@ -310,6 +348,7 @@ def _run_job(job_id: str, names: List[str],
             platform_progress=platform_progress,
             should_cancel=_cancel_event(job_id).is_set,
             options=options,
+            checkpoint=lambda df, force=False: _persist_partial(job_id, df, force),
         )
 
         out_path, serper_path, compact_path = _persist_outputs(final_df)
@@ -322,6 +361,7 @@ def _run_job(job_id: str, names: List[str],
                 job["error"] = str(exc)
                 _stamp_finished(job)
         _persist(job_id)
+        _clear_checkpoint_state(job_id)
 
 
 def _run_job_from_file(job_id: str, path: Path,
@@ -353,6 +393,7 @@ def _run_job_from_file(job_id: str, path: Path,
             platform_progress=platform_progress,
             should_cancel=_cancel_event(job_id).is_set,
             options=options,
+            checkpoint=lambda df, force=False: _persist_partial(job_id, df, force),
         )
 
         out_path, serper_path, compact_path = _persist_outputs(final_df)
@@ -365,6 +406,7 @@ def _run_job_from_file(job_id: str, path: Path,
                 job["error"] = str(exc)
                 _stamp_finished(job)
         _persist(job_id)
+        _clear_checkpoint_state(job_id)
     finally:
         try:
             path.unlink(missing_ok=True)

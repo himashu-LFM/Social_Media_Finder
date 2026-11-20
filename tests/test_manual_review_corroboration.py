@@ -222,3 +222,25 @@ def test_corroboration_still_rescues_an_evidence_shortfall_cell(monkeypatch):
     out = vp._corroborate_row(
         "UC Berkeley", _wiki.WikiMetadata(talent="UC Berkeley", name="UC Berkeley"), results, DEFAULT)
     assert out["X"].status == vp.STATUS_VERIFIED
+
+
+def test_rescue_does_not_promote_a_campus_parent_from_an_evidence_shortfall(monkeypatch):
+    # A campus subject's PARENT channel that reached Manual via an evidence shortfall
+    # (held=False, so NOT excluded from rescue) must still not be promoted: the campus
+    # guard is re-applied to the rescued result and downgrades the parent back to Manual.
+    # (The ``held`` exclusion alone wouldn't catch this — the guard only ran on Verified.)
+    monkeypatch.setattr(vp, "_drop_missing_profiles", lambda cands, platform: cands)
+    monkeypatch.setattr(vp, "_enrich_candidates", lambda cands, platform: None)
+    monkeypatch.setattr(vp.verification_service, "verify_platform", _always_verified)
+
+    results = {
+        "YouTube": _mr("https://www.youtube.com/user/Rutgers", vp.STATUS_MANUAL, "YouTube"),  # held=False
+        "Instagram": _mr("https://www.instagram.com/rutgerscamden", vp.STATUS_VERIFIED, "Instagram"),
+    }
+    out = vp._corroborate_row(
+        "Rutgers University (Camden) - DAR",
+        _wiki.WikiMetadata(talent="Rutgers University (Camden) - DAR",
+                           name="Rutgers University (Camden) - DAR"),
+        results, DEFAULT)
+    assert out["YouTube"].status == vp.STATUS_MANUAL
+    assert "camden" in (out["YouTube"].reason or "").lower()
