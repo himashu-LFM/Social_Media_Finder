@@ -1011,20 +1011,29 @@ def api_results_latest(job_id: Optional[str] = None,
     """
     if job_id:
         status = _job_status(job_id)
-        # A queued/running job's DB rows are a mid-run checkpoint, not final results,
-        # so don't serve them as if the run were done — report pending so the UI keeps
+        # A queued/running job's rows are a mid-run checkpoint, not final results, so
+        # don't serve them as if the run were done — report pending so the UI keeps
         # showing progress. Failed/cancelled rows ARE served, but flagged ``partial``.
         if status in ("queued", "running", "cancelling"):
             return {"rows": [], "filename": None, "warning": None,
                     "error": None, "pending": True}
+        partial = status in ("failed", "cancelled")
+        # Prefer this instance's in-memory result_rows. _finalize_job sets them WITH the
+        # status under _jobs_lock, so they are always this job's FINAL rows. The DB is
+        # written a moment later (outside that lock), so reading job.rows here instead
+        # would race the finalize and serve the last mid-run checkpoint as if final.
+        mem = _in_memory_result_rows(job_id)
+        if mem is not None:
+            return {"rows": mem, "filename": None, "warning": None, "error": None,
+                    "source": "memory", "partial": partial}
+        # Not on this instance (restart / another container): the DB record is durable
+        # and its status+rows were written together, so it is internally consistent.
         stored = db_service.load_job_rows(job_id)
         if stored:
             return {"rows": stored, "filename": None, "warning": None, "error": None,
-                    "source": "database", "partial": status in ("failed", "cancelled")}
-    # In-memory tool-schema rows (single instance / no DB). Needed because the
-    # exported workbook is now the client's brand-report format and cannot be
-    # re-parsed into the results schema. The Analysis page calls this without a
-    # job_id, so fall back to the most recent completed job's rows.
+                    "source": "database", "partial": partial}
+    # No job_id (the Analysis page) — fall back to the most recent in-memory rows, then
+    # the newest file on disk.
     mem_rows = _in_memory_result_rows(job_id)
     if mem_rows:
         return {"rows": mem_rows, "filename": None, "warning": None,

@@ -172,3 +172,32 @@ def test_unreached_rows_checkpoint_as_not_checked(monkeypatch):
     assert str(first.iloc[0][ex.status_col("Instagram")]) != vs.STATUS_STOPPED   # processed
     assert str(first.iloc[-1][ex.status_col("Instagram")]) == vs.STATUS_STOPPED  # unreached
     assert str(first.iloc[-1][ex.reason_col("Instagram")]) == vp.NOT_REACHED_REASON
+
+
+def test_completed_job_prefers_in_memory_rows_over_stale_db(monkeypatch):
+    """Race guard: _finalize_job flips status to 'completed' in memory BEFORE writing the
+    final rows to the DB. In that window the endpoint must serve the in-memory (final)
+    result_rows, never the stale last checkpoint still sitting in the DB."""
+    from app import main
+    monkeypatch.setattr(main.db_service, "load_job_rows", lambda job_id: [{"Talent": "STALE"}])
+    main._jobs["job-x"] = {"status": "completed", "result_rows": [{"Talent": "FINAL"}]}
+    try:
+        resp = main.api_results_latest(job_id="job-x", user=None)
+    finally:
+        main._jobs.pop("job-x", None)
+    assert resp["rows"] == [{"Talent": "FINAL"}]       # in-memory, not the stale DB checkpoint
+    assert resp.get("source") == "memory"
+    assert resp.get("partial") is False
+
+
+def test_cancelled_in_memory_rows_are_flagged_partial(monkeypatch):
+    """A cancelled job served from its in-memory result_rows must still carry partial=True,
+    so the UI shows the 'did not finish' banner."""
+    from app import main
+    monkeypatch.setattr(main.db_service, "load_job_rows", lambda job_id: [{"Talent": "DB"}])
+    main._jobs["job-c"] = {"status": "cancelled", "result_rows": [{"Talent": "PARTIAL"}]}
+    try:
+        resp = main.api_results_latest(job_id="job-c", user=None)
+    finally:
+        main._jobs.pop("job-c", None)
+    assert resp["rows"] == [{"Talent": "PARTIAL"}] and resp.get("partial") is True
