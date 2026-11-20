@@ -16,6 +16,9 @@ from app.platforms import social_urls as su
     ("https://www.tiktok.com/@someone", "TikTok"),
     ("https://x.com/someone", "X"),
     ("https://twitter.com/someone", "X"),
+    # A non-numeric "/pages/<vanity>" page is a real page URL — only the old
+    # numeric-id form is non-canonical and rejected (see the reject cases below).
+    ("https://www.facebook.com/pages/Some-Org", "Facebook"),
 ])
 def test_accepts_real_profile_urls(url, platform):
     assert su.is_valid_profile_url(url, platform)
@@ -30,6 +33,8 @@ def test_accepts_real_profile_urls(url, platform):
     ("https://x.com/search", "X"),
     ("https://www.tiktok.com/@someone/video/123", "TikTok"),
     ("https://www.facebook.com/someone/posts/123", "Facebook"),
+    ("https://www.facebook.com/pages/New-York-University/103256838688", "Facebook"),  # old /pages/ format
+    ("https://m.facebook.com/pages/Some-Name/999", "Facebook"),
     ("ftp://www.instagram.com/someone", "Instagram"),           # wrong scheme
 ])
 def test_rejects_non_profile_urls(url, platform):

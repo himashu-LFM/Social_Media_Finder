@@ -44,6 +44,17 @@ _jobs: Dict[str, Dict[str, Any]] = {}
 # flight — partial results are still assembled and saved.
 _cancel_events: Dict[str, threading.Event] = {}
 
+# Incremental checkpointing: the pipeline calls back as rows fill in, but writing
+# every tick to the remote DB would make it the bottleneck. So a checkpoint is
+# persisted at most once per _CHECKPOINT_EVERY_CALLS callback calls OR once per
+# _CHECKPOINT_EVERY_SECONDS, whichever comes first (plus any ``force=True`` call,
+# e.g. the end-of-Phase-A boundary). The pipeline calls back ~twice per row (Phase A
+# then Phase B), so this is ~40 writes for a 500-row run.
+_CHECKPOINT_EVERY_CALLS = 25
+_CHECKPOINT_EVERY_SECONDS = 30.0
+# job_id -> {"t": last_write_epoch, "c": calls_since_last_write}
+_checkpoint_state: Dict[str, Dict[str, float]] = {}
+
 
 def _cancel_event(job_id: str) -> threading.Event:
     with _jobs_lock:
@@ -72,6 +83,13 @@ def _persist(job_id: str, rows: Optional[List[dict]] = None,
         db_service.save_job(job_id, job, rows)
 
 
+def _stamp_finished(job: Dict[str, Any]) -> None:
+    """Record the run's end time and total execution time (seconds)."""
+    job["finished_at"] = time.time()
+    started = job.get("started_at")
+    job["duration_seconds"] = round(job["finished_at"] - started, 1) if started else None
+
+
 def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
                   compact_path: Optional[str] = None,
                   rows: Optional[List[dict]] = None) -> None:
@@ -82,6 +100,7 @@ def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
             return
         was_cancelled = job_id in _cancel_events and _cancel_events[job_id].is_set()
         job["status"] = "cancelled" if was_cancelled else "completed"
+        _stamp_finished(job)
         job["output_path"] = out_path
         job["serper_output_path"] = serper_path
         job["compact_output_path"] = compact_path
@@ -96,6 +115,7 @@ def _finalize_job(job_id: str, out_path: str, serper_path: Optional[str],
             entry["completed_platforms"] = list(testing.PLATFORMS.keys())
         snapshot = dict(job)          # taken under the lock, immune to eviction
     _persist(job_id, rows, snapshot=snapshot)
+    _clear_checkpoint_state(job_id)
 
 UPLOAD_DIR = ROOT / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -274,6 +294,32 @@ def _frame_to_rows(df: Any) -> List[dict]:
         return []
 
 
+def _persist_partial(job_id: str, df: Any, force: bool = False) -> None:
+    """Throttled mid-run checkpoint of the result rows.
+
+    Called by the pipeline as rows fill in. Writes the current rows to Postgres at
+    most once per _CHECKPOINT_EVERY_CALLS calls or _CHECKPOINT_EVERY_SECONDS (plus
+    any forced call), so a stopped/crashed run keeps the work done so far instead
+    of losing it all. Best-effort end to end: serialisation returns [] on error and
+    ``save_job_rows`` never raises, so a checkpoint can never break the run.
+    """
+    now = time.time()
+    with _jobs_lock:
+        st = _checkpoint_state.setdefault(job_id, {"t": 0.0, "c": 0.0})
+        st["c"] += 1
+        due = (force or st["c"] >= _CHECKPOINT_EVERY_CALLS
+               or (now - st["t"]) >= _CHECKPOINT_EVERY_SECONDS)
+        if not due:
+            return
+        st["t"], st["c"] = now, 0.0
+    db_service.save_job_rows(job_id, _frame_to_rows(df))
+
+
+def _clear_checkpoint_state(job_id: str) -> None:
+    with _jobs_lock:
+        _checkpoint_state.pop(job_id, None)
+
+
 def _run_job(job_id: str, names: List[str],
              options: search_options.SearchOptions = search_options.DEFAULT) -> None:
     def row_status(row_index: int, status: str) -> None:
@@ -293,6 +339,7 @@ def _run_job(job_id: str, names: List[str],
     try:
         with _jobs_lock:
             _jobs[job_id]["status"] = "running"
+            _jobs[job_id]["started_at"] = time.time()
         _persist(job_id)
 
         final_df = testing.run_pipeline_for_names(
@@ -301,6 +348,7 @@ def _run_job(job_id: str, names: List[str],
             platform_progress=platform_progress,
             should_cancel=_cancel_event(job_id).is_set,
             options=options,
+            checkpoint=lambda df, force=False: _persist_partial(job_id, df, force),
         )
 
         out_path, serper_path, compact_path = _persist_outputs(final_df)
@@ -311,7 +359,9 @@ def _run_job(job_id: str, names: List[str],
             if job:
                 job["status"] = "failed"
                 job["error"] = str(exc)
+                _stamp_finished(job)
         _persist(job_id)
+        _clear_checkpoint_state(job_id)
 
 
 def _run_job_from_file(job_id: str, path: Path,
@@ -333,6 +383,7 @@ def _run_job_from_file(job_id: str, path: Path,
     try:
         with _jobs_lock:
             _jobs[job_id]["status"] = "running"
+            _jobs[job_id]["started_at"] = time.time()
         _persist(job_id)
 
         df = testing.load_talent_table_from_path(path)
@@ -342,6 +393,7 @@ def _run_job_from_file(job_id: str, path: Path,
             platform_progress=platform_progress,
             should_cancel=_cancel_event(job_id).is_set,
             options=options,
+            checkpoint=lambda df, force=False: _persist_partial(job_id, df, force),
         )
 
         out_path, serper_path, compact_path = _persist_outputs(final_df)
@@ -352,7 +404,9 @@ def _run_job_from_file(job_id: str, path: Path,
             if job:
                 job["status"] = "failed"
                 job["error"] = str(exc)
+                _stamp_finished(job)
         _persist(job_id)
+        _clear_checkpoint_state(job_id)
     finally:
         try:
             path.unlink(missing_ok=True)
@@ -713,6 +767,9 @@ def start_job(body: StartJobBody,
             ],
             "output_path": None,
             "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "duration_seconds": None,
             "started_by": _uid(user),
             "search_mode": options.mode,
             "prompt": options.prompt,
@@ -796,6 +853,9 @@ async def start_job_from_upload(file: UploadFile = File(...),
             ],
             "output_path": None,
             "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "duration_seconds": None,
             "source_filename": raw_name,
             "started_by": _uid(user),
             "search_mode": options.mode,
@@ -930,6 +990,18 @@ def _read_rows_response(paths: List[Path]) -> dict[str, Any]:
     }
 
 
+def _job_status(job_id: Optional[str]) -> Optional[str]:
+    """A job's lifecycle status from memory, falling back to the durable DB record."""
+    if not job_id:
+        return None
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job:
+            return job.get("status")
+    stored = db_service.load_job(job_id)
+    return stored.get("status") if stored else None
+
+
 @app.get("/api/results/latest")
 def api_results_latest(job_id: Optional[str] = None,
                        user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
@@ -937,14 +1009,31 @@ def api_results_latest(job_id: Optional[str] = None,
     Final results as JSON. When ``job_id`` is supplied, serves that job's own
     output (never an older run); otherwise the newest Talent_Social_Lookup_*.xlsx.
     """
-    stored = db_service.load_job_rows(job_id) if job_id else None
-    if stored:
-        return {"rows": stored, "filename": None, "warning": None,
-                "error": None, "source": "database"}
-    # In-memory tool-schema rows (single instance / no DB). Needed because the
-    # exported workbook is now the client's brand-report format and cannot be
-    # re-parsed into the results schema. The Analysis page calls this without a
-    # job_id, so fall back to the most recent completed job's rows.
+    if job_id:
+        status = _job_status(job_id)
+        # A queued/running job's rows are a mid-run checkpoint, not final results, so
+        # don't serve them as if the run were done — report pending so the UI keeps
+        # showing progress. Failed/cancelled rows ARE served, but flagged ``partial``.
+        if status in ("queued", "running", "cancelling"):
+            return {"rows": [], "filename": None, "warning": None,
+                    "error": None, "pending": True}
+        partial = status in ("failed", "cancelled")
+        # Prefer this instance's in-memory result_rows. _finalize_job sets them WITH the
+        # status under _jobs_lock, so they are always this job's FINAL rows. The DB is
+        # written a moment later (outside that lock), so reading job.rows here instead
+        # would race the finalize and serve the last mid-run checkpoint as if final.
+        mem = _in_memory_result_rows(job_id)
+        if mem is not None:
+            return {"rows": mem, "filename": None, "warning": None, "error": None,
+                    "source": "memory", "partial": partial}
+        # Not on this instance (restart / another container): the DB record is durable
+        # and its status+rows were written together, so it is internally consistent.
+        stored = db_service.load_job_rows(job_id)
+        if stored:
+            return {"rows": stored, "filename": None, "warning": None, "error": None,
+                    "source": "database", "partial": partial}
+    # No job_id (the Analysis page) — fall back to the most recent in-memory rows, then
+    # the newest file on disk.
     mem_rows = _in_memory_result_rows(job_id)
     if mem_rows:
         return {"rows": mem_rows, "filename": None, "warning": None,
@@ -1135,11 +1224,22 @@ def get_job(job_id: str,
             user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
     with _jobs_lock:
         job = _jobs.get(job_id)
+    restored = False
     if not job:
         # Not in memory: either this process restarted, or another instance owns
         # it. Postgres is the durable record, so try there before 404-ing.
         job = db_service.load_job(job_id)
-        if job:
-            return {"job_id": job_id, "restored_from_db": True, **job}
-        raise HTTPException(status_code=404, detail="Unknown job_id.")
-    return {"job_id": job_id, **job}
+        if not job:
+            raise HTTPException(status_code=404, detail="Unknown job_id.")
+        restored = True
+    resp: dict[str, Any] = {"job_id": job_id, **job}
+    if restored:
+        resp["restored_from_db"] = True
+    # Server-computed elapsed for a still-running job, so the client can tick the
+    # timer from an authoritative value instead of mixing its own clock with the
+    # backend's epoch (which skews when the two clocks disagree). Once the run ends
+    # duration_seconds is authoritative, so no elapsed is sent.
+    started = job.get("started_at")
+    if started and job.get("duration_seconds") is None:
+        resp["elapsed_seconds"] = round(time.time() - float(started), 1)
+    return resp

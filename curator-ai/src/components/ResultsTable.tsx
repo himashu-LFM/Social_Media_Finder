@@ -451,7 +451,7 @@ export function ResultsTable({ rows, notice }: { rows: ResultRow[]; notice?: Rea
             <table className="sc-data cols" style={{ minWidth: 1080 }}>
               <thead>
                 <tr>
-                  <th style={{ width: 170 }}>Talent</th>
+                  <th style={{ width: 190 }}>Talent</th>
                   {RESULT_PLATFORMS.map((p) => (
                     <th key={p.key}>
                       <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
@@ -481,7 +481,8 @@ export function ResultsTable({ rows, notice }: { rows: ResultRow[]; notice?: Rea
                           fontSize: 12.5,
                           fontWeight: 700,
                           color: "#f1f5f9",
-                          whiteSpace: "nowrap",
+                          lineHeight: 1.25,
+                          overflowWrap: "anywhere",
                         }}
                       >
                         {r.name}

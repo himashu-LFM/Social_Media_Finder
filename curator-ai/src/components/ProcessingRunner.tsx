@@ -76,12 +76,30 @@ type JobPollPayload = {
     completed_platforms?: string[];
   }[];
   error?: string | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+  duration_seconds?: number | null;
+  elapsed_seconds?: number | null;
 };
+
+/** Seconds -> "m:ss" (or "h:mm:ss" past an hour) for the execution timer. */
+function formatDuration(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
 
 const EMPTY_PLATFORM_PROGRESS: RowPlatformProgress = {
   currentPlatform: null,
   completedPlatforms: [],
 };
+
+// Consecutive failed job-status polls tolerated before surfacing a backend error.
+// Keeps one transient blip from freezing the timer or flashing a disconnect notice.
+const MAX_POLL_FAILURES = 3;
 
 function platformProgressFromEntry(entry: JobPollPayload["names"][number]): RowPlatformProgress {
   return {
@@ -127,6 +145,21 @@ export function ProcessingRunner() {
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previousDoneCountRef = useRef(0);
   const previousActiveIndexRef = useRef(-1);
+  // Transient poll failures are tolerated: one blip must not freeze the timer or
+  // flash an error. Only a sustained outage surfaces backendError.
+  const consecutiveFailuresRef = useRef(0);
+
+  // Execution timer. The backend sends an authoritative ``elapsed_seconds`` each
+  // poll; we tick from that plus the local time since it arrived, so the client
+  // clock is only ever used for the sub-poll delta — never mixed with the server's
+  // epoch (which skews when the clocks disagree). ``serverElapsedRef`` is that last
+  // server value and ``serverElapsedAtRef`` the Date.now() when we received it.
+  // ``startMsRef`` is the fallback anchor for the demo run (no backend elapsed).
+  const serverElapsedRef = useRef<number | null>(null);
+  const serverElapsedAtRef = useRef<number>(0);
+  const startMsRef = useRef<number | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [finalSeconds, setFinalSeconds] = useState<number | null>(null);
 
   const doneCount = useMemo(
     () => statuses.filter((s) => s === "done").length,
@@ -136,6 +169,21 @@ export function ProcessingRunner() {
   const allDone = total > 0 && doneCount === total;
   const currentNameIndex = statuses.findIndex((s) => s === "processing");
   const remainingCount = Math.max(0, total - doneCount);
+
+  // Finer-grained progress: count completed platform-steps across every row, not
+  // whole rows. With rows running in parallel, a row-only percent sits flat then
+  // jumps at the end; this advances as each platform on each row completes.
+  const platformStepCount = SOCIAL_PLATFORM_STEPS.length;
+  const doneSteps = useMemo(
+    () =>
+      statuses.reduce((acc, s, i) => {
+        if (s === "done") return acc + platformStepCount;
+        const done = rowPlatformProgress[i]?.completedPlatforms.length ?? 0;
+        return acc + Math.min(done, platformStepCount);
+      }, 0),
+    [statuses, rowPlatformProgress, platformStepCount],
+  );
+  const totalSteps = total * platformStepCount;
 
   useEffect(() => {
     setMounted(true);
@@ -258,10 +306,27 @@ export function ProcessingRunner() {
           return;
         }
         if (!res.ok) {
-          setBackendError(`Job status error (${res.status})`);
+          // A transient non-404 (e.g. a brief 5xx) must not freeze the run — retry
+          // quietly and only surface an error after several consecutive failures.
+          consecutiveFailuresRef.current += 1;
+          if (consecutiveFailuresRef.current >= MAX_POLL_FAILURES) {
+            setBackendError(`Job status error (${res.status})`);
+          }
           return;
         }
         const data = (await res.json()) as JobPollPayload;
+        // A good poll clears any transient error and resets the failure count.
+        consecutiveFailuresRef.current = 0;
+        setBackendError((prev) => (prev ? null : prev));
+        // Timer: tick from the backend's authoritative elapsed (reload-safe, no
+        // clock mixing); take its final total once the run ends.
+        if (typeof data.elapsed_seconds === "number") {
+          serverElapsedRef.current = data.elapsed_seconds;
+          serverElapsedAtRef.current = Date.now();
+        }
+        if (typeof data.duration_seconds === "number") {
+          setFinalSeconds(data.duration_seconds);
+        }
         const next = data.names.map((n) => n.status);
         const nextPlatformProgress = data.names.map((entry) => platformProgressFromEntry(entry));
         const nextDoneCount = next.filter((s) => s === "done").length;
@@ -314,11 +379,16 @@ export function ProcessingRunner() {
           }
         }
       } catch {
-        setBackendError("Cannot reach the Python API.");
-        pushToast("Python API disconnected.", "error");
-        if (pollTimerRef.current) {
-          clearInterval(pollTimerRef.current);
-          pollTimerRef.current = null;
+        // Network blip — tolerate a few before declaring the API unreachable, so a
+        // single dropped request doesn't stop polling or freeze the timer.
+        consecutiveFailuresRef.current += 1;
+        if (consecutiveFailuresRef.current >= MAX_POLL_FAILURES) {
+          setBackendError("Cannot reach the Python API.");
+          pushToast("Python API disconnected.", "error");
+          if (pollTimerRef.current) {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+          }
         }
       }
     }
@@ -367,13 +437,45 @@ export function ProcessingRunner() {
       pushToast("Could not reach the API to stop the run.", "error");
     }
   }
+  // Live execution timer: ticks once a second while a run is in progress. The final
+  // total comes from the backend (``finalSeconds``); this only drives the live
+  // count-up. For a backend run it extrapolates from the last server-reported
+  // ``elapsed_seconds`` plus the local time since — so the client clock is used only
+  // for the sub-poll delta, not mixed with the server epoch. The demo run (no backend
+  // elapsed) falls back to a plain client anchor.
+  useEffect(() => {
+    const active =
+      (source === "python" || source === "demo") &&
+      total > 0 &&
+      !allDone &&
+      !runCancelled &&
+      !backendError;
+    if (!active) return;
+    const tick = () => {
+      if (serverElapsedRef.current !== null) {
+        const sinceServer = (Date.now() - serverElapsedAtRef.current) / 1000;
+        setElapsedSeconds(Math.floor(serverElapsedRef.current + Math.max(0, sinceServer)));
+      } else {
+        if (startMsRef.current === null) startMsRef.current = Date.now();
+        setElapsedSeconds(Math.floor((Date.now() - startMsRef.current) / 1000));
+      }
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [source, total, allDone, runCancelled, backendError]);
+
   /* ── render ─────────────────────────────────────────────────────────────
      The Claude Design handoff's Processing page: a run summary naming the row
      being worked on, the four pipeline phases, and a platform-wise tracker.
      The chrome comes from AppShell so the rail, header and stage strip match
      every other page. */
 
-  const pct = total ? Math.round((doneCount / total) * 100) : 0;
+  const pct = totalSteps ? Math.round((doneSteps / totalSteps) * 100) : 0;
+  // What the timer shows: the backend's authoritative total once finished, else
+  // the live client-side count-up.
+  const timerSeconds =
+    (allDone || runCancelled) && finalSeconds !== null ? finalSeconds : elapsedSeconds;
   const activeName = currentNameIndex >= 0 ? names?.[currentNameIndex] : undefined;
   const liveMessage = LIVE_MESSAGES[currentStepIndex % LIVE_MESSAGES.length];
   const isWaitingForFirstRow = !allDone && doneCount === 0 && currentNameIndex < 0;
@@ -518,6 +620,12 @@ export function ProcessingRunner() {
             <span className="sc-metric">
               <span className="sc-metric-label">Remaining</span>
               <span className="sc-metric-value">{remainingCount}</span>
+            </span>
+            <span className="sc-metric">
+              <span className="sc-metric-label">
+                {allDone || runCancelled ? "Total time" : "Elapsed"}
+              </span>
+              <span className="sc-metric-value">{formatDuration(timerSeconds)}</span>
             </span>
             <span className="sc-metric">
               <span className="sc-metric-label">Workbook</span>

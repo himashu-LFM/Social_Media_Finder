@@ -128,6 +128,10 @@ save_output = excel_service.save_output
 # stopped the run. Kept inside the existing 4 statuses (Not Found) so the export
 # schema and the UI legend stay unchanged.
 CANCELLED_REASON = "Run stopped by user before this platform was searched."
+# Seeded on a row the pipeline has not reached yet, so a mid-run checkpoint or a
+# crash-rebuilt export carries an explanation next to its "Not Checked" status rather
+# than a bare blank cell. Overwritten the moment the row is actually verified.
+NOT_REACHED_REASON = "Not checked — the run ended before this row was processed."
 
 
 def _is_cancelled(should_cancel: Optional[Callable[[], bool]]) -> bool:
@@ -146,16 +150,31 @@ def _is_cancelled(should_cancel: Optional[Callable[[], bool]]) -> bool:
 
 def _add_candidate(candidates: List[dict], seen: set, platform: str, url: str,
                    source: str, meta: Optional[dict] = None) -> None:
-    """Append a validated, de-duplicated candidate to the working list."""
+    """Append a validated, de-duplicated candidate to the working list.
+
+    On a duplicate URL, merge the newcomer's evidence into the stored candidate
+    (fill-only, never overwrite) so a client handle that Serper also found keeps
+    that evidence instead of facing the evidence floor empty (gap #1).
+    """
     if not url or social_urls.platform_from_url(url) != platform:
         return
     if not social_urls.is_valid_profile_url(url, platform):
         return
     norm = social_urls.normalize_profile_url(url, platform)
+    new_meta = dict(meta or {})
     if norm in seen:
+        if new_meta:
+            existing = next((c for c in candidates if c["url"] == norm), None)
+            if existing is not None:
+                dst = existing.setdefault("meta", {})
+                for key, value in new_meta.items():
+                    if value in ("", None, [], {}):
+                        continue
+                    if dst.get(key) in ("", None, [], {}):
+                        dst[key] = value
         return
     seen.add(norm)
-    candidates.append({"url": norm, "source": source, "meta": dict(meta or {})})
+    candidates.append({"url": norm, "source": source, "meta": new_meta})
 
 
 def _serper_primary_candidate(
@@ -218,30 +237,138 @@ def _enrich_candidates(candidates: List[dict], platform: str) -> None:
                 merged.update({k: v for k, v in cand["meta"].items() if v not in ("", None)})
                 cand["meta"] = merged
         cand["_enriched"] = True
-    # Supplement with OG-tag profile metadata ONLY where it works — Facebook and
-    # YouTube expose OG tags (verified badge / bio / followers). Instagram, TikTok
-    # and X block it and return nothing, so we skip the wasted fetch there.
+    # Supplement with OG-tag profile metadata where it works — Facebook, YouTube and
+    # Instagram expose OG tags (verified badge / bio / followers / private flag) to
+    # the OG-scraper UA. TikTok and X return nothing, so we skip the wasted fetch.
     if platform in _OG_FETCH_PLATFORMS:
         profile_metadata.enrich_candidates(candidates, platform)
 
 
 def _drop_missing_profiles(candidates: List[dict], platform: str) -> List[dict]:
     """
-    Remove candidates the platform itself reports as non-existent (hard 404).
+    Remove candidates the platform itself reports as non-existent.
 
-    A guessed handle can otherwise pick up plausible-looking Serper context —
-    Google returns pages about the person for a URL that was never created — and
-    get Verified. Only YouTube and X give a trustworthy signal, so only they are
-    probed; everything else passes through untouched.
+    A guessed/stale handle can otherwise pick up plausible-looking Serper context —
+    Google returns pages about the subject for a URL that was never created, or
+    for a dead Facebook vanity — and get Verified. YouTube and X give a clean 404;
+    Facebook (which 200s for everything) is judged by its OpenGraph liveness. Each
+    check is conservative, so only a candidate we are certain is dead is dropped;
+    all other platforms pass through untouched.
     """
     kept: List[dict] = []
     for cand in candidates:
         url = cand.get("url", "")
         if profile_metadata.profile_is_missing(url, platform):
-            print(f"  [DEAD] {platform} candidate does not exist (404) — dropped: {url}")
+            print(f"  [DEAD] {platform} candidate does not exist — dropped: {url}")
             continue
         kept.append(cand)
     return kept
+
+
+# Flag set on a kept private Instagram candidate so a verdict that chooses it is
+# routed to Manual Review rather than auto-Verified.
+_PRIVATE_REVIEW_FLAG = "_private_needs_review"
+
+
+def _filter_private_instagram(candidates: List[dict], platform: str) -> List[dict]:
+    """
+    Instagram only. Discard a DISCOVERED private account (usually a namesake); keep
+    but flag for Manual Review a private account that is verified or client-supplied.
+    A blocked fetch leaves no ``private`` flag, so the account is kept (conservative).
+    """
+    if platform != "Instagram":
+        return candidates
+    kept: List[dict] = []
+    for cand in candidates:
+        meta = cand.get("meta") or {}
+        if meta.get("private"):
+            if meta.get("verified") or cand.get("source") == "input":
+                cand[_PRIVATE_REVIEW_FLAG] = True
+                kept.append(cand)
+            else:
+                print(f"  [PRIVATE] Instagram discovered private account — dropped: {cand.get('url','')}")
+                continue
+        else:
+            kept.append(cand)
+    return kept
+
+
+def _route_private_to_manual(result: VerificationResult,
+                             candidates: List[dict]) -> VerificationResult:
+    """
+    Downgrade a verdict to Manual Review when the chosen Instagram candidate is a
+    kept private account (verified or client-supplied). A 'wrong' verdict stands.
+    """
+    if not result.best_candidate or result.status == STATUS_WRONG:
+        return result
+    chosen = next((c for c in candidates if c.get("url") == result.best_candidate), None)
+    if chosen and chosen.get(_PRIVATE_REVIEW_FLAG):
+        result.status = STATUS_MANUAL
+        result.held = True            # deliberate hold — never re-promote in corroboration
+        result.confidence = min(result.confidence or 60, 60)
+        if "private" not in (result.reason or "").lower():
+            result.reason = ("The account is private, so its content can't be confirmed "
+                             "or tracked — manual review needed. " + (result.reason or "")).strip()
+    return result
+
+
+# Display preference for a YouTube URL: a readable @handle beats a legacy
+# /user//c name, which beats a bare /channel/UC... id. De-dupe keys on the channel
+# id but OUTPUTS the most human-friendly form, so the result matches handle-style
+# references and reads cleanly (a /channel/UC... is only used when nothing else exists).
+def _yt_display_rank(url: str) -> int:
+    s = (url or "").lower()
+    if "youtube.com/@" in s:
+        return 0
+    if "/user/" in s or "/c/" in s:
+        return 1
+    if "/channel/" in s:
+        return 2
+    return 3
+
+
+def _collapse_youtube_duplicates(candidates: List[dict]) -> List[dict]:
+    """
+    Merge YouTube candidates with the SAME channel id (UC...) so two URL forms of one
+    channel (``/@handle`` and ``/channel/UC...``) don't compete as separate accounts.
+    The kept candidate keeps the first one's discovery source and the union of their
+    evidence, but its URL is the most human-friendly form among them (``/@handle``
+    preferred; a ``/channel/UC...`` only when no handle form was found). Candidates
+    with no resolved channel id pass through unchanged.
+    """
+    order: List[tuple] = []          # ("solo", cand) | ("group", cid)
+    groups: Dict[str, List[dict]] = {}
+    for cand in candidates:
+        cid = (cand.get("meta") or {}).get("channel_id")
+        if not cid:
+            order.append(("solo", cand))
+            continue
+        if cid not in groups:
+            groups[cid] = []
+            order.append(("group", cid))
+        groups[cid].append(cand)
+
+    out: List[dict] = []
+    for kind, ref in order:
+        if kind == "solo":
+            out.append(ref)
+            continue
+        grp = groups[ref]
+        base = dict(grp[0])                       # first candidate: keep its source/priority
+        base["meta"] = dict(grp[0].get("meta") or {})
+        for cand in grp[1:]:
+            for k, v in (cand.get("meta") or {}).items():
+                if v not in ("", None):
+                    base["meta"].setdefault(k, v)
+        urls = [c.get("url", "") for c in grp if c.get("url")]
+        best = min(urls, key=_yt_display_rank) if urls else ""
+        if _yt_display_rank(best) >= 2:           # only a bare /channel/ form available
+            best = social_urls.profile_url_from_handle(ref, "YouTube") or best
+        base["url"] = best
+        if len(grp) > 1:
+            print(f"  [YT-DEDUPE] channel {ref}: {len(grp)} forms -> {best}")
+        out.append(base)
+    return out
 
 
 def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
@@ -258,6 +385,15 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
             reason="Candidate profile(s) returned HTTP 404 — the handle does not exist.",
         )
     _enrich_candidates(candidates, platform)
+    candidates = _filter_private_instagram(candidates, platform)
+    if not candidates:
+        return VerificationResult(
+            platform=platform, status=STATUS_NOT_FOUND,
+            reason=("The only Instagram profile(s) found are private accounts, which "
+                    "cannot be tracked — discarded."),
+        )
+    if platform == "YouTube":
+        candidates = _collapse_youtube_duplicates(candidates)
     result = verification_service.verify_platform(
         platform, wiki_meta.to_prompt_dict(), candidates,
         is_person=wiki_meta.is_person, thin_gate=options.thin_gate,
@@ -265,6 +401,10 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
     result = _guard_ambiguous_identity(
         result, candidates, wiki_meta.name or wiki_meta.talent, platform
     )
+    result = _guard_subentity(
+        result, candidates, wiki_meta.name or wiki_meta.talent, platform
+    )
+    result = _route_private_to_manual(result, candidates)
     # Label where the chosen link came from, for the "<Platform> Source" column.
     _label_verify_source(result, candidates)
     return result
@@ -274,6 +414,7 @@ def _verify(platform: str, wiki_meta: wikipedia_service.WikiMetadata,
 _VERIFY_SOURCE_LABELS = {
     "input": "Input file + LLM",
     "wikidata": "Wikidata + LLM",
+    "official_website": "Official website + LLM",
     "serper": "Serper + LLM",
     "apify": "Apify + LLM",
     "handle_fanout": "Input handle reused + LLM",
@@ -364,6 +505,165 @@ def _guard_ambiguous_identity(
     )
 
 
+# ── Sub-entity (campus / branch) guard — gap #4 ──────────────────────────────
+# Stops a campus ("Rutgers University (Camden)", "... - SUNY") from resolving to
+# its parent/system account: on a VERIFIED result it re-points to the account that
+# carries the campus signal, else routes to Manual. Educational, separator-style
+# names only; concatenated sub-brands ("NYU Tisch") are out of scope for v1.
+
+# A trailing "- SUNY" marks a sub-unit of a system; an unknown tag like "- DAR" does not.
+_UNIVERSITY_SYSTEMS = frozenset({"suny", "cuny", "csu", "cu"})
+
+# The guard engages only for names containing one of these institution words.
+_INSTITUTION_WORDS = frozenset({
+    "university", "college", "institute", "school", "academy",
+    "polytechnic", "seminary", "conservatory",
+})
+# Wikipedia disambiguation parentheticals describe WHAT a thing is (a film, a band),
+# not a campus/branch — so "Old School (film)" must not read "(film)" as a campus
+# qualifier (the institution word "school" would otherwise open the gate).
+_DISAMBIG_PARENS = frozenset({
+    "film", "movie", "tv", "television", "series", "miniseries", "sitcom",
+    "album", "song", "single", "ep", "mixtape", "soundtrack", "band", "group",
+    "duo", "musician", "singer", "rapper", "dj", "producer", "novel", "book",
+    "comics", "character", "video", "game", "franchise", "company", "brand", "podcast",
+})
+
+# Generic tokens dropped when reducing a campus name to its distinctive part.
+_ORG_GENERIC_TOKENS = frozenset({"university", "college", "of", "the", "at", "and"})
+
+
+def _sig_tokens(text: str) -> set:
+    """Lower-cased alphanumeric tokens of length > 1."""
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 1}
+
+
+def _subentity_identity(talent: str) -> "tuple[set, str]":
+    """
+    ``(qualifier_tokens, full_acronym)`` for an educational campus/branch, else
+    ``(set(), "")``. Qualifier source by priority: parentheses, an EN/EM-dash tail
+    (the Wikidata campus form, ``Rutgers University–Camden``), comma, the word ``at``,
+    or — with a known hyphen system suffix (``- SUNY``) — the base's own tokens; an
+    unknown trailing hyphen tag (``- DAR``) is dropped. Acronym is the campus initialism
+    (``ucla``/``sbu``) a handle may match instead of the tokens.
+    """
+    name = (talent or "").strip()
+    if not (set(re.findall(r"[a-z0-9]+", name.lower())) & _INSTITUTION_WORDS):
+        return set(), ""
+
+    paren = re.search(r"\(([^)]+)\)", name)
+    qualifier = _sig_tokens(paren.group(1)) if paren else set()
+    # A disambiguation tag ('(film)', '(TV series)') is not a campus qualifier.
+    if qualifier and qualifier <= _DISAMBIG_PARENS:
+        qualifier = set()
+    base = re.sub(r"\([^)]*\)", " ", name)
+
+    # Trailing campus/branch suffix. Wikidata writes a campus with an EN/EM-dash
+    # ("Rutgers University–Camden") and the tail there IS the campus (this is the form
+    # the guard sees on a Wikipedia row, via wiki_meta.name). A client row instead uses
+    # a hyphen before a known system ("- SUNY" -> keep the base's tokens) or a dataset
+    # tag ("- DAR" -> drop).
+    suffix_is_system = False
+    tail_m = re.search(r"([-–—])\s*([A-Za-z0-9&.][A-Za-z0-9&. ]*?)\s*$", base)
+    if tail_m:
+        sep, tail_raw = tail_m.group(1), tail_m.group(2)
+        base = base[:tail_m.start()]
+        if sep in "–—":
+            if not qualifier:
+                qualifier = {t for t in _sig_tokens(tail_raw)
+                             if t not in _ORG_GENERIC_TOKENS}
+        else:
+            suffix_is_system = re.sub(r"[^a-z0-9]", "", tail_raw.lower()) in _UNIVERSITY_SYSTEMS
+
+    if not qualifier and "," in base:
+        qualifier = _sig_tokens(base.split(",", 1)[1])
+    if not qualifier:
+        at_m = re.search(r"\bat\b", base.lower())
+        if at_m:
+            qualifier = {t for t in _sig_tokens(base[at_m.end():])
+                         if t not in _ORG_GENERIC_TOKENS}
+    if not qualifier and suffix_is_system:
+        qualifier = {t for t in _sig_tokens(base) if t not in _ORG_GENERIC_TOKENS}
+
+    if not qualifier:
+        return set(), ""
+
+    # Full acronym: initials of the whole campus name, keeping parenthetical content
+    # and an en-dash campus ("Rutgers University–Camden" -> "ruc") but dropping a
+    # trailing HYPHEN system/tag suffix ("... Santa Barbara - DAR" -> "ucsb").
+    clean = re.sub(r"[()]", " ", name)
+    clean = re.sub(r"-\s*[A-Za-z0-9&.]+\s*$", " ", clean)
+    acro_tokens = [t for t in re.findall(r"[a-z0-9]+", clean.lower())
+                   if t not in {"of", "the", "at", "and"}]
+    acronym = "".join(t[0] for t in acro_tokens if t)
+    return qualifier, acronym
+
+
+def _guard_subentity(
+    result: VerificationResult, candidates: List[dict], talent: str, platform: str,
+) -> VerificationResult:
+    """
+    Keep an educational sub-entity from resolving to its parent/system/sibling.
+
+    No-op unless VERIFIED and ``talent`` names a campus. The chosen account must
+    carry the campus signal (qualifier token in handle/display name, or the campus
+    acronym); if it doesn't, the cell is downgraded to Manual Review (a candidate
+    that does carry the signal is named in the reason as a lead). It only ever
+    downgrades — never re-points to a VERIFIED the LLM didn't choose.
+    """
+    if result.status != STATUS_VERIFIED or not result.best_candidate:
+        return result
+    qualifier, acronym = _subentity_identity(talent)
+    if not qualifier:
+        return result
+
+    def _evidence(cand: dict) -> str:
+        meta = cand.get("meta") or {}
+        handle = re.sub(r"[^a-z0-9]", "", _handle_from_url(cand.get("url", "")).lower())
+        handles = {handle} if handle else set()
+        shown = _name_tokens(" ".join(str(meta.get(k, "")) for k in
+                             ("display_name", "serper_title", "title", "knowledge_graph")))
+        # Substring match on the handle only for distinctive (>= 5-char) tokens, so a
+        # short qualifier ('los', 'park') can't match a coincidental substring
+        # ('sparkle'); short tokens still count as a whole token in the shown name.
+        handle_hit = any(q in h for h in handles for q in qualifier if len(q) >= 5)
+        if (qualifier & shown) or handle_hit:
+            return "explicit"
+        if acronym and len(acronym) >= 3 and any(h == acronym for h in handles):
+            return "acronym"
+        return ""
+
+    chosen = next((c for c in candidates if c.get("url") == result.best_candidate), None)
+    if chosen is not None and _evidence(chosen):
+        return result
+
+    qdesc = " ".join(sorted(qualifier))
+
+    def _rank(cand: dict) -> tuple:
+        order = {"explicit": 0, "acronym": 1}
+        indep = 0 if cand.get("source") not in ("input", "handle_fanout") else 1
+        return (order.get(_evidence(cand), 9), indep)
+
+    # A guard only ever DOWNGRADES. It must not re-point to a candidate the LLM did
+    # not choose and mark it Verified — that would skip the evidence floor, the fan/
+    # parody override and the ambiguity guard, and could bless a namesake/parody that
+    # merely carries the campus token (e.g. "rutgerscamdenparody"). If another
+    # candidate does carry the campus signal, name it in the reason so the analyst can
+    # check it, but the cell goes to Manual Review, not Verified.
+    better = sorted((c for c in candidates if _evidence(c)), key=_rank)
+    hint = (f" A candidate that matches the campus was found ({better[0].get('url')}) — "
+            f"confirm it." if better else "")
+    print(f"  [SUB-ENTITY] {platform} | {talent}: chosen account presents as the parent/"
+          f"system, not the '{qdesc}' campus -> manual review")
+    return replace(
+        result, status=STATUS_MANUAL, held=True, confidence=min(result.confidence, 70),
+        decision="manual_review",
+        reason=(f"Subject is the '{qdesc}' campus/branch, but the chosen account presents "
+                f"as the parent or system — confirm it is the specific campus, not the "
+                f"parent.{hint} " + (result.reason or "")).strip(),
+    )
+
+
 # ────────────────────────────────────────────────────────────────────────────
 #  Per-platform resolution: Serper primary (Phase 1) + Apify backup (Phase 2)
 # ────────────────────────────────────────────────────────────────────────────
@@ -443,8 +743,11 @@ def _tag_backlinks(candidates: List[dict], input_handles: Dict[str, str],
     real Instagram, which is exactly the "about them, not them" trap that caused
     the earlier false positives, so the LLM and every authenticity guard still
     run. What changes is that the candidate now clears the evidence gate.
+
+    Runs in every mode (gap #1): a back-link to the client's own profile is
+    independent evidence. ``options`` kept for signature stability.
     """
-    if not options.is_custom or not input_handles:
+    if not input_handles:
         return
     for cand in candidates:
         published = (cand.get("meta") or {}).get("profile_links") or {}
@@ -573,25 +876,25 @@ def _resolve_platform_serper(
     if known_url:
         _add_candidate(candidates, seen, platform, known_url, "input",
                        {"supplied_in_client_record": True})
-    # The profile Wikidata declares for this platform (via P2003/P2397/P2002/…).
-    # It is the authoritative source, so it belongs in the pool the LLM chooses
-    # from — not only in the ground-truth context, where the model could see it
-    # but the "must return a supplied URL" guard forbade returning it.
+    # The profile Wikidata declares for this platform (P2003/P2397/P2002/…), added
+    # as a candidate (validated, not trusted) so the LLM can choose it.
     wikidata_url = (getattr(wiki_meta, "social_links", None) or {}).get(platform, "")
     if wikidata_url:
         _add_candidate(candidates, seen, platform, wikidata_url, "wikidata",
                        {"declared_by_wikidata": True})
+    # First-party fallback: a DIFFERENT handle the official website listed, so if the
+    # Wikidata one is dead/wrong (dropped by the existence check) the site's can win.
+    website_url = (getattr(wiki_meta, "website_social_links", None) or {}).get(platform, "")
+    if website_url:
+        _add_candidate(candidates, seen, platform, website_url, "official_website",
+                       {"declared_by_official_website": True})
     for cand in serper_candidates:
         _add_candidate(candidates, seen, platform, cand.get("url", ""),
                        cand.get("source", "serper"), cand.get("meta"))
 
-    # NOTE: we deliberately do NOT synthesise a candidate by reusing a handle from
-    # another platform. Manufacturing a URL the pipeline never actually found or
-    # corroborated produces confident-looking wrong links for individuals who do
-    # not reuse one handle everywhere. When the authoritative sources (client
-    # handle, Wikidata, official-website scrape) and Serper all find nothing, the
-    # honest answer is Not Found. ``fanout_slugs`` is still used below, as EVIDENCE
-    # for corroborating a profile an independent search actually surfaced.
+    # We do NOT synthesise a candidate by reusing a handle from another platform —
+    # a manufactured URL the pipeline never found becomes a confident wrong link.
+    # ``fanout_slugs`` is still used below as EVIDENCE to corroborate a real hit.
 
     # Drop anything an analyst has already rejected, comparing on the normalised
     # URL so a trailing slash or scheme difference can't smuggle it back in.
@@ -614,8 +917,71 @@ def _resolve_platform_serper(
         return VerificationResult(platform=platform, status=STATUS_NOT_FOUND, reason=reason)
 
     _tag_anchor_handle_matches(candidates, fanout_slugs or [], options)
+    # Enrich BEFORE back-link tagging: _tag_backlinks reads meta['profile_links'],
+    # which enrichment populates. (_verify re-enriches, but skips already-enriched
+    # candidates, so this is one fetch, not two.)
+    _enrich_candidates(candidates, platform)
     _tag_backlinks(candidates, input_handles_for_backlink or {}, options)
-    return _verify(platform, wiki_meta, candidates, options)
+    result = _verify(platform, wiki_meta, candidates, options)
+    # Lever #1: the client's OWN handle is their declared source of truth — do not
+    # let a different (official/campaign) account override it when the supplied
+    # handle itself checks out. Re-verified platforms (FB/X/TikTok) only.
+    return _prefer_supplied_handle(result, platform, known_url, candidates,
+                                   wiki_meta, options)
+
+
+def _prefer_supplied_handle(
+    result: VerificationResult, platform: str, known_url: str,
+    candidates: List[dict], wiki_meta: wikipedia_service.WikiMetadata,
+    options: search_options.SearchOptions,
+) -> VerificationResult:
+    """
+    Keep the client's SUPPLIED handle over a DIFFERENT discovered one — but only
+    when the supplied handle itself verifies (live + name-match, judged by the same
+    ``_verify`` guards and the evidence it already carries). The input file's handle
+    is the client's declared truth, so a different-but-also-valid 'official' account
+    must not silently replace it. When the supplied handle cannot be confirmed
+    (dead / wrong / a different person), the discovered result stands — a stale or
+    wrong supplied handle is never forced through, so this can only move a cell
+    toward the client's own answer, never away from a confirmed one.
+
+    Scope: the RE-VERIFIED platforms only (Facebook / X / TikTok). Instagram and
+    YouTube are confirmed as trusted anchors in Phase 0 and are untouched here.
+    """
+    if platform in _TRUSTED_INPUT_PLATFORMS or not known_url:
+        return result
+    supplied = social_urls.normalize_profile_url(known_url, platform).lower()
+    chosen = social_urls.normalize_profile_url(result.best_candidate or "", platform).lower()
+    if chosen == supplied:
+        return result          # verification already landed on the client's handle
+    input_cand = next(
+        (c for c in candidates
+         if social_urls.normalize_profile_url(c.get("url", ""), platform).lower() == supplied),
+        None,
+    )
+    if input_cand is None:
+        return result          # supplied handle isn't a live candidate (dropped/rejected)
+    # Judge the supplied handle ALONE, with the evidence it already carries.
+    verdict = _verify(platform, wiki_meta, [input_cand], options)
+    if verdict.status != STATUS_VERIFIED:
+        return result          # supplied handle not confirmable -> keep discovery's pick
+    # That _verify saw only the single supplied candidate, so _guard_ambiguous_identity
+    # could not fire (it needs rivals). Re-run it against the FULL candidate list: if
+    # several live accounts claim this identity, the client's handle must stay Manual,
+    # not be promoted past the ambiguity the row was flagged for.
+    verdict = _guard_ambiguous_identity(
+        verdict, candidates, wiki_meta.name or wiki_meta.talent, platform)
+    if verdict.status != STATUS_VERIFIED:
+        return result          # ambiguous among live rivals -> keep discovery's pick
+    print(f"  [INPUT-PREFERRED] {platform} | {wiki_meta.name or ''} -> kept client handle "
+          f"'{known_url}' over discovered '{result.best_candidate}'")
+    return VerificationResult(
+        platform=platform, best_candidate=verdict.best_candidate or known_url,
+        status=STATUS_VERIFIED, confidence=verdict.confidence or 90,
+        decision="verified", source="Input file (client handle kept)",
+        reason=("The client supplied this handle and it verifies as the talent, so it "
+                "is kept over a different discovered account."),
+    )
 
 
 def _apify_backup_platform(
@@ -738,21 +1104,11 @@ def _input_surname_mismatch(meta: dict, url: str,
                             wiki_meta: wikipedia_service.WikiMetadata,
                             talent: str) -> bool:
     """
-    Deterministic wrong-person guard for a supplied PERSON handle.
-
-    A plausible-but-different name ("Stephanie Miller" supplied as the handle
-    'stephclairesmith', whose profile is "Steph Claire Smith") shares a first name
-    and reads as a near-match, so a lenient evidence gate can wave it through. But
-    a real person's profile carries their SURNAME — in the display name, the
-    username, the bio, or the handle. If the talent's surname appears in none of
-    those, it is almost certainly a different person, so we flag it.
-
-    Callers apply this to Instagram only: an IG profile's display name is reliably
-    the person's own name, whereas a YouTube channel is often branded with a show
-    name ("The Jane Show") that legitimately omits the surname — flagging those
-    would wrongly reject a correct, client-supplied channel.
-
-    Only applies to people with a multi-token name; brands/orgs have no surname.
+    Wrong-person guard for a supplied PERSON handle: a real profile carries the
+    talent's SURNAME somewhere (display name, username, bio, or handle). If it
+    appears in none, it's likely a different person (e.g. "Stephanie Miller"
+    supplied as 'stephclairesmith' -> "Steph Claire Smith"). People with a
+    multi-token name only; callers apply it to Instagram only.
     """
     if not getattr(wiki_meta, "is_person", True):
         return False
@@ -772,36 +1128,42 @@ def _validate_input_handle(
     talent: str = "",
 ) -> VerificationResult:
     """
-    Confirm a supplied Instagram/YouTube handle really belongs to the talent.
-
-    Reads the profile's own name/bio and lets the LLM compare it to the ground
-    truth (name + category). A match stays Verified; a different-named profile (the
-    classic "Stephanie Miller -> stephclairesmith" wrong input) or an unreadable one
-    is flagged Manual Review, keeping the URL. When the reader is entirely
-    unavailable (Apify off), the input is trusted as before so a whole file is not
-    flagged by mistake.
+    Confirm a supplied Instagram/YouTube handle really belongs to the talent: read
+    the profile's name/bio and let the LLM compare it to the ground truth. A match
+    stays Verified; a different-named or unreadable profile is flagged Manual Review
+    (keeping the URL). When the reader is entirely unavailable (Apify off), the
+    input is trusted so a whole file isn't flagged by mistake.
     """
     meta, flag_worthy = _read_input_profile(platform, url)
     if meta is None:
         if not flag_worthy:
             return _trusted_input_result(platform, url)  # couldn't read -> trust
         return VerificationResult(  # positively confirmed bad (e.g. 404)
-            platform=platform, best_candidate=url, status=STATUS_MANUAL,
+            platform=platform, best_candidate=url, status=STATUS_MANUAL, held=True,
             confidence=0, decision="manual_review", source="Input file (unconfirmed)",
             reason=("The supplied profile could not be confirmed (it may not exist) — "
                     "manual review needed."),
         )
-    # Deterministic wrong-person guard: a supplied handle whose profile drops the
-    # talent's surname is almost certainly someone else (the classic "Stephanie
-    # Miller -> Steph Claire Smith" wrong input). Flag before the LLM, which a
-    # shared first name can otherwise talk past. Instagram only — a YouTube channel
-    # is often branded with a show name that legitimately omits the surname, so the
-    # guard would wrongly reject a correct, client-supplied channel there.
+    # A validated YouTube input handle is kept in its given @handle / user form (more
+    # readable, and it matches handle-style references); de-duplication against
+    # discovery happens by channel id in _collapse_youtube_duplicates, so we no longer
+    # rewrite it to the /channel/UC... form here.
+    # A private Instagram account can't be read (no name/bio to confirm against), but a
+    # client-supplied one isn't discarded — it goes to Manual Review for a human to check.
+    if platform == "Instagram" and meta.get("private"):
+        return VerificationResult(
+            platform=platform, best_candidate=url, status=STATUS_MANUAL, held=True,
+            confidence=60, decision="manual_review", source="Input file (private account)",
+            reason=("The account is private, so its content can't be confirmed or "
+                    "tracked — manual review needed."),
+        )
+    # Surname guard before the LLM, which a shared first name can talk past.
+    # Instagram only (a YouTube channel often drops the surname in a show name).
     if platform == "Instagram" and talent and _input_surname_mismatch(meta, url, wiki_meta, talent):
         shown = str(meta.get("display_name") or "")[:60]
         return VerificationResult(
-            platform=platform, best_candidate=url, status=STATUS_MANUAL, confidence=0,
-            decision="manual_review", source="Input file (unverified)",
+            platform=platform, best_candidate=url, status=STATUS_MANUAL, held=True,
+            confidence=0, decision="manual_review", source="Input file (unverified)",
             reason=(f"The supplied profile's name ('{shown}') does not include the "
                     "talent's surname — likely a different person; manual review needed."),
         )
@@ -898,13 +1260,9 @@ def _row_bio_link_phase(
     }
     adopted: Dict[str, VerificationResult] = {}
 
-    # The client's Instagram and YouTube handles are the declared source of truth,
-    # but we no longer trust them blindly: each is confirmed to actually belong to
-    # the talent (read the profile's own name, let the LLM compare it to the name +
-    # category) before being adopted as Verified. A different-named profile (e.g.
-    # "Stephanie Miller" -> stephclairesmith) is flagged Manual Review instead.
-    # Facebook / X / TikTok input handles are NOT adopted here; they fall through to
-    # the Serper phases and are re-verified like any discovered link.
+    # Client IG/YouTube handles are the declared source of truth but not trusted
+    # blindly: each is confirmed to belong to the talent before adoption (a mismatch
+    # -> Manual). FB/X/TikTok input handles are re-verified in the Serper phases.
     for platform, url in input_handles.items():
         if platform in _TRUSTED_INPUT_PLATFORMS and url and url not in rejected:
             adopted[platform] = _validate_input_handle(platform, url, gt, options, talent)
@@ -958,13 +1316,9 @@ def _row_bio_link_phase(
         print(f"  [BIO-LINKS] '{talent}': {len(adopted)} platform(s) resolved "
               f"-> {', '.join(sorted(adopted))}")
 
-    # Instagram is the column clients fill in, yet an anonymous read of it returns
-    # almost nothing. So when a platform is still missing and the file gave an
-    # Instagram handle, read that profile with the cookie-backed Apify actor. It
-    # is the only reliable Instagram reader — but it is PAID, so it runs last
-    # (after the free YouTube/Instagram reads above) and only for the gaps they
-    # left. Its links are sourced from the client's own bio, so they go through the
-    # same name/category validation as the free bio links before being trusted.
+    # An anonymous IG read returns almost nothing, so when a platform is still
+    # missing read the IG bio with the paid cookie-backed Apify actor (runs last,
+    # only for the gaps); its links are validated like the free bio links.
     ig_url = anchor_handles.get("Instagram", "")
     missing = [p for p in PLATFORMS if p not in adopted]
     if ig_url and missing and apify_service.instagram_configured():
@@ -991,40 +1345,6 @@ def _row_bio_link_phase(
 # ────────────────────────────────────────────────────────────────────────────
 #  Custom-mode discovery helpers
 # ────────────────────────────────────────────────────────────────────────────
-
-# Excel columns (case-insensitive) that carry a talent's profession/category,
-# used to build the custom-mode query "<name> <profession> <prompt>". An explicit
-# ``profession``/``occupation`` column wins when present (cleanest signal);
-# otherwise fall back to the taxonomy columns.
-_PROFESSION_KEYS = (
-    "profession", "occupation",
-    "title_sub_category", "title_subcategory", "sub_category", "subcategory",
-    "title_category", "category",
-    "primary_genre", "genre", "role",
-)
-
-
-def _clean_profession(value: str) -> str:
-    """
-    Strip a 'Label - Value' prefix so the query stays clean.
-    e.g. 'Talent Type - Musician' -> 'Musician', 'Actor' -> 'Actor'.
-    """
-    parts = re.split(r"\s+[-–—]\s+|:\s+", value.strip())
-    return parts[-1].strip() if parts else value.strip()
-
-
-def _detect_profession(input_metadata: Optional[Dict[str, str]]) -> str:
-    """Best-effort profession/category term from the row's Excel columns."""
-    if not input_metadata:
-        return ""
-    lowered = {str(k).lower(): v for k, v in input_metadata.items()}
-    for key in _PROFESSION_KEYS:
-        val = lowered.get(key)
-        if isinstance(val, str) and val.strip():
-            return _clean_profession(val)
-    return ""
-
-
 
 # Confidence written when a no-Wikipedia Serper hit is corroborated (its profile
 # links back to a known handle, or it reuses a distinctive known handle). Sits
@@ -1072,20 +1392,13 @@ def _corroboration_signal(
 
 def _contradicts_known_profiles(cand: dict, known_profiles: Dict[str, str]) -> str:
     """
-    Deterministic DIS-corroboration: the candidate self-declares a DIFFERENT
-    identity. Its own profile page links to a handle on a platform where we already
-    have a CONFIRMED handle for this subject, and the two are different accounts.
-
-    A real profile links to the subject's OWN other accounts, so a conflicting link
-    is strong evidence this is a namesake — e.g. a YouTube '@bradalexander' whose
-    bio points at a different Brad Alexander's Instagram, not the actor's
-    'bradalexanderactor'. ``_corroboration_signal`` only ever CONFIRMED a matching
-    back-link; this is the missing opposite. Returns a reason, or "".
-
-    Compares only against CONFIRMED handles (input-verified or already corroborated
-    this row), and only where both sides have a handle — an absent link is not a
-    contradiction. A client-supplied ("input") candidate is exempt: the client
-    asserted that handle, so it is re-verified, not discarded on its own bio.
+    DIS-corroboration (the opposite of ``_corroboration_signal``): the candidate's
+    own page links to a DIFFERENT account than the CONFIRMED one on file for this
+    subject on that platform — strong evidence of a namesake (e.g. a YouTube
+    '@bradalexander' whose bio points at a different Brad Alexander's Instagram).
+    Compares only where both sides have a handle; an ``input`` candidate is exempt
+    (the client asserted it, so it's re-verified, not dropped on its own bio).
+    Returns a reason, or "".
     """
     if cand.get("source") == "input":
         return ""
@@ -1103,22 +1416,12 @@ def _contradicts_known_profiles(cand: dict, known_profiles: Dict[str, str]) -> s
 
 def _name_match_signal(cand: dict, talent: str) -> str:
     """
-    Strong, high-precision name evidence for a no-Wikipedia candidate: the
-    profile's HANDLE, reduced to alphanumerics, is exactly the talent name reduced
-    to alphanumerics — e.g. ``@hollywainwright`` for "Holly Wainwright",
-    ``/popcultureparenting`` for "Pop Culture Parenting".
-
-    Handles are unique per platform, so a handle that *equals* the name is very
-    unlikely to be a different subject — unlike a mere display-name match, which
-    every namesake shares (that is why a US radio host "Stephanie Miller" must NOT
-    corroborate a different "Stephanie Miller"). Suffix / fan variants such as
-    ``jessiestephens40`` do not match, by construction, so they stay Manual.
-
-    Only an INDEPENDENTLY-DISCOVERED profile qualifies: a manufactured
-    ``handle_fanout`` URL reuses the name by construction (circular), and a
-    client-supplied ``input`` handle is the client's own assertion — the
-    input-trust policy re-verifies client Facebook/X/TikTok rather than trusting
-    a name-shaped handle they may have recorded wrongly.
+    High-precision name evidence: the profile's HANDLE, reduced to alphanumerics,
+    exactly equals the name reduced to alphanumerics (e.g. ``@hollywainwright`` for
+    "Holly Wainwright"). Handles are unique per platform, so a handle equal to the
+    name is unlikely to be a namesake (unlike a mere display-name match). Only an
+    independently-discovered profile qualifies — ``handle_fanout`` (circular) and
+    ``input`` (the client's own assertion) are excluded.
     """
     if cand.get("source") in ("handle_fanout", "input"):
         return ""
@@ -1134,16 +1437,12 @@ def _name_match_signal(cand: dict, talent: str) -> str:
 
 def _name_plausible(cand: dict, talent: str) -> bool:
     """
-    Loose check that a candidate could belong to the subject — used only to decide,
-    on a no-Wikipedia platform with nothing to corroborate against, whether an
-    uncorroborated hit is worth a human's time (Manual Review) or is just a
-    namesake the broad "<name> site:<domain>" search swept in (Not Found).
-
-    True when the handle carries a distinctive (>= 4-char) token of the name, or
-    the profile's displayed name carries the full name. Deliberately generous:
-    its job is only to strip out the clearly-unrelated (``breguissimxs`` for
-    "Emily Vernem", the movie ``mammamiamovie`` for "Mamamia Out Loud"), not to
-    adjudicate between plausible accounts.
+    Loose check that a candidate could belong to the subject: True when the handle
+    carries a distinctive (>= 4-char) token of the name, or the displayed name
+    carries the full name. Used on a no-Wikipedia platform with nothing to
+    corroborate against, to decide whether an uncorroborated hit is worth Manual
+    Review or is just a namesake the broad search swept in (Not Found). Generous by
+    design — it only strips the clearly-unrelated, not plausible accounts.
     """
     tokens = {t for t in _name_tokens(talent) if len(t) >= 4}
     handle_compact = re.sub(r"[^a-z0-9]", "", _handle_from_url(cand.get("url", "")))
@@ -1160,14 +1459,12 @@ def _gather_serper_candidates(
     """
     Discover no-Wikipedia candidates for one platform (Serper + handle fanout),
     drop analyst-rejected ones, and enrich for back-link detection. Makes NO
-    decision — that happens once every platform's candidates are known, so
-    cross-platform agreement can be weighed. Returns ``(candidates, searched, errored)``.
+    decision — that happens once every platform's candidates are known. Returns
+    ``(candidates, searched, errored)``.
 
-    ``client_url`` is a client-supplied handle for a non-trusted platform
-    (Facebook/X/TikTok). It is added as an ``input`` candidate so it is enriched
-    and can be corroborated (e.g. it back-links to the client's Instagram) — or,
-    failing that, surfaced for Manual Review rather than dropped. It never drives
-    cross-platform agreement (that is independent-search only).
+    ``client_url`` is a client-supplied handle for a non-trusted platform, added as
+    an ``input`` candidate so it can be corroborated or surfaced for Manual Review
+    rather than dropped. It never drives cross-platform agreement.
     """
     searched = serper_service.is_configured()
     errored = False
@@ -1190,9 +1487,8 @@ def _gather_serper_candidates(
     for c in raw:
         _add_candidate(candidates, seen, platform, c.get("url", ""),
                        c.get("source", "serper"), c.get("meta"))
-    # We do NOT synthesise a candidate from a reused handle. A manufactured URL
-    # the search never surfaced becomes a confident wrong link for anyone who
-    # doesn't reuse one handle everywhere. ``anchor_slugs`` is still used as
+    # We do NOT synthesise a candidate from a reused handle — a manufactured URL
+    # the search never surfaced becomes a confident wrong link. ``anchor_slugs`` is still used as
     # EVIDENCE to corroborate a profile an independent search actually found.
 
     if rejected:
@@ -1206,6 +1502,9 @@ def _gather_serper_candidates(
     # difference from the Wikipedia path.
     if candidates:
         _enrich_candidates(candidates, platform)
+        candidates = _filter_private_instagram(candidates, platform)
+        if platform == "YouTube":
+            candidates = _collapse_youtube_duplicates(candidates)
     return candidates, searched, errored
 
 
@@ -1218,14 +1517,11 @@ def _decide_no_wiki_platform(
     """
     Corroborate or flag one platform, using the whole row's cross-platform agreement.
 
-    Written (Verified) only when self-evidencing: a back-link to a known handle,
-    reuse of a distinctive known handle, or a distinctive handle an independent
-    search returned on another platform too. A name-exact handle is a strong but
-    unproven signal, so it is surfaced at the TOP of Manual Review (not auto-
-    Verified — it could be a namesake or a tribute page). Any other hit that bears
-    a name relation is also Manual; a hit with NO name relation is Not Found when
-    it is one of several namesakes, but a LONE uncorroborated hit is still shown as
-    Manual (deterministic search means a drop is permanent). No hit at all is Not Found.
+    Verified only when self-evidencing (a back-link, reuse of a distinctive known
+    handle, or cross-platform agreement). A name-exact handle is strong but unproven
+    -> top of Manual Review. Any other name-related hit is Manual too; a hit with no
+    name relation is Not Found when one of several namesakes, but a LONE
+    uncorroborated hit stays Manual. No hit at all is Not Found.
     """
     if not candidates:
         if errored or not searched:
@@ -1237,13 +1533,9 @@ def _decide_no_wiki_platform(
             platform=platform, status=STATUS_NOT_FOUND,
             reason="No profile found by a Serper site-search — no such account located.")
 
-    # 0. DIS-corroboration. Drop any candidate that self-declares a DIFFERENT
-    #    identity — its own page links to a handle conflicting with a CONFIRMED one
-    #    for this subject (the YouTube '@bradalexander' whose bio points at a
-    #    different Brad Alexander's Instagram, not the actor's). Corroboration below
-    #    only ever CONFIRMED a matching back-link; without this, such a namesake
-    #    falls through to the name-match / gate and is surfaced for review instead
-    #    of discarded. Runs first so it can never be rescued by a later signal.
+    # 0. DIS-corroboration. Drop any candidate whose own page links to a handle
+    #    conflicting with a CONFIRMED one for this subject. Runs first so a namesake
+    #    can never be rescued by a later signal.
     kept: List[dict] = []
     for cand in candidates:
         why = _contradicts_known_profiles(cand, known_profiles)
@@ -1273,14 +1565,10 @@ def _decide_no_wiki_platform(
                 evidence=[signal], decision="verified",
             )
 
-    # 2. Cross-platform agreement: the top independent search hit reuses a
-    #    distinctive handle that another platform's search ALSO returned. Two
-    #    independent searches converging on the same handle is strong evidence —
-    #    BUT only if the candidate actually presents as this subject. Without that
-    #    check, a subject with no accounts (e.g. "Princess Grace of Monaco") lets
-    #    Serper's popular fallback (Lady Gaga's @ladygaga, returned on IG AND
-    #    TikTok) get auto-Verified. _claims_identity gates on the profile's own
-    #    displayed name, not the handle string.
+    # 2. Cross-platform agreement: the top independent hit reuses a distinctive
+    #    handle another platform's search ALSO returned — strong evidence, but only
+    #    if the candidate presents as this subject (_claims_identity gates on the
+    #    displayed name, so Serper's popular fallback like @ladygaga can't sneak in).
     top = next((c for c in candidates
                 if c.get("source") not in ("handle_fanout", "input") and c.get("url")), None)
     if top and _claims_identity(top, talent):
@@ -1297,14 +1585,9 @@ def _decide_no_wiki_platform(
                 evidence=[signal], decision="verified",
             )
 
-    # 3. Name-match is a STRONG triage signal, but NOT proof. A handle equal to the
-    #    subject's name is usually them (e.g. "Holly Wainwright" whose TikTok is the
-    #    name-exact '@hollywainwright'), but it can also be a namesake, or a fan /
-    #    tribute page that adopts the full name as its handle — a tribute
-    #    'princess_grace_of_monaco' for a person who died in 1982, say. The
-    #    no-Wikipedia path has no LLM, ambiguity guard or authenticity check to tell
-    #    those apart, so a name-exact hit is SURFACED at the top of Manual Review for
-    #    a one-glance human confirmation rather than auto-Verified.
+    # 3. Name-match is a STRONG triage signal, but NOT proof — a name-exact handle
+    #    can be a namesake or a fan/tribute page, and this path has no LLM to tell
+    #    them apart. So it's surfaced at the top of Manual Review, not auto-Verified.
     name_match = next((c for c in candidates if _name_match_signal(c, talent)), None)
     if name_match:
         sig = _name_match_signal(name_match, talent)
@@ -1333,20 +1616,16 @@ def _decide_no_wiki_platform(
             platform=platform, status=STATUS_NOT_FOUND,
             reason="No profile found by a Serper site-search — no such account located.")
 
-    # Gate: the broad "<name> site:<domain>" query has high recall, so it also
-    # sweeps in unrelated namesakes (@breguissimxs for "Emily Vernem", the movie
-    # @mammamiamovie for "Mamamia Out Loud"). A client-SUPPLIED handle is always
-    # surfaced (the client asserted it; a human should see it); discovered hits are
-    # kept when name-plausible.
+    # Gate: the broad query has high recall, so it sweeps in unrelated namesakes.
+    # A client-SUPPLIED handle is always surfaced; discovered hits are kept when
+    # name-plausible.
     kept = [c for c in search_cands
             if c.get("source") == "input" or _name_plausible(c, talent)]
     if not kept:
-        # Nothing name-plausible. Serper is deterministic, so a drop to Not Found is
-        # permanent — never re-surfaced on a later run. So we only drop when a PILE
-        # of unrelated namesakes makes "none of these is the subject" the likely
-        # read; a LONE uncorroborated hit may be a real account whose handle simply
-        # isn't the name (a podcast's network handle, say) and is still worth one
-        # human glance — keep it as Manual rather than hiding it.
+        # Nothing name-plausible. A drop is permanent (deterministic search), so we
+        # only drop when a PILE of namesakes makes "none is the subject" likely; a
+        # LONE hit may be a real account whose handle just isn't the name, so keep
+        # it as Manual rather than hiding it.
         if len(search_cands) == 1:
             kept = search_cands
         else:
@@ -1398,17 +1677,11 @@ def _row_serper_corroborate_phase(
     known_profiles: Dict[str, str] = _confirmed_handles(resolved)
     anchor_slugs = _fanout_slugs(known_profiles)
 
-    # No-wiki discovery query: the bare "<name> site:<domain>".
-    #
-    # An A/B/C test over 366 curated talent→handle reference points (real Serper,
-    # two passes, stable to within ~2 pts) showed this plain query surfaces the
-    # correct profile for ~80% of no-wiki rows — versus ~41% with the category
-    # appended and ~16% with the old "<name> <category> <prompt>" query. Both the
-    # category term and the analyst's free-text prompt SUPPRESS the right result
-    # (Google treats the extra words as near-required, and a profile page rarely
-    # contains "Athlete" or "social media handles"); quoting the name hurts
-    # multi-word names too. Disambiguation is the corroboration step's job, not
-    # the query's, so category/prompt are deliberately NOT appended here.
+    # No-wiki discovery query: the bare "<name> site:<domain>". An A/B/C test (366
+    # reference points) showed this surfaces the correct profile ~80% of the time,
+    # vs ~41% with the category appended and ~16% with the old category+prompt query
+    # — the extra terms suppress the right result. Disambiguation is the
+    # corroboration step's job, so category/prompt are not appended here.
     profession = ""
     prompt = ""
     template = "{name} site:{domain}"
@@ -1461,9 +1734,16 @@ def _row_serper_corroborate_phase(
                 platform=platform, status=STATUS_STOPPED, reason=CANCELLED_REASON)
         else:
             cands, searched, errored = g
-            results[platform] = _decide_no_wiki_platform(
+            decided = _decide_no_wiki_platform(
                 talent, platform, cands, searched, errored,
                 known_profiles, anchor_slugs, mutual_handles)
+            # Guard over the dis-corroboration SURVIVORS only — a namesake already
+            # rejected inside _decide_no_wiki_platform must not be reconsidered here
+            # (or named as the campus account).
+            kept = [c for c in cands
+                    if not _contradicts_known_profiles(c, known_profiles)]
+            decided = _guard_subentity(decided, kept, talent, platform)
+            results[platform] = _route_private_to_manual(decided, kept)
         if platform_progress:
             platform_progress(platform, "done")
     return results
@@ -1600,9 +1880,10 @@ def _tag_cross_platform_match(cand: dict, platform: str,
     the CLIENT supplied. This compares against handles this run verified on its
     own, so the corroboration is only as strong as those verdicts — which is why
     it is evidence for the adjudicator rather than a verdict of its own.
+
+    Runs in every mode (gap #1): a Verified handle on another platform is independent
+    evidence that clears the evidence floor. ``options`` kept for signature stability.
     """
-    if not options.is_custom:
-        return
     handle = _handle_from_url(cand.get("url", ""))
     if not handle or len(handle) < _MIN_ANCHOR_HANDLE_LEN:
         return
@@ -1634,7 +1915,13 @@ def _corroborate_row(
             if handle:
                 verified_handles[platform] = handle
 
-    rescue = [p for p, r in results.items() if r.status == STATUS_MANUAL and r.best_candidate]
+    # Rescue only cells that are Manual for an EVIDENCE shortfall (FB/X/TikTok expose
+    # no fetchable content). A cell a guard DELIBERATELY held for a human (``held``) —
+    # a private account, surname mismatch, unconfirmed input, distributor channel, or
+    # campus/parent mismatch — must never be re-promoted by corroboration, so it is
+    # excluded here rather than re-detected unreliably inside the rescue.
+    rescue = [p for p, r in results.items()
+              if r.status == STATUS_MANUAL and r.best_candidate and not r.held]
     if not verified_handles or not rescue:
         return results
 
@@ -1665,6 +1952,13 @@ def _corroborate_row(
                 platform, gt, [cand], is_person=wiki_meta.is_person,
                 thin_gate=options.thin_gate,
             )
+            # Re-apply the campus guard to the PROMOTED result. The ``held`` exclusion
+            # above only covers a cell the guard ALREADY downgraded; a parent/system
+            # account that reached Manual via an evidence shortfall (held=False) isn't
+            # excluded, and rescue can promote it to Verified — so re-check it here. The
+            # guard reads the URL/display name (reliable), unlike the private flag, which
+            # ``held`` already handles; private is deliberately NOT re-detected here.
+            res = _guard_subentity(res, [cand], wiki_meta.name or talent, platform)
         except Exception as exc:  # noqa: BLE001
             print(f"  [CORROBORATE] {platform} | {talent} error: {exc.__class__.__name__}")
             return platform, results[platform]
@@ -1699,7 +1993,7 @@ def _apply_yt_distributor_override(
     results = dict(results)
     results["YouTube"] = VerificationResult(
         platform="YouTube", best_candidate=distributor_url,
-        status=STATUS_MANUAL, confidence=0, decision="manual_review",
+        status=STATUS_MANUAL, held=True, confidence=0, decision="manual_review",
         source="Input file (distributor channel)",
         reason=("The supplied YouTube link is a distributor/label channel shared "
                 "across titles, not this title's own channel, and no title-specific "
@@ -1736,6 +2030,34 @@ def _assemble_row_out(results: Dict[str, VerificationResult],
     return out
 
 
+# Words that mark a title as a show/group/brand (not a person), so the person-only
+# surname guard skips it when the client gave no category. Strong markers only.
+_ORG_NAME_MARKERS = frozenset({
+    "podcast", "show", "radio", "fm", "tv", "network", "channel", "media",
+    "music", "band", "records", "label", "productions", "studios", "orchestra",
+    "ensemble", "collective", "news", "magazine", "inc", "ltd", "llc",
+    "corporation", "company", "fc", "united",
+})
+
+
+def _thin_is_person(talent: str, input_metadata: Optional[dict]) -> "tuple[bool, str]":
+    """
+    Best-effort (is_person, entity_type) for a row with no Wikipedia record. The
+    client's category wins; absent it, a name reading as a show/group/brand ('&' or
+    a format word) is treated as non-person. An unmarked name stays a person.
+    """
+    meta = dict(input_metadata or {})
+    is_person, entity_type = wikipedia_service._infer_entity_type(meta)
+    category = wikipedia_service._meta_get(meta, "title_category", "category", "brand_type")
+    if category:                       # explicit taxonomy is authoritative
+        return is_person, entity_type
+    name = (talent or "").lower()
+    tokens = set(re.findall(r"[a-z0-9]+", name))
+    if "&" in name or (tokens & _ORG_NAME_MARKERS):
+        return False, "organization (inferred from name)"
+    return is_person, entity_type
+
+
 def _thin_ground_truth(
     talent: str, input_metadata: Optional[dict] = None,
     input_handles: Optional[Dict[str, str]] = None,
@@ -1745,8 +2067,9 @@ def _thin_ground_truth(
     Used to validate bio-sourced profiles against the subject's name and the
     category the client supplied, when there is no richer Wikipedia record.
     """
+    is_person, entity_type = _thin_is_person(talent, input_metadata)
     return wikipedia_service.WikiMetadata(
-        talent=talent, name=talent,
+        talent=talent, name=talent, is_person=is_person, entity_type=entity_type,
         input_metadata=dict(input_metadata or {}),
         client_recorded_profiles=dict(input_handles or {}),
     )
@@ -1912,30 +2235,13 @@ def _row_inputs(df: pd.DataFrame, row_label: object) -> tuple:
     return talent, wiki_url, input_metadata, input_handles, yt_distributor
 
 
-def process_row(
-    df: pd.DataFrame,
-    row_label: object,
-    platform_progress: Optional[Callable[[str, str], None]] = None,
-) -> None:
-    """Single-row entry point (in place). Kept for the sequential / CLI path."""
-    talent, wiki_url, input_metadata, input_handles, yt_distributor = _row_inputs(df, row_label)
-    if not talent:
-        return
-    print(f"\n{'=' * 65}\nProcessing: {talent}")
-    result = _resolve_row_result(talent, wiki_url, input_metadata,
-                                 apify_candidates=None, platform_progress=platform_progress,
-                                 input_handles=input_handles,
-                                 yt_distributor_url=yt_distributor)
-    for col, val in result.items():
-        df.at[row_label, col] = val
-
-
 def run_pipeline_on_dataframe(
     df: pd.DataFrame,
     row_status: Optional[Callable[[int, str], None]] = None,
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     options: search_options.SearchOptions = search_options.DEFAULT,
+    checkpoint: Optional[Callable[..., None]] = None,
 ) -> pd.DataFrame:
     """
     Process every row and return the populated frame — Serper primary, Apify backup.
@@ -1946,9 +2252,16 @@ def run_pipeline_on_dataframe(
       Phase B — ONE batched Apify pass for only the talents that had a
                 non-Verified platform, then re-verify just those platforms.
 
-    Workers only compute; the DataFrame is written on the main thread as Phase B
-    futures complete, so there are no concurrent pandas writes.
+    Workers only compute; the DataFrame is written on the main thread as Phase A
+    results arrive and as Phase B futures complete, so there are no concurrent
+    pandas writes.
     ``row_status(row_index, status)`` reports per-row lifecycle ("processing"/"done").
+    ``checkpoint(df, force=False)`` — when given — is called with the live frame as
+    rows fill in, so the caller can persist partial progress; it is the hook that
+    lets a stopped/crashed run keep the work done so far instead of losing it all.
+    It is forced once at the end of Phase A (before the batched Apify pass, the
+    riskiest stretch) so that checkpoint is never throttled away. Always invoked on
+    the main thread.
     """
     df = df.copy()
     for col in excel_service.ordered_columns():
@@ -1970,6 +2283,14 @@ def run_pipeline_on_dataframe(
         if talent:
             rows.append((idx, row_label, talent, wiki_url, input_metadata,
                          input_handles, yt_distributor))
+            # Seed every real talent row's status cells with "Not Checked" (plus a brief
+            # reason) up front, so a mid-run checkpoint or a crash-rebuilt export shows
+            # "Not Checked" for a row the pipeline never reached, not a blank cell that reads
+            # as a real result. Phase A/B overwrite these as each row is verified. (Blank-name
+            # rows stay blank.)
+            for _p in PLATFORMS:
+                df.at[row_label, excel_service.status_col(_p)] = STATUS_STOPPED
+                df.at[row_label, excel_service.reason_col(_p)] = NOT_REACHED_REASON
 
     total = len(rows)
     print(f"[PIPELINE] Verification run started for {total} talent row(s) "
@@ -2047,6 +2368,21 @@ def run_pipeline_on_dataframe(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for res in pool.map(_phase_a, rows):
             phase_a.append(res)
+            # Write this row's PROVISIONAL (Serper-only) result into the frame as
+            # soon as it is known — the same assembly the Serper companion uses
+            # below — so a checkpoint during Phase A, or a stop before the Apify
+            # batch, preserves it. Phase B overwrites it with the fuller result.
+            prov = _apply_yt_distributor_override(res["phase1"], res.get("yt_distributor", ""))
+            wiki_out = res["wiki_meta"].wikipedia_url or res.get("wiki_url", "")
+            for col, val in _assemble_row_out(prov, wiki_out).items():
+                df.at[res["row_label"], col] = val
+            if checkpoint:
+                checkpoint(df)
+    # Force a checkpoint now: Phase A is done but nothing fuller exists yet, and the
+    # batched Apify pass up next is the longest, most failure-prone stretch (a slow
+    # actor can stall it for minutes). This is the write that survives a stop there.
+    if checkpoint:
+        checkpoint(df, force=True)
 
     # ── One batched Apify pass for ONLY the talents with a non-Verified platform ──
     stopped = _is_cancelled(should_cancel)
@@ -2105,6 +2441,8 @@ def run_pipeline_on_dataframe(
                 df.at[row_label, col] = val
             if row_status:
                 row_status(idx, "done")
+            if checkpoint:
+                checkpoint(df)
             done += 1
             print(f"  [{done}/{total}] complete")
 
@@ -2128,6 +2466,7 @@ def run_pipeline_for_names(
     platform_progress: Optional[Callable[[int, str, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     options: search_options.SearchOptions = search_options.DEFAULT,
+    checkpoint: Optional[Callable[..., None]] = None,
 ) -> pd.DataFrame:
     """Names-only entry point (no Wikipedia URLs — metadata falls back to search)."""
     clean = [str(name).strip() for name in names if name and str(name).strip()]
@@ -2136,5 +2475,5 @@ def run_pipeline_for_names(
     df = excel_service.build_talent_df(clean)
     return run_pipeline_on_dataframe(
         df, row_status=row_status, platform_progress=platform_progress,
-        should_cancel=should_cancel, options=options,
+        should_cancel=should_cancel, options=options, checkpoint=checkpoint,
     )
