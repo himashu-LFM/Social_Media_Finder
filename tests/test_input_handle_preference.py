@@ -103,3 +103,21 @@ def test_resolve_serper_wires_the_preference(monkeypatch):
 
     out = vp._resolve_platform_serper("Mike Lawler", "Facebook", GT, known_url=INPUT, options=so.DEFAULT)
     assert _norm(out.best_candidate) == _norm(INPUT)
+
+
+def test_ambiguous_rivals_keep_the_row_manual(monkeypatch):
+    # Several live accounts present the SAME name, so the row is genuinely ambiguous.
+    # The lone-input re-verify would confirm the client's handle, but the ambiguity
+    # guard — re-run against the FULL candidate list — must keep the row Manual rather
+    # than auto-Verify the client's handle past the ambiguity it was flagged for.
+    monkeypatch.setattr(vp, "_verify",
+                        lambda platform, gt, cands, options=None, **k: _verified(cands[0]["url"]))
+    cands = [
+        {"url": INPUT, "source": "input", "meta": {"display_name": "Mike Lawler"}},
+        {"url": DISCOVERED, "source": "serper", "meta": {"display_name": "Mike Lawler"}},
+    ]
+    result = _manual(DISCOVERED)   # discovery already routed the row to Manual (ambiguity)
+    out = vp._prefer_supplied_handle(result, "Facebook", INPUT, cands, GT, so.DEFAULT)
+    assert out.status == vp.STATUS_MANUAL
+    assert _norm(out.best_candidate) != _norm(INPUT)        # client handle NOT promoted
+    assert "client handle kept" not in (out.source or "").lower()

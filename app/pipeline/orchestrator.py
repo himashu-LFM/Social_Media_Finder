@@ -128,6 +128,10 @@ save_output = excel_service.save_output
 # stopped the run. Kept inside the existing 4 statuses (Not Found) so the export
 # schema and the UI legend stay unchanged.
 CANCELLED_REASON = "Run stopped by user before this platform was searched."
+# Seeded on a row the pipeline has not reached yet, so a mid-run checkpoint or a
+# crash-rebuilt export carries an explanation next to its "Not Checked" status rather
+# than a bare blank cell. Overwritten the moment the row is actually verified.
+NOT_REACHED_REASON = "Not checked — the run ended before this row was processed."
 
 
 def _is_cancelled(should_cancel: Optional[Callable[[], bool]]) -> bool:
@@ -961,6 +965,14 @@ def _prefer_supplied_handle(
     verdict = _verify(platform, wiki_meta, [input_cand], options)
     if verdict.status != STATUS_VERIFIED:
         return result          # supplied handle not confirmable -> keep discovery's pick
+    # That _verify saw only the single supplied candidate, so _guard_ambiguous_identity
+    # could not fire (it needs rivals). Re-run it against the FULL candidate list: if
+    # several live accounts claim this identity, the client's handle must stay Manual,
+    # not be promoted past the ambiguity the row was flagged for.
+    verdict = _guard_ambiguous_identity(
+        verdict, candidates, wiki_meta.name or wiki_meta.talent, platform)
+    if verdict.status != STATUS_VERIFIED:
+        return result          # ambiguous among live rivals -> keep discovery's pick
     print(f"  [INPUT-PREFERRED] {platform} | {wiki_meta.name or ''} -> kept client handle "
           f"'{known_url}' over discovered '{result.best_candidate}'")
     return VerificationResult(
@@ -2271,6 +2283,14 @@ def run_pipeline_on_dataframe(
         if talent:
             rows.append((idx, row_label, talent, wiki_url, input_metadata,
                          input_handles, yt_distributor))
+            # Seed every real talent row's status cells with "Not Checked" (plus a brief
+            # reason) up front, so a mid-run checkpoint or a crash-rebuilt export shows
+            # "Not Checked" for a row the pipeline never reached, not a blank cell that reads
+            # as a real result. Phase A/B overwrite these as each row is verified. (Blank-name
+            # rows stay blank.)
+            for _p in PLATFORMS:
+                df.at[row_label, excel_service.status_col(_p)] = STATUS_STOPPED
+                df.at[row_label, excel_service.reason_col(_p)] = NOT_REACHED_REASON
 
     total = len(rows)
     print(f"[PIPELINE] Verification run started for {total} talent row(s) "

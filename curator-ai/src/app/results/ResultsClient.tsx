@@ -80,6 +80,7 @@ export function ResultsClient() {
           warning?: string | null;
           error?: string | null;
           pending?: boolean;
+          partial?: boolean;
         };
         if (!alive) return;
 
@@ -91,7 +92,14 @@ export function ResultsClient() {
         } else {
           setRows((data.rows ?? []).map((r) => mapRecordToRow(r)));
           setLatestFileName(data.filename ?? null);
-          setLoadWarning(data.warning ?? null);
+          // A failed/cancelled run returns ``partial``: these rows are incomplete, and
+          // cells marked "Not Checked" were never processed — say so instead of letting
+          // them read as a finished run.
+          setLoadWarning(
+            data.partial
+              ? "This run did not finish — these are partial results. Cells marked “Not Checked” were never processed."
+              : data.warning ?? null,
+          );
           setLoadError(data.error ?? null);
         }
       } catch (err) {

@@ -125,3 +125,50 @@ def test_save_job_rows_is_a_noop_without_a_database(monkeypatch):
     monkeypatch.setattr(db_service, "is_configured", lambda: False)
     # Must not raise or touch any connection when unconfigured.
     db_service.save_job_rows("job-123", [{"r": 1}])
+
+
+def test_results_endpoint_gates_on_job_status(monkeypatch):
+    """Now that checkpointing writes job.rows mid-run, /api/results/latest must not
+    serve those partial rows as final. A queued/running job reports ``pending`` with no
+    rows; a terminal job serves its rows, flagged ``partial`` only for failed/cancelled."""
+    from app import main
+    # DB always has (partial) rows — the gate must decide whether to serve them.
+    monkeypatch.setattr(main.db_service, "load_job_rows", lambda job_id: [{"Talent": "A"}])
+
+    def _result(status: str) -> dict:
+        main._jobs[f"job-{status}"] = {"status": status}
+        try:
+            return main.api_results_latest(job_id=f"job-{status}", user=None)
+        finally:
+            main._jobs.pop(f"job-{status}", None)
+
+    running = _result("running")
+    assert running.get("pending") is True and running["rows"] == []   # not served as final
+
+    done = _result("completed")
+    assert done.get("pending") is not True
+    assert done["rows"] == [{"Talent": "A"}] and done.get("partial") is False
+
+    failed = _result("failed")
+    assert failed["rows"] == [{"Talent": "A"}] and failed.get("partial") is True
+
+
+def test_unreached_rows_checkpoint_as_not_checked(monkeypatch):
+    """A mid-run checkpoint must show "Not Checked" for rows the pipeline hasn't reached
+    yet — not a blank cell — so a crash-rebuilt export never has empty status cells. The
+    seed is overwritten the moment a row is actually verified."""
+    _stub_offline(monkeypatch)
+    monkeypatch.setattr(vp.apify_service, "find_social_links_batch", lambda talents: {})
+
+    df = ex.build_talent_df(["Alpha", "Beta", "Gamma"])
+    snapshots = []
+    vp.run_pipeline_on_dataframe(
+        df, checkpoint=lambda frame, force=False: snapshots.append(frame.copy()))
+
+    # The first checkpoint fires after row 0's provisional write, before the later rows
+    # are reached. Row 0 carries a real (verified) status; the un-reached last row must
+    # read STATUS_STOPPED ("Not Checked") with a reason, not a blank cell.
+    first = snapshots[0]
+    assert str(first.iloc[0][ex.status_col("Instagram")]) != vs.STATUS_STOPPED   # processed
+    assert str(first.iloc[-1][ex.status_col("Instagram")]) == vs.STATUS_STOPPED  # unreached
+    assert str(first.iloc[-1][ex.reason_col("Instagram")]) == vp.NOT_REACHED_REASON

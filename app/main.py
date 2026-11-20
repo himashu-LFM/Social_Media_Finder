@@ -990,6 +990,18 @@ def _read_rows_response(paths: List[Path]) -> dict[str, Any]:
     }
 
 
+def _job_status(job_id: Optional[str]) -> Optional[str]:
+    """A job's lifecycle status from memory, falling back to the durable DB record."""
+    if not job_id:
+        return None
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job:
+            return job.get("status")
+    stored = db_service.load_job(job_id)
+    return stored.get("status") if stored else None
+
+
 @app.get("/api/results/latest")
 def api_results_latest(job_id: Optional[str] = None,
                        user: Optional[Dict[str, Any]] = Depends(current_user)) -> dict[str, Any]:
@@ -997,10 +1009,18 @@ def api_results_latest(job_id: Optional[str] = None,
     Final results as JSON. When ``job_id`` is supplied, serves that job's own
     output (never an older run); otherwise the newest Talent_Social_Lookup_*.xlsx.
     """
-    stored = db_service.load_job_rows(job_id) if job_id else None
-    if stored:
-        return {"rows": stored, "filename": None, "warning": None,
-                "error": None, "source": "database"}
+    if job_id:
+        status = _job_status(job_id)
+        # A queued/running job's DB rows are a mid-run checkpoint, not final results,
+        # so don't serve them as if the run were done — report pending so the UI keeps
+        # showing progress. Failed/cancelled rows ARE served, but flagged ``partial``.
+        if status in ("queued", "running", "cancelling"):
+            return {"rows": [], "filename": None, "warning": None,
+                    "error": None, "pending": True}
+        stored = db_service.load_job_rows(job_id)
+        if stored:
+            return {"rows": stored, "filename": None, "warning": None, "error": None,
+                    "source": "database", "partial": status in ("failed", "cancelled")}
     # In-memory tool-schema rows (single instance / no DB). Needed because the
     # exported workbook is now the client's brand-report format and cannot be
     # re-parsed into the results schema. The Analysis page calls this without a
